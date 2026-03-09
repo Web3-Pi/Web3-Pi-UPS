@@ -1,0 +1,10 @@
+# Build output directory
+obj/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE launch configurations (optional - uncomment if you want to track)
+# *.launch
+# *.wvproj
