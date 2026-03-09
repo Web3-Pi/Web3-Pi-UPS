@@ -1,0 +1,40 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Firmware build artifacts
+build/
+*.o
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+
+# KiCad
+*.kicad_prl
+*-backups/
+fp-info-cache
+*.kicad_pro-bak
+
+# Altium
+History/
+__Previews/
+Project\ Outputs/
+*.PcbDoc
+*.SchDoc
+*.PrjPcb
+*.PrjPcbStructure
+
+# CAD temp files
+*.bak
+*.tmp
+*.log
