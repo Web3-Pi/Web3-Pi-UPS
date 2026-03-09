@@ -1,6 +1,8 @@
 # Web3 Pi UPS
 
-**Open-source DC Uninterruptible Power Supply for Raspberry Pi 5**, designed for 24/7 Web3 nodes. Features USB-PD power delivery up to 27W, swappable Sony NP-F batteries, OLED status display, and a 3D-printed enclosure.
+The newest member of the [Web3 Pi](https://www.web3pi.io) ecosystem, built to ensure perfect reliability of your Ethereum node around the clock. Essential for Solo Staking, it shields your setup from any power disruption — no matter how brief. When the power goes out, your node stays up — and when the battery runs low, it shuts down safely.
+
+**Open-source DC Uninterruptible Power Supply for Raspberry Pi 5** — USB-PD power delivery up to 27W, swappable Sony NP-F batteries, OLED status display, and a 3D-printed enclosure.
 
 <p align="center">
   <img src="docs/images/renders/rpi_ups2.png" alt="Web3 Pi UPS with Raspberry Pi" width="550">
