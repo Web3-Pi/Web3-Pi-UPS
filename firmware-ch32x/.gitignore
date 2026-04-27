@@ -5,6 +5,14 @@ obj/
 .DS_Store
 Thumbs.db
 
-# IDE launch configurations (optional - uncomment if you want to track)
-# *.launch
-# *.wvproj
+# Claude / AI tooling
+CLAUDE.md
+.claude/
+
+# MRS user-local debug launch (regenerated from USB-PD.wvproj on import,
+# contains absolute paths to the local checkout)
+.mrs/launch.json
+
+# MRS / Eclipse project files (.project, .cproject, .template, .wvproj,
+# USB-PD.launch, .mrs/USB-PD.mrs-workspace) ARE tracked so the project can be
+# opened directly in MounRiver Studio 2 after cloning.
