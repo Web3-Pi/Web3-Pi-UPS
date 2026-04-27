@@ -1,142 +1,202 @@
-# Web3 Pi UPS - USB-PD Source Controller
+# Web3 Pi UPS — USB-PD Dual-Role Controller (CH32X035)
 
-USB Power Delivery source firmware for the **CH32X035 RISC-V microcontroller**, designed as the power management controller for the **Web3 Pi UPS** - a dedicated DC UPS for Raspberry Pi 5.
+USB Power Delivery firmware for the **CH32X035 RISC-V microcontroller**, acting as the power management controller for the **Web3 Pi UPS v2** — a dedicated DC UPS for Raspberry Pi 5.
+
+The MCU dynamically switches between **SOURCE** and **SINK** roles: it powers the Raspberry Pi by default (SOURCE), and renegotiates power from an upstream USB-C charger when one is connected (SINK).
 
 ## Features
 
-- **USB-PD 3.0 Source** with 4 fixed PDOs:
-  - 5.1V @ 5A (25.5W)
-  - 9V @ 3A (27W)
-  - 12V @ 2.25A (27W)
-  - 15V @ 1.8A (27W)
-- **Raspberry Pi 5 compatibility** - responds to RPi5's vendor-defined messages for 27W PSU identification
-- **Battery-backed power** - supports Sony NP-F series batteries (NP-F550/F770/F970)
-- **Intelligent charging** - MP2762A charger IC with temperature monitoring
-- **Fuel gauge integration** - MAX17261 for accurate battery state-of-charge
-- **Real-time status reporting** - JSON telemetry via UART to UI controller
+- **USB-PD 3.0 dual-role** (SOURCE + SINK) on a single CC pair via an analog mux
+- **SOURCE**: 4 fixed PDOs advertised to the Raspberry Pi
+  - 5V @ 5A · 9V @ 3A · 12V @ 2.25A · 15V @ 1.8A
+- **SINK**: negotiates 12–15V / ≥26W from an upstream USB-C charger
+- **Raspberry Pi 5 PSU identification** — responds to RPi5 VDM discovery as a compatible 27W supply
+- **Battery-backed power** — Sony NP-F series (NP-F550 / F770 / F970)
+- **Programmable buck-boost output** via TPS55289 (I²C, voltage + current limit)
+- **Charger control + telemetry** via MP2762A (input/battery V/I, charge state, faults)
+- **JSON status** sent over UART at 921600 baud to the UI MCU (RP2040)
+
+## Architecture (v2)
+
+In v1 the UPS used two CH32X035 MCUs (one for SINK input, one for SOURCE output). v2 collapses both roles into a single CH32X035 with a 74LVC1G3157 analog mux on the CC lines:
+
+```
+                ┌────────────────────────┐
+USB-C charger ──┤ SINK port              │
+                │              ┌─────────┴────────┐
+                │              │  74LVC1G3157     │   PDC_CC_SEL (PB3)
+                │              │  CC mux          │◄──── 0 = SOURCE
+                │              └─────────┬────────┘      1 = SINK
+                │ SOURCE port            │
+Raspberry Pi 5 ─┤◄───────────────────────┤
+                └────────────────────────┘
+                       CH32X035 PD PHY
+```
+
+Role transitions are driven by `PDC_CC_DET` (PB11, active-low host detect). When a charger is plugged in, the controller switches to SINK for a 500 ms negotiation window, then returns to SOURCE.
 
 ## Hardware
 
 | Component | Part | Function |
 |-----------|------|----------|
-| MCU | CH32X035F8U6 | RISC-V RV32IMAC, 62KB Flash, 20KB RAM |
-| DC-DC | TPS55289 | Buck-boost converter, 3-30V output |
-| Charger | MP2762A | 2S Li-ion/Li-Po charger |
-| Fuel Gauge | MAX17261 | Battery SoC monitoring |
-| Temp Sensor | LM75B | Board temperature |
+| MCU | CH32X035F8U6 | RISC-V RV32IMACXW, 62 KB Flash, 20 KB RAM |
+| DC-DC | TPS55289 | Buck-boost converter, 3–30 V output, I²C-controlled |
+| Charger | MP2762A | 2S Li-ion / Li-Po charger with ADC telemetry |
+| Temp sensor | LM75B | Board temperature |
+| CC mux | 74LVC1G3157 | Analog mux for SOURCE/SINK CC switching |
+| I²C mux | 74LVC1G157 | Switches SYS_I²C between PD controller and RP2040 |
 
-### Pin Mapping
+### Power Input
 
-| Pin | Function | Description |
-|-----|----------|-------------|
-| PA0 | ADC | VBUS output voltage sense |
-| PA2/PA3 | USART2 | TX/RX to UI MCU (RP2040) |
-| PA7 | GPIO | VBUS output enable |
-| PB0 | GPIO | TPS55289 enable |
-| PB12 | GPIO | Status LED |
-| PC14/PC15 | CC1/CC2 | USB-PD CC lines |
-| PC18/PC19 | I2C | System I2C bus |
+- USB-C Power Delivery (12–15 V negotiated via SINK role)
+- Barrel jack (12–20 V DC)
+
+### I²C Bus (SYS_I²C, PC18/PC19)
+
+```
+0x48 — LM75B    (temperature sensor)
+0x5C — MP2762A  (battery charger)
+0x75 — TPS55289 (buck-boost converter)
+```
+
+The 74LVC1G157 mux (controlled by `SYS_I²C_SEL`) lets the UI MCU (RP2040) take the bus when needed.
+
+### Pin Mapping (CH32X035F8U6)
+
+| Pin  | Function    | Description                                   |
+|------|-------------|-----------------------------------------------|
+| PA0  | ADC0        | VBUS_OUT_ADC                                  |
+| PA1  | ADC1        | DC_INP_ADC_SRC                                |
+| PA2  | USART2_TX   | PDC_SRC_TX → RP2040                           |
+| PA3  | USART2_RX   | PDC_SRC_RX ← RP2040                           |
+| PA4  | GPIO        | CHG_nINT (charger interrupt)                  |
+| PA5  | ADC5        | PD_SRC_VBAT (battery voltage)                 |
+| PA6  | GPIO        | DC_INP_EN_SRC                                 |
+| PA7  | GPIO        | VBUS_OUT_EN                                   |
+| PB0  | GPIO        | PDS_EN (TPS55289 enable)                      |
+| PB3  | GPIO        | PDC_CC_SEL (CC mux: 0 = SOURCE, 1 = SINK)     |
+| PB11 | GPIO        | PDC_CC_DET (host detect, active-low)          |
+| PB12 | GPIO        | PDC_SRC_STAT (status LED)                     |
+| PC14 | CC1         | PDC_SRC_CC1                                   |
+| PC15 | CC2         | PDC_SRC_CC2                                   |
+| PC16 | USB_N       | PDC_SRC_USB_N                                 |
+| PC17 | USB_P       | PDC_SRC_USB_P                                 |
+| PC18 | I²C_SCL     | SYS_I²C_SCL                                   |
+| PC19 | I²C_SDA     | SYS_I²C_SDA                                   |
 
 ## Building
 
-### Prerequisites
+### Option 1 — MounRiver Studio 2
 
-- MounRiver Studio (MRS) toolchain or
-- `riscv-none-embed-gcc` toolchain
+The project is set up for **[MounRiver Studio 2](http://mounriver.com) (MRS2) v2.2.0** with WCH-Link as the programmer. After cloning:
+
+1. Open MRS2 → **File → Open Folder…** → select this `firmware-ch32x/` directory.
+2. The Solution Explorer should populate from the committed `.project` / `.cproject` / `USB-PD.wvproj` files.
+3. Build (Ctrl/Cmd + B). Artifacts go to `obj/`.
+4. Plug in WCH-Link → **Run** or **Debug**. MRS2 generates a local `.mrs/launch.json` from `USB-PD.wvproj` on first run (it is git-ignored — contains your absolute path).
+
+### Option 2 — Standalone GCC
+
+With `riscv-none-embed-gcc` available in `PATH`:
+
+```bash
+cd obj
+make            # build
+make clean      # wipe artifacts
+```
 
 ### Output Files
 
-- `USBPD_SRC.elf` - ELF executable
-- `USBPD_SRC.hex` - Intel HEX for flashing
-- `USBPD_SRC.map` - Memory map
+- `obj/USB-PD.elf` — ELF executable
+- `obj/USB-PD.hex` — Intel HEX for flashing
+- `obj/USB-PD.map` — memory map
+- `obj/USB-PD.lst` — disassembly listing
+
+### Toolchain Details
+
+- Compiler: `riscv-none-embed-gcc`
+- Architecture: RV32IMACXW (RISC-V with multiply, atomic, compressed, WCH custom extensions)
+- ABI: ilp32
+- Optimization: `-Os` (size)
+- Linker script: `Ld/Link.ld`
+
+## JSON Status Protocol
+
+The PD controller sends periodic status messages on USART2 (PA2/PA3 @ 921600 baud) to the RP2040 UI MCU:
+
+```json
+{"up":1234,"pd":18,"pdo":2,"cc":1,"role":1,"snk_ok":0,"snk_v":0,"snk_i":0,"t":392,"vs":51,"is":30,"vr":51,"ir":30,"bp":1,"cs":2,"pg":1,"vi":11850,"ii":681,"vb":8200,"ci":900,"cf":0}
+```
+
+| Field    | Description                              | Unit         |
+|----------|------------------------------------------|--------------|
+| `up`     | Uptime since boot                        | seconds      |
+| `pd`     | PD state machine state                   | enum         |
+| `pdo`    | Active / requested PDO index             | 1–4          |
+| `cc`     | Sink connected                           | 0 / 1        |
+| `role`   | Current role (0 = SINK, 1 = SOURCE)      | enum         |
+| `snk_ok` | Last SINK negotiation succeeded          | 0 / 1        |
+| `snk_v`  | Negotiated SINK voltage                  | 0.1 V        |
+| `snk_i`  | Negotiated SINK current                  | 0.1 A        |
+| `t`      | Board temperature (LM75B)                | 0.1 °C       |
+| `vs`/`is`| VBUS voltage / current setpoint          | 0.1 V / 0.1 A|
+| `vr`/`ir`| VBUS voltage / current readback          | 0.1 V / 0.1 A|
+| `bp`     | Battery present (MP2762A UVLO)           | 0 / 1        |
+| `cs`     | Charge state                             | enum         |
+| `pg`     | Power good (input present)               | 0 / 1        |
+| `vi`/`ii`| Charger input voltage / current          | mV / mA      |
+| `vb`     | Battery voltage                          | mV           |
+| `ci`     | Charge current                           | mA           |
+| `cf`     | Charger fault flags                      | bitmask      |
+
+**`pd` (PD state)** — selected values: `0` Idle · `1` Disconnected · `11` Sink connected · `12` Sending SRC_CAP · `13` Waiting REQUEST · `14` REQUEST received · `15` Sending ACCEPT · `17` Adjusting voltage · `18` Sending PS_RDY. Full list in `User/PD_Process.h`.
+
+**`pdo` (PDO index)** — `1` 5V/5A · `2` 9V/3A · `3` 12V/2.25A · `4` 15V/1.8A.
+
+**`cs` (charge state)** — `0` not charging · `1` trickle/pre-charge · `2` fast charge · `3` charge done.
+
+**`cf` (fault flags, MP2762A REG14H)** — bit 7 watchdog · bit 6 OTG · bits 5:4 charge fault (input OVP / thermal / timer) · bit 3 battery OVP · bits 2:0 NTC fault.
 
 ## Project Structure
 
 ```
-├── Core/           # RISC-V core definitions
-├── Debug/          # Debug UART utilities
-├── Ld/             # Linker script (62KB Flash, 20KB RAM)
-├── Peripheral/     # CH32X035 HAL drivers
-│   ├── inc/        # Peripheral headers
-│   └── src/        # Peripheral implementations
-├── Startup/        # Startup assembly
-└── User/           # Application code
-    ├── main.c          # Entry point, GPIO init
-    ├── PD_Process.c    # USB-PD state machine
-    ├── tps55289.c      # DC-DC control
-    ├── max17261.c      # Fuel gauge driver
-    ├── mp2762a.c       # Charger driver
-    ├── lm75b.c         # Temperature sensor
-    ├── ups_status.c    # JSON status reporting
-    └── pdc_uart.c      # UART communication
+Core/           RISC-V core definitions
+Debug/          UART debug printf utility (debug.c/h)
+Ld/             Linker script (62 KB Flash, 20 KB RAM)
+Peripheral/     CH32X035 HAL drivers
+  inc/          peripheral headers
+  src/          peripheral implementations
+Startup/        startup assembly
+User/           application code
+  main.c             entry point, GPIO/I²C/UART init, main loop
+  PD_Process.{c,h}   USB-PD state machine (dual-role)
+  tps55289.{c,h}     buck-boost driver
+  mp2762a.{c,h}      charger driver
+  lm75b.{c,h}        temperature sensor driver
+  i2c_lib.{c,h}      software-bitbang I²C
+  ch32x035_it.{c,h}  interrupt handlers
+  system_ch32x035.{c,h}  clock setup
+USB-PD.wvproj   MounRiver Studio 2 project
+.project        Eclipse / CDT project descriptor
+.cproject       Eclipse / CDT build configuration
+.template       MRS chip / toolchain metadata
 ```
 
-## JSON Status Protocol
+## USB-PD Implementation Notes
 
-The controller sends periodic status updates to the UI MCU at 115200 baud:
+- The PD PHY is integrated in the CH32X035 (BMC encoder/decoder + CC analog frontend).
+- **Timing critical**: GoodCRC must be sent within 30 µs — handled in the `USBPD_IRQHandler`. Do not add blocking work in interrupts or the main loop.
+- Detection in `PD_Detect()` is **role-aware**: SOURCE uses Rp pull-ups (CC_PU_330) and detects sink Rd; SINK uses Rd pull-downs and detects source Rp.
+- For SOURCE mode the external pull-down on CC must be removed (otherwise sink detection misfires).
+- Low-power STANDBY is **disabled** while dual-role is active so host detection on PB11 keeps running.
 
-```json
-{"up":1234,"pd":18,"pdo":2,"cc":1,"t":392,"vs":90,"is":30,"vr":90,"ir":30,"soc":85,"bv":8200,"ba":-1500,"cs":0,"pg":0,"vi":0,"ii":0,"ci":0,"cf":0}
-```
+## SINK Negotiation Parameters (`PD_Process.h`)
 
-| Field | Description | Unit |
-|-------|-------------|------|
-| `up` | Uptime | seconds |
-| `pd` | PD state machine state | enum |
-| `pdo` | Active PDO index | 1-4 |
-| `cc` | Sink connected | 0/1 |
-| `t` | Board temperature | 0.1°C |
-| `vs`/`is` | VBUS voltage/current setpoint | 0.1V / 0.1A |
-| `vr`/`ir` | VBUS voltage/current readback | 0.1V / 0.1A |
-| `soc` | Battery state of charge | % |
-| `bv` | Battery voltage | mV |
-| `ba` | Battery current (+charge/-discharge) | mA |
-| `cs` | Charge state (0=off, 1=pre, 2=fast, 3=done) | enum |
-| `pg` | Power good (input present) | 0/1 |
-| `vi`/`ii` | Charger input voltage/current | mV / mA |
-| `ci` | Charge current | mA |
-| `cf` | Charger fault flags | bitmask |
+| Constant               | Value     |
+|------------------------|-----------|
+| `SINK_MIN_VOLTAGE_MV`  | 12000     |
+| `SINK_MAX_VOLTAGE_MV`  | 15000     |
+| `SINK_MIN_POWER_MW`    | 26000     |
+| `SINK_WINDOW_MS`       | 500       |
 
-## USB-PD Implementation
-
-### State Machine
-
-The PD source follows USB-PD 3.0 specification:
-
-1. **Idle** - Waiting for sink connection (CC detection)
-2. **Sink Connected** - CC pull-down detected, apply Rp
-3. **Send SRC_CAP** - Advertise available PDOs
-4. **Wait REQUEST** - Sink selects desired PDO
-5. **Send ACCEPT** - Acknowledge selection
-6. **Voltage Transition** - Adjust TPS55289 output
-7. **Send PS_RDY** - Power supply ready
-
-### Raspberry Pi 5 Support
-
-The firmware responds to RPi5's vendor-defined discovery message, identifying itself as a compatible 27W power supply. This enables full 5A operation on Raspberry Pi 5.
-
-## I2C Bus Architecture
-
-```
-SYS_I2C Bus (PC18/PC19)
-    │
-    ├── 0x36: MAX17261 (Fuel Gauge)
-    ├── 0x48: LM75B (Temperature)
-    ├── 0x5C: MP2762A (Charger)
-    └── 0x75: TPS55289 (DC-DC)
-```
-
-The I2C mux (74LVC1G157) allows the UI MCU (RP2040) to access devices when `SYS_I2C_SEL` (PA5) is asserted.
-
-## Low Power Operation
-
-When no sink is connected, the controller enters STANDBY mode to conserve power. Wake-up occurs via:
-- GPIO interrupt on CC line changes (default)
-- USB-PD peripheral wake-up (alternative)
-
-## Development Notes
-
-- **Timing critical**: USB-PD requires GoodCRC response within 30μs
-- **No CC pull-downs**: For source mode, remove any external pull-down resistors on CC lines
-- **Debug UART**: 921600 baud on dedicated debug pins
-- **Memory constrained**: Use static allocation, avoid dynamic memory
+If the upstream charger does not offer a PDO meeting these limits within 500 ms, the controller returns to SOURCE mode and continues powering the Pi from the battery / barrel input.
