@@ -88,12 +88,12 @@ The 74LVC1G157 mux (controlled by `SYS_I²C_SEL`) lets the UI MCU (RP2040) take 
 
 ### Option 1 — MounRiver Studio 2
 
-The project is set up for **[MounRiver Studio 2](http://mounriver.com) (MRS2) v2.2.0** with WCH-Link as the programmer. After cloning:
+The project is set up for **[MounRiver Studio 2](http://mounriver.com) (MRS2) V2.4.0**. After cloning:
 
 1. Open MRS2 → **File → Open Folder…** → select this `firmware-ch32x/` directory.
 2. The Solution Explorer should populate from the committed `.project` / `.cproject` / `USB-PD.wvproj` files.
 3. Build (Ctrl/Cmd + B). Artifacts go to `obj/`.
-4. Plug in WCH-Link → **Run** or **Debug**. MRS2 generates a local `.mrs/launch.json` from `USB-PD.wvproj` on first run (it is git-ignored — contains your absolute path).
+4. For flashing see **Flashing (macOS)** below — the project does not require a WCH-Link, the CH32X035 USB ISP bootloader is used directly. MRS2 generates a local `.mrs/launch.json` from `USB-PD.wvproj` on first run (it is git-ignored — contains your absolute path).
 
 ### Option 2 — Standalone GCC
 
@@ -114,11 +114,91 @@ make clean      # wipe artifacts
 
 ### Toolchain Details
 
-- Compiler: `riscv-none-embed-gcc`
+- Compiler: `riscv-none-embed-gcc` (or `riscv32-wch-elf-gcc` in newer MRS_Toolchain bundles)
 - Architecture: RV32IMACXW (RISC-V with multiply, atomic, compressed, WCH custom extensions)
 - ABI: ilp32
 - Optimization: `-Os` (size)
 - Linker script: `Ld/Link.ld`
+
+## Flashing (macOS)
+
+Programming uses the **CH32X035 built-in USB ISP bootloader** — no WCH-Link required. On macOS the open-source [`wchisp`](https://github.com/ch32-rs/wchisp) CLI handles erase / program / verify / reset.
+
+### Prerequisites
+
+```bash
+# install wchisp (Rust toolchain required, or grab a release binary from the repo)
+cargo install wchisp
+wchisp --version    # tested with 0.3.0
+```
+
+### Entering boot mode
+
+The CH32X035 enters USB ISP mode when **BOOT pin is pulled high during reset**. With the board powered off USB:
+
+1. Hold the BOOT button (or jumper BOOT to VCC).
+2. Press and release RESET.
+3. Release BOOT.
+4. The MCU enumerates as a WCH ISP device (USB VID `4348` / `1a86`, PID `55e0`).
+
+Verify it is detected:
+
+```bash
+wchisp probe
+# Device #0: CH32X035F8U6[0x5e23]
+```
+
+### First flash on a fresh CH32X035
+
+Factory chips ship with **read-out protection enabled** (`RDPR ≠ 0xA5`), which causes `verify` to fail because the bootloader returns `0xFF` on read. Unprotect once per chip:
+
+```bash
+wchisp config unprotect
+# NOTE: unprotect resets the device — re-enter boot mode before the next command.
+wchisp flash obj/USB-PD.hex
+```
+
+`wchisp flash` performs erase → program → verify → reset in a single step.
+
+### Subsequent flashes during development
+
+Once unprotected, the chip stays unprotected across power cycles. Just enter boot mode and:
+
+```bash
+wchisp flash obj/USB-PD.hex
+```
+
+### Production flashing (50-unit run)
+
+For shipped units, **keep RDPR engaged** to prevent end-user firmware readback. Skip `unprotect` entirely and bypass the readback check:
+
+```bash
+wchisp flash --no-verify obj/USB-PD.hex
+```
+
+The write itself still completes; only the verify pass (which would fail against a protected chip) is skipped.
+
+### Helper script: `flash.sh`
+
+A ready-made wrapper lives at [`firmware-ch32x/flash.sh`](flash.sh). Build the `.hex` in MRS2 first, then:
+
+```bash
+./flash.sh                    # Dev re-flash (chip already unprotected)
+./flash.sh --first            # Fresh chip — runs `wchisp config unprotect` then flashes
+./flash.sh --prod             # Production — flashes with --no-verify, RDPR stays engaged
+./flash.sh --help             # Usage summary
+```
+
+The script waits for the MCU to enter boot mode before flashing, so for a 50-unit run the loop is: plug in next board → BOOT + RESET → script auto-detects and flashes → `✓ Flashed at HH:MM:SS`.
+
+### Troubleshooting
+
+| Symptom                                              | Cause / fix                                                                              |
+|------------------------------------------------------|------------------------------------------------------------------------------------------|
+| `No WCH ISP USB device found (4348:55e0 ...)`        | Not in boot mode. Re-do BOOT + RESET sequence.                                           |
+| `Verify failed, mismatch` after `flash`              | RDPR engaged. Run `wchisp config unprotect` (then re-enter boot, re-flash), or use `--no-verify`. |
+| Device disappears after `wchisp config unprotect`    | Expected — `unprotect` resets the chip. Re-enter boot mode and continue.                 |
+| Data-only USB cable                                  | Use a known-good USB-C / USB-A data cable.                                               |
 
 ## JSON Status Protocol
 

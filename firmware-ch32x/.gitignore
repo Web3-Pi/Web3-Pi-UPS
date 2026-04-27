@@ -13,6 +13,12 @@ CLAUDE.md
 # contains absolute paths to the local checkout)
 .mrs/launch.json
 
+# MRS2 V2.4.0 machine-local workspace copy (absolute paths) and IDE state
+# snapshots (bookmarks etc.). Regenerated automatically when the project is
+# opened — do not commit.
+.mrs/USB-PD-*.mrs-workspace
+.mrs/*.snapshot
+
 # MRS / Eclipse project files (.project, .cproject, .template, .wvproj,
 # USB-PD.launch, .mrs/USB-PD.mrs-workspace) ARE tracked so the project can be
 # opened directly in MounRiver Studio 2 after cloning.
