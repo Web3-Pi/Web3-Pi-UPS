@@ -6,3 +6,6 @@
 # versions.
 dependencies:
   espressif/esp_modem: "^1"
+  # esp-mqtt was moved out of the ESP-IDF tree into the component manager
+  # in v6.0+. Same code, just a different home.
+  espressif/mqtt: "*"

@@ -1,6 +1,10 @@
 #include "modem.h"
+#include "mqtt.h"
 
 #include <string.h>
+#include <time.h>
+
+#include "esp_netif_sntp.h"
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -111,6 +115,42 @@ static void on_netif_ppp_status(void *arg, esp_event_base_t base, int32_t id, vo
         ESP_LOGW(MODEM_TAG, "PPP error from user / disconnect");
         xEventGroupSetBits(s_modem_evt, EVT_PPP_FAIL);
     }
+}
+
+/* --- SNTP time sync ------------------------------------------------------ */
+
+/*
+ * TLS cert validation needs an accurate wall clock; without it, mbedTLS
+ * thinks every Let's Encrypt cert is "not yet valid" because the chip
+ * boots at epoch=0 (1970). We hit pool.ntp.org over PPP and block until
+ * we have a real time, or `timeout_ms` elapses.
+ */
+static esp_err_t wait_for_time_sync(uint32_t timeout_ms)
+{
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_err_t err = esp_netif_sntp_init(&cfg);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(MODEM_TAG, "esp_netif_sntp_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    int retry = 0;
+    const int retry_count = (int)(timeout_ms / 500);
+    while (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(500)) != ESP_OK) {
+        if (++retry > retry_count) {
+            ESP_LOGW(MODEM_TAG, "SNTP sync timed out after %u ms", (unsigned)timeout_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
+    time_t now = 0;
+    time(&now);
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm);
+    ESP_LOGI(MODEM_TAG, "SNTP synced: %s (epoch=%lld)", buf, (long long)now);
+    return ESP_OK;
 }
 
 /* --- HTTP GET smoke test ------------------------------------------------ */
@@ -275,11 +315,22 @@ static void ppp_bringup_task(void *arg)
                                            pdMS_TO_TICKS(60000));
     if (bits & EVT_GOT_IP) {
         ESP_LOGI(MODEM_TAG, "PPP up — TCP/IP stack is on the cellular interface");
+
+        /* Wall-clock time, needed by TLS cert validity check below. */
+        wait_for_time_sync(15000);
+
         /* End-to-end proof from C: hit a public HTTP server through lwIP →
          * PPP → modem → 1nce → internet. If this returns 200 with a body,
          * it means esp-mqtt / esp_http_client / sockets work natively from
          * here on. */
         run_http_get_test();
+
+        /* Bring up the MQTT client (TLS + auth, see main/secrets.h). It runs
+         * in its own task; we return as soon as it's been kicked off. */
+        ESP_LOGI(MODEM_TAG, "starting MQTT client...");
+        if (mqtt_client_start() != ESP_OK) {
+            ESP_LOGE(MODEM_TAG, "mqtt_client_start failed");
+        }
     } else if (bits & EVT_PPP_FAIL) {
         ESP_LOGE(MODEM_TAG, "PPP setup failed");
     } else {

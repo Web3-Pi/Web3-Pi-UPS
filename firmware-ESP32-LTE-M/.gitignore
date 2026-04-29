@@ -25,6 +25,9 @@ logs/
 # The PDFs we actually need are copied into docs/ and docs/datasheets/.
 docs/LilyGo-T-SIM7080G/
 
+# Local secrets (broker credentials etc.) — see main/secrets.h.example
+main/secrets.h
+
 # Build artifacts and directories
 **/build/
 build/

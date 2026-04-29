@@ -15,3 +15,21 @@ CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
 
 # --- Flash size (board has 16 MB) ---
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# --- TLS: use the mbedTLS-bundled root CA store so esp-mqtt can verify
+#         broker.w3p.ovh's Let's Encrypt cert without us having to embed
+#         certs ourselves. ---
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# Allocate mbedTLS handshake buffers on the heap instead of the stack.
+# Without this the per-task stack must be huge to fit a TLS 1.2/1.3
+# handshake, which manifests as an X509 fatal error during connect.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# TODO(security): allow esp-tls to skip server certificate verification.
+# Required while broker.w3p.ovh still serves the EMQX self-signed default
+# cert. Once the broker has a real Let's Encrypt cert, set this back to n
+# and re-enable crt_bundle_attach in main/mqtt.c.
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
