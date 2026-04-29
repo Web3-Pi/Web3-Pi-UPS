@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Wrapper that runs send_at.py with the ESP-IDF venv Python (so pyserial is
+# guaranteed to be available). All arguments are forwarded to the script.
+#
+# Examples:
+#   tools/send-at AT
+#   tools/send-at "AT+CSQ"
+#   tools/send-at 'AT+CGDCONT=1,"IP","iot.1nce.net"'
+#   tools/send-at "AT+CFUN=1" --timeout 10
+#
+# Configurable via env: ESP_IDF_VERSION, IDF_TOOLS_PATH, PYTHON.
+
+set -eo pipefail
+
+ESP_IDF_VERSION="${ESP_IDF_VERSION:-v6.0}"
+IDF_TOOLS_PATH="${IDF_TOOLS_PATH:-$HOME/.espressif/tools}"
+PYTHON="${PYTHON:-$IDF_TOOLS_PATH/python/$ESP_IDF_VERSION/venv/bin/python}"
+
+if [[ ! -x "$PYTHON" ]]; then
+  echo "ERROR: Python not found at: $PYTHON" >&2
+  echo "Install ESP-IDF $ESP_IDF_VERSION via EIM, or set PYTHON=/path/to/python." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$PYTHON" "$SCRIPT_DIR/send_at.py" "$@"

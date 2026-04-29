@@ -1,16 +1,15 @@
 /*
  * Web3 Pi UPS — LTE-M firmware (ESP32-S3 + SimCom SIM7080G).
  *
- * Stage 0 skeleton: only a boot banner + heartbeat so we have a known-good
- * sign of life on the serial log while we wire up the rest of the system.
+ * Stage 1 — modem brought up at AT level:
+ *   1. PMU init: AXP2101 over I²C → DC3 (3.0 V), BLDO1 (3.3 V), TS-pin off.
+ *   2. Modem power-on: pulse PWRKEY (GPIO41), bring up UART1 at 115200 on 4/5.
+ *   3. AT pass-through bridge: USB-CDC ⇄ UART1 for hands-on AT exploration.
  *
- * Planned next stages, in order:
- *   1. PMU init (AXP2101 over I²C) — DC3 (modem), BLDO1 (level shifter), TS-pin off.
- *   2. Modem power-on sequence — pulse PWRKEY (GPIO41), bring up UART1 @ 115200.
- *   3. AT pass-through bridge — USB-CDC ⇄ UART1 for manual command exploration.
- *   4. PPP via esp_modem against SIM7080G; integration with esp_netif.
+ * Coming next:
+ *   4. PPP via esp_modem (gives us esp_netif + lwIP).
  *   5. MQTT (esp-mqtt) over PPP.
- *   6. Arkiv integration on the same TCP/IP stack.
+ *   6. Arkiv on the same TCP/IP stack.
  *
  * Hardware: LilyGo T-SIM7080G-S3 dev board. See docs/info.md for pinout,
  * power domains, and other details cribbed from the board datasheet.
@@ -27,11 +26,16 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
 #include "sdkconfig.h"
+
+#include "modem.h"
+#include "pmu.h"
 
 static const char *TAG = "app";
 
-#define HEARTBEAT_PERIOD_MS 5000
+#define HEARTBEAT_PERIOD_MS  5000
+#define MODEM_BOOT_DELAY_MS  8000
 
 static void log_boot_banner(void)
 {
@@ -46,7 +50,7 @@ static void log_boot_banner(void)
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
 
-    ESP_LOGI(TAG, "===== Web3 Pi UPS — LTE-M firmware (stage 0) =====");
+    ESP_LOGI(TAG, "===== Web3 Pi UPS — LTE-M firmware (stage 1) =====");
     ESP_LOGI(TAG, "target=%s cores=%d rev=v%u.%u",
              CONFIG_IDF_TARGET,
              info.cores,
@@ -66,8 +70,41 @@ static void log_boot_banner(void)
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "app_main entered");
     log_boot_banner();
 
+    /* esp_netif and esp_modem need NVS for runtime state (DNS, etc). */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
+    ESP_LOGI(TAG, "boot banner printed, calling pmu_init...");
+
+    /* PMU brings up modem rails (DC3 = 3.0 V, BLDO1 = 3.3 V level shifter). */
+    ESP_ERROR_CHECK(pmu_init());
+    ESP_LOGI(TAG, "pmu_init returned, settling rails...");
+
+    /* Let the rails settle before we reach for PWRKEY. */
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_LOGI(TAG, "calling modem_init...");
+
+    /* Configure GPIO + UART, then pulse PWRKEY. */
+    ESP_ERROR_CHECK(modem_init());
+    ESP_LOGI(TAG, "calling modem_power_on...");
+    ESP_ERROR_CHECK(modem_power_on());
+
+    /* Wait for the modem to finish booting before we start watching the UART. */
+    ESP_LOGI(TAG, "waiting %d ms for modem boot...", MODEM_BOOT_DELAY_MS);
+    vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_DELAY_MS));
+
+    /* Hand the UART over to the bidirectional bridge. */
+    modem_at_pass_through_start();
+
+    /* Keep emitting a heartbeat so the host sees the firmware is still alive
+     * even when no AT traffic is happening. */
     uint32_t tick = 0;
     while (true) {
         int64_t uptime_us = esp_timer_get_time();

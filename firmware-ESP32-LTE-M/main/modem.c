@@ -1,0 +1,222 @@
+#include "modem.h"
+
+#include <string.h>
+
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_modem_api.h"
+#include "esp_modem_config.h"
+#include "esp_netif.h"
+#include "esp_netif_defaults.h"
+#include "esp_netif_ppp.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/task.h"
+
+#define MODEM_TAG "modem"
+
+#define MODEM_PWR_GPIO    41
+#define MODEM_DTR_GPIO    42
+#define MODEM_RI_GPIO      3
+#define MODEM_RX_GPIO      4   /* ESP32 RX ← Modem TX */
+#define MODEM_TX_GPIO      5   /* ESP32 TX → Modem RX */
+
+#define MODEM_UART        UART_NUM_1
+#define MODEM_BAUD        115200
+
+#define APN_1NCE_IOT      "iot.1nce.net"
+
+#define EVT_GOT_IP        BIT0
+#define EVT_LOST_IP       BIT1
+#define EVT_PPP_FAIL      BIT2
+
+static EventGroupHandle_t s_modem_evt;
+static esp_netif_t       *s_ppp_netif;
+static esp_modem_dce_t   *s_dce;
+
+esp_err_t modem_init(void)
+{
+    /* PWRKEY GPIO: default LOW (= PWRKEY released through inverting transistor). */
+    gpio_config_t pwr_cfg = {
+        .pin_bit_mask = (1ULL << MODEM_PWR_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    esp_err_t err = gpio_config(&pwr_cfg);
+    if (err != ESP_OK) return err;
+    gpio_set_level(MODEM_PWR_GPIO, 0);
+
+    ESP_LOGI(MODEM_TAG, "GPIO%d (PWRKEY) configured; UART will be owned by esp_modem",
+             MODEM_PWR_GPIO);
+    return ESP_OK;
+}
+
+esp_err_t modem_power_on(void)
+{
+    /* Pulse sequence per LilyGo example & SIM7080G hardware design. */
+    ESP_LOGI(MODEM_TAG, "pulsing PWRKEY (GPIO%d) for 1s to power modem on...", MODEM_PWR_GPIO);
+    gpio_set_level(MODEM_PWR_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level(MODEM_PWR_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    gpio_set_level(MODEM_PWR_GPIO, 0);
+    ESP_LOGI(MODEM_TAG, "PWRKEY released — modem boot in progress");
+    return ESP_OK;
+}
+
+/* --- esp_netif PPP event hooks ------------------------------------------- */
+
+static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    if (base != IP_EVENT) return;
+
+    switch (id) {
+    case IP_EVENT_PPP_GOT_IP: {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(MODEM_TAG, "PPP got IP: " IPSTR " gw=" IPSTR " mask=" IPSTR,
+                 IP2STR(&e->ip_info.ip),
+                 IP2STR(&e->ip_info.gw),
+                 IP2STR(&e->ip_info.netmask));
+        esp_netif_dns_info_t dns;
+        if (esp_netif_get_dns_info(s_ppp_netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK) {
+            ESP_LOGI(MODEM_TAG, "PPP DNS main: " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
+        }
+        if (esp_netif_get_dns_info(s_ppp_netif, ESP_NETIF_DNS_BACKUP, &dns) == ESP_OK) {
+            ESP_LOGI(MODEM_TAG, "PPP DNS backup: " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
+        }
+        xEventGroupSetBits(s_modem_evt, EVT_GOT_IP);
+        break;
+    }
+    case IP_EVENT_PPP_LOST_IP:
+        ESP_LOGW(MODEM_TAG, "PPP lost IP");
+        xEventGroupSetBits(s_modem_evt, EVT_LOST_IP);
+        break;
+    default:
+        break;
+    }
+}
+
+static void on_netif_ppp_status(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg; (void)data;
+    if (base != NETIF_PPP_STATUS) return;
+    /* PHASE_DEAD = link broken */
+    if (id == NETIF_PPP_ERRORUSER) {
+        ESP_LOGW(MODEM_TAG, "PPP error from user / disconnect");
+        xEventGroupSetBits(s_modem_evt, EVT_PPP_FAIL);
+    }
+}
+
+/* --- bring-up task ------------------------------------------------------- */
+
+static void ppp_bringup_task(void *arg)
+{
+    (void)arg;
+
+    /* esp_modem requires a default event loop + esp_netif initialized. */
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    /* Set up the PPP netif. */
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_PPP();
+    s_ppp_netif = esp_netif_new(&netif_cfg);
+    assert(s_ppp_netif);
+
+    s_modem_evt = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID,
+                                               on_ip_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID,
+                                               on_netif_ppp_status, NULL));
+
+    /* DTE = Data Terminal Equipment side (us) — UART parameters. */
+    esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
+    dte_cfg.uart_config.tx_io_num   = MODEM_TX_GPIO;
+    dte_cfg.uart_config.rx_io_num   = MODEM_RX_GPIO;
+    dte_cfg.uart_config.rts_io_num  = -1;
+    dte_cfg.uart_config.cts_io_num  = -1;
+    dte_cfg.uart_config.flow_control = ESP_MODEM_FLOW_CONTROL_NONE;
+    dte_cfg.uart_config.port_num   = MODEM_UART;
+    dte_cfg.uart_config.baud_rate  = MODEM_BAUD;
+
+    /* DCE = Data Circuit-terminating Equipment side (the modem). The 1nce
+     * SIM auto-provisions the radio APN, but the application PPP context
+     * still needs an explicit APN at PDP-context activation time. */
+    esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG(APN_1NCE_IOT);
+
+    /* SIM7080G isn't a separate DCE class; SIM7070 covers the same AT set
+     * (the SIM7070/SIM7080/SIM7090 family share commands and the V1.05 AT
+     * Manual is one document for all three). */
+    s_dce = esp_modem_new_dev(ESP_MODEM_DCE_SIM7070,
+                              &dte_cfg, &dce_cfg, s_ppp_netif);
+    if (!s_dce) {
+        ESP_LOGE(MODEM_TAG, "esp_modem_new_dev failed");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(MODEM_TAG, "DCE created (SIM7070 class)");
+
+    /* Probe the modem at AT level a few times so we know it's awake before
+     * we tell esp_modem to switch to PPP/data mode. esp_modem starts in
+     * COMMAND mode, so AT works. */
+    for (int i = 0; i < 20; i++) {
+        if (esp_modem_sync(s_dce) == ESP_OK) {
+            ESP_LOGI(MODEM_TAG, "modem responsive (after %d AT retries)", i);
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+        if (i == 19) {
+            ESP_LOGE(MODEM_TAG, "modem did not respond to AT after 20 tries");
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    /* A few sanity-check at-level reads before going to data mode. */
+    char buf[64] = {0};
+    if (esp_modem_get_imei(s_dce, buf) == ESP_OK)        ESP_LOGI(MODEM_TAG, "IMEI: %s", buf);
+    if (esp_modem_get_imsi(s_dce, buf) == ESP_OK)        ESP_LOGI(MODEM_TAG, "IMSI: %s", buf);
+    if (esp_modem_get_module_name(s_dce, buf) == ESP_OK) ESP_LOGI(MODEM_TAG, "module: %s", buf);
+    int rssi = 99, ber = 99;
+    if (esp_modem_get_signal_quality(s_dce, &rssi, &ber) == ESP_OK) {
+        ESP_LOGI(MODEM_TAG, "signal: rssi=%d ber=%d", rssi, ber);
+    }
+
+    /* Switch to data (PPP) mode — esp_modem now drives UART and lwIP picks up. */
+    ESP_LOGI(MODEM_TAG, "switching modem to PPP/data mode...");
+    esp_err_t err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DATA);
+    if (err != ESP_OK) {
+        ESP_LOGE(MODEM_TAG, "esp_modem_set_mode(DATA) failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Wait for IP. */
+    EventBits_t bits = xEventGroupWaitBits(s_modem_evt,
+                                           EVT_GOT_IP | EVT_PPP_FAIL,
+                                           pdFALSE, pdFALSE,
+                                           pdMS_TO_TICKS(60000));
+    if (bits & EVT_GOT_IP) {
+        ESP_LOGI(MODEM_TAG, "PPP up — TCP/IP stack is on the cellular interface");
+    } else if (bits & EVT_PPP_FAIL) {
+        ESP_LOGE(MODEM_TAG, "PPP setup failed");
+    } else {
+        ESP_LOGE(MODEM_TAG, "PPP setup timed out (60s)");
+    }
+
+    vTaskDelete(NULL);
+}
+
+void modem_at_pass_through_start(void)
+{
+    /* Despite the legacy name, this now spawns the PPP bring-up task using
+     * espressif/esp_modem. Once it returns success, lwIP routes traffic
+     * through the cellular interface and esp-mqtt / esp_http_client / sockets
+     * "just work". */
+    xTaskCreate(ppp_bringup_task, "ppp_up", 8192, NULL, 5, NULL);
+    ESP_LOGI(MODEM_TAG, "PPP bring-up task started (esp_modem)");
+}

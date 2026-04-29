@@ -42,6 +42,7 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG = PROJECT_ROOT / "logs" / "serial.log"
 DEFAULT_PID = PROJECT_ROOT / "logs" / "serial-monitor.pid"
+DEFAULT_FIFO = PROJECT_ROOT / "logs" / "serial-input.fifo"
 
 # SIGUSR1 puts the monitor into a yield state so a concurrent `idf.py flash`
 # (esptool) can grab the port without "multiple access" errors. The wrapper
@@ -102,8 +103,63 @@ def pulse_reset(ser: "serial.Serial") -> None:
     ser.setRTS(False)
 
 
+def fifo_pump_thread(fifo_path: Path, get_ser, log_fp, out, stop_evt) -> None:
+    """
+    Background thread that reads bytes from a named FIFO and forwards them
+    to the serial port. Lets `tools/send-at` inject bytes into the chip's
+    USB-CDC stdin (which the firmware's pass-through bridge then forwards
+    to the modem) without opening the serial port itself — opening the
+    serial port on macOS pulses DTR and resets ESP32-S3 USB-Serial-JTAG.
+
+    get_ser() returns the current serial.Serial handle (or None if the
+    monitor is currently yielded). The thread silently drops bytes that
+    arrive while yielded, since no one's holding the port.
+    """
+    import threading  # noqa: F401  (imported here for clarity in this scope)
+
+    while not stop_evt.is_set():
+        try:
+            # Blocks until a writer opens the FIFO and sends bytes.
+            with fifo_path.open("rb") as fp:
+                while not stop_evt.is_set():
+                    data = fp.read(1024)
+                    if not data:
+                        break  # writer closed; reopen on next iteration
+                    ser = get_ser()
+                    if ser is None:
+                        emit_note(out, log_fp,
+                                  f"fifo→ser dropped {len(data)}B (port yielded)")
+                        continue
+                    try:
+                        ser.write(data)
+                        ser.flush()
+                    except Exception as e:
+                        emit_note(out, log_fp, f"fifo→ser write failed: {e}")
+                        continue
+                    # Tag what we forwarded so it shows up next to modem replies.
+                    text = data.decode("utf-8", errors="replace")
+                    for line in text.splitlines():
+                        if line:
+                            emit_line_with_prefix(out, log_fp, ">>>", line)
+        except FileNotFoundError:
+            time.sleep(0.5)
+        except Exception as e:
+            emit_note(out, log_fp, f"fifo pump error: {e}")
+            time.sleep(1.0)
+
+
+def emit_line_with_prefix(stream, log_fp, prefix: str, line: str) -> None:
+    formatted = f"[{stamp()}] {prefix} {line.rstrip()}\n"
+    stream.write(formatted)
+    stream.flush()
+    log_fp.write(formatted)
+    log_fp.flush()
+
+
 def run(port: str, baud: int, log_path: Path, pid_path: Path,
-        reset_on_connect: bool) -> int:
+        fifo_path: Path, reset_on_connect: bool) -> int:
+    import threading
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_fp = log_path.open("a", buffering=1, encoding="utf-8", errors="replace")
     out = sys.stdout
@@ -111,9 +167,37 @@ def run(port: str, baud: int, log_path: Path, pid_path: Path,
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
 
-    emit_note(out, log_fp, f"monitor start pid={os.getpid()} port={port} baud={baud} log={log_path}")
+    # FIFO setup: create lazily on demand. We don't need to mkfifo here —
+    # send-at will check and (if missing) create it before opening for write.
+    # We DO record the path so other tools can find it.
+    fifo_path.parent.mkdir(parents=True, exist_ok=True)
+    if not fifo_path.exists():
+        try:
+            os.mkfifo(fifo_path)
+        except FileExistsError:
+            pass
 
-    state = {"stop": False, "yield_until": 0.0}
+    emit_note(out, log_fp, f"monitor start pid={os.getpid()} port={port} "
+                            f"baud={baud} log={log_path} fifo={fifo_path}")
+
+    state = {"stop": False, "yield_until": 0.0, "skip_next_reset": False,
+             "ser": None}
+    stop_evt = threading.Event()
+
+    # FIFO pump: lets `tools/send-at` write bytes that get forwarded to the
+    # chip via our already-open serial handle, so it doesn't have to open the
+    # port itself (which on macOS pulses DTR and resets ESP32-S3).
+    def get_ser():
+        if time.monotonic() < state["yield_until"]:
+            return None
+        return state["ser"]
+
+    fifo_thread = threading.Thread(
+        target=fifo_pump_thread,
+        args=(fifo_path, get_ser, log_fp, out, stop_evt),
+        daemon=True,
+    )
+    fifo_thread.start()
 
     def handle_sigterm(_signum, _frame):
         state["stop"] = True
@@ -121,8 +205,11 @@ def run(port: str, baud: int, log_path: Path, pid_path: Path,
     def handle_sigusr1(_signum, _frame):
         # Yield the port. yield_until acts as a safety-net deadline; the
         # normal exit path is SIGUSR2 from the flash wrapper when esptool
-        # actually finishes.
+        # actually finishes. Mark the next reconnect as "do not reset" — for
+        # tools that take the port mid-session (send-at, custom probes) we
+        # don't want to pulse RTS and reboot whatever the firmware was doing.
         state["yield_until"] = time.monotonic() + YIELD_SECONDS
+        state["skip_next_reset"] = True
 
     def handle_sigusr2(_signum, _frame):
         # Flash wrapper signals "I'm done with the port, you can come back
@@ -155,15 +242,26 @@ def run(port: str, baud: int, log_path: Path, pid_path: Path,
                 emit_note(out, log_fp, f"port unavailable ({e}); retry in 1s")
                 time.sleep(1.0)
                 continue
+            state["ser"] = ser  # publish to FIFO pump
 
-            if reset_on_connect:
+            if reset_on_connect and not state["skip_next_reset"]:
                 try:
                     pulse_reset(ser)
                     emit_note(out, log_fp, f"connected to {port} (reset pulse sent)")
                 except Exception as e:
                     emit_note(out, log_fp, f"connected to {port} (reset failed: {e})")
             else:
-                emit_note(out, log_fp, f"connected to {port}")
+                # Make sure DTR/RTS are released so the chip keeps running.
+                try:
+                    ser.setDTR(False)
+                    ser.setRTS(False)
+                except Exception:
+                    pass
+                if state["skip_next_reset"]:
+                    emit_note(out, log_fp, f"connected to {port} (skipped reset — was yielded)")
+                    state["skip_next_reset"] = False
+                else:
+                    emit_note(out, log_fp, f"connected to {port}")
 
             try:
                 while not state["stop"]:
@@ -189,6 +287,7 @@ def run(port: str, baud: int, log_path: Path, pid_path: Path,
                         line = line_bytes.decode("utf-8", errors="replace").rstrip("\r")
                         emit_line(out, log_fp, line)
             finally:
+                state["ser"] = None  # tell FIFO pump the port is gone
                 try:
                     ser.close()
                 except Exception:
@@ -200,6 +299,7 @@ def run(port: str, baud: int, log_path: Path, pid_path: Path,
             emit_line(out, log_fp, line)
         emit_note(out, log_fp, "monitor stop")
     finally:
+        stop_evt.set()
         try:
             if pid_path.exists() and pid_path.read_text().strip() == str(os.getpid()):
                 pid_path.unlink()
@@ -221,6 +321,10 @@ def main() -> int:
                         help="Truncate the log file before starting")
     parser.add_argument("--pid-file", default=str(DEFAULT_PID),
                         help=f"PID file path (default: {DEFAULT_PID})")
+    parser.add_argument("--input-fifo", default=str(DEFAULT_FIFO),
+                        help=f"Named FIFO that other tools can write to "
+                             f"and have the bytes forwarded to the chip "
+                             f"(default: {DEFAULT_FIFO})")
     parser.add_argument("--no-reset", action="store_true",
                         help="Don't pulse RTS/EN to reset the chip on each connect")
     args = parser.parse_args()
@@ -235,6 +339,7 @@ def main() -> int:
         log_path.unlink()
 
     return run(port, args.baud, log_path, Path(args.pid_file),
+               Path(args.input_fifo),
                reset_on_connect=not args.no_reset)
 
 

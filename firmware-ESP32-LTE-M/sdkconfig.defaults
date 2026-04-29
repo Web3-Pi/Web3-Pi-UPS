@@ -1,0 +1,17 @@
+# Defaults for the LilyGo T-SIM7080G-S3 board (ESP32-S3-WROOM-1, 16 MB Flash, OPI PSRAM).
+# Delete sdkconfig if you want a clean rebuild from these defaults.
+
+# --- Console (USB-Serial-JTAG over USB-C) ---
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# --- Logging ---
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# --- lwIP: enable PPP so esp_modem can attach the cellular modem as a netif ---
+CONFIG_LWIP_PPP_SUPPORT=y
+CONFIG_LWIP_PPP_PAP_SUPPORT=y
+CONFIG_LWIP_PPP_CHAP_SUPPORT=y
+CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
+
+# --- Flash size (board has 16 MB) ---
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y

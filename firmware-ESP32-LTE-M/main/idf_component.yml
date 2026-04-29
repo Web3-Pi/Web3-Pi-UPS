@@ -1,0 +1,8 @@
+# Pulled from the ESP Component Registry. Source on GitHub:
+#   https://github.com/espressif/esp-protocols/tree/master/components/esp_modem
+#
+# We use the ^ operator for esp_modem so we automatically pick up patch / minor
+# updates within the current major. esp-protocols stays compatible across minor
+# versions.
+dependencies:
+  espressif/esp_modem: "^1"
