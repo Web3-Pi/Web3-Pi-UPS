@@ -108,21 +108,14 @@ esp_err_t pmu_init(void)
         ESP_LOGE(PMU_TAG, "i2c_new_master_bus failed: %s", esp_err_to_name(err));
         return err;
     }
-
-    /* Scan the bus before we commit to one address — useful when bring-up
-     * fails so we can tell pull-up/wiring issues from address-mismatch. */
-    ESP_LOGI(PMU_TAG, "scanning I²C bus (SDA=GPIO%d, SCL=GPIO%d) ...",
+    ESP_LOGI(PMU_TAG, "I²C bus ready (SDA=GPIO%d, SCL=GPIO%d)",
              PMU_I2C_SDA, PMU_I2C_SCL);
-    int found = 0;
-    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-        if (i2c_master_probe(s_bus, addr, pdMS_TO_TICKS(20)) == ESP_OK) {
-            ESP_LOGI(PMU_TAG, "  device acked at 0x%02x", addr);
-            found++;
-        }
-    }
-    if (found == 0) {
-        ESP_LOGE(PMU_TAG, "  no devices responded — likely pull-up / wiring issue");
-    }
+
+    /* No bus scan: i2c_master_probe issues a 0-byte write-only transaction
+     * that the AXP2101 doesn't ACK, which made the scan log "no devices
+     * responded" even when the chip was healthy. The REG_IC_TYPE read below
+     * is the real probe — it talks to the chip the same way every other
+     * PMU op does, so a failure there means a real wiring/address issue. */
 
     /* AXP2101 device handle on that bus */
     i2c_device_config_t dev_cfg = {

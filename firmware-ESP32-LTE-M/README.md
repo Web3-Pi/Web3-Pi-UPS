@@ -57,6 +57,10 @@ tools/idf build
 tools/idf flash
 ```
 
+If you have a stale `sdkconfig` from before `sdkconfig.defaults` landed
+(symptom: `flash=2 MB` in the boot banner instead of 16 MB), delete it
+and run `tools/idf reconfigure` to regenerate it from the defaults.
+
 Reset without reflashing (e.g. after a menuconfig change that affects hardware setup):
 
 ```sh

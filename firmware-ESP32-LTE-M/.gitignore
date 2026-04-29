@@ -20,6 +20,9 @@ logs/
 # Serial monitor PID file
 *.pid
 
+# Local AI assistant context (not part of the firmware itself)
+/CLAUDE.md
+
 # Vendor reference clone — too large for git, available upstream at:
 #   https://github.com/Xinyuan-LilyGO/LilyGo-T-SIM7080G
 # The PDFs we actually need are copied into docs/ and docs/datasheets/.
