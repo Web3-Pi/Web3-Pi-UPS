@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Launcher for ESP-IDF v6.0 MCP server (stdio transport).
+# Invoked by MCP clients (e.g. Claude Code) via .mcp.json.
+#
+# Adapted from /Users/cmd0s/data/repos/ArkivChat/Arkiv-Mbed-ESP32-S3/scripts/idf-mcp-server.sh
+set -eo pipefail
+
+ACTIVATE="$HOME/.espressif/tools/activate_idf_v6.0.sh"
+
+# EIM's activate script's is_sourced() detection breaks when invoked from another
+# script (checks $0 instead of BASH_SOURCE), so we use its -e mode to print env
+# vars and apply them ourselves.
+while IFS='=' read -r key value; do
+    [ -z "$key" ] && continue
+    case "$key" in
+        SYSTEM_PATH) continue ;;
+        PATH) export PATH="$value:$PATH" ;;
+        *) export "$key=$value" ;;
+    esac
+done < <("$ACTIVATE" -e)
+
+exec "$IDF_PYTHON_ENV_PATH/bin/python" "$IDF_PATH/tools/idf.py" mcp-server "$@"

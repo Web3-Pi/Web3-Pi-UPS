@@ -38,3 +38,6 @@ Project\ Outputs/
 *.bak
 *.tmp
 *.log
+
+# Local working scratch
+docs/tmp/

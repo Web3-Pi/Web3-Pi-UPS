@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Pulse the ESP32-S3 reset line via RTS without re-flashing. Coordinates with
+# tools/serial-monitor: sends SIGUSR1 to release the port, pulses reset, and
+# lets the monitor's auto-reconnect pick up the boot banner.
+#
+# Usage:
+#   tools/reset                       # auto-detect port
+#   tools/reset /dev/cu.usbmodem1101  # explicit port
+
+set -eo pipefail
+
+PORT="${1:-}"
+if [[ -z "$PORT" ]]; then
+  shopt -s nullglob
+  ports=( /dev/cu.usbmodem* )
+  shopt -u nullglob
+  if [[ ${#ports[@]} -eq 1 ]]; then
+    PORT="${ports[0]}"
+  else
+    echo "ERROR: specify port (multiple or no /dev/cu.usbmodem* found)" >&2
+    exit 1
+  fi
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PID_FILE="${SCRIPT_DIR}/../logs/serial-monitor.pid"
+VENV_PY="$HOME/.espressif/tools/python/v6.0/venv/bin/python"
+
+# Notify monitor to release the port so we can take it briefly.
+monitor_pid=""
+if [[ -f "$PID_FILE" ]]; then
+  candidate="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$candidate" ]] && kill -0 "$candidate" 2>/dev/null; then
+    monitor_pid="$candidate"
+  fi
+fi
+
+release_monitor() {
+  if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+    kill -USR2 "$monitor_pid" 2>/dev/null || true
+  fi
+}
+
+if [[ -n "$monitor_pid" ]]; then
+  echo "[reset] notifying serial monitor (pid=$monitor_pid) to yield port..." >&2
+  kill -USR1 "$monitor_pid"
+  trap release_monitor EXIT INT TERM
+  sleep 0.3
+fi
+
+# Pulse EN (reset) by toggling RTS. The board's USB-to-UART auto-reset circuit
+# inverts RTS so RTS=True drives EN low (chip in reset).
+"$VENV_PY" - <<PYEOF
+import time, serial, sys
+s = serial.Serial("$PORT", 115200)
+s.setDTR(False)   # IO0 high (do not enter download mode)
+s.setRTS(True)    # EN low — chip in reset
+time.sleep(0.1)
+s.setRTS(False)   # EN high — release reset, chip boots
+s.close()
+print("reset pulse sent on $PORT", file=sys.stderr)
+PYEOF

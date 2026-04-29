@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Wrapper that activates ESP-IDF v6.0 (EIM install) and runs idf.py with the
+# given arguments. Use this instead of remembering to `source activate_idf_v6.0.sh`
+# before every command.
+#
+# Examples:
+#   tools/idf build
+#   tools/idf -p /dev/cu.usbmodem1101 flash
+#   tools/idf reconfigure
+#   tools/idf size
+#
+# EIM's activate_idf_v6.0.sh has a buggy is_sourced() that checks $0 instead of
+# BASH_SOURCE — so sourcing it from a non-shell-named script fails. We use the
+# script's own `-e` mode (dump env vars) and apply them ourselves.
+
+set -eo pipefail
+
+ACTIVATE="/Users/cmd0s/.espressif/tools/activate_idf_v6.0.sh"
+
+if [[ ! -f "$ACTIVATE" ]]; then
+  echo "ERROR: ESP-IDF v6.0 activation script not found at: $ACTIVATE" >&2
+  exit 1
+fi
+
+# Dump env vars from EIM and apply them to current shell. EIM's -e mode emits
+# the IDF-only PATH separately from the user's SYSTEM_PATH; we have to combine
+# them so system tools (cmake, git, etc.) remain reachable.
+IDF_ONLY_PATH=""
+SYSTEM_PATH=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    PATH)         IDF_ONLY_PATH="$value" ;;
+    SYSTEM_PATH)  SYSTEM_PATH="$value" ;;
+    IDF_TOOLS_PATH|IDF_COMPONENT_LOCAL_STORAGE_URL|IDF_PATH|\
+ESP_ROM_ELF_DIR|OPENOCD_SCRIPTS|IDF_PYTHON_ENV_PATH|ESP_IDF_VERSION)
+      export "$key=$value"
+      ;;
+  esac
+done < <(bash "$ACTIVATE" -e)
+
+# Final PATH: idf.py wrappers + IDF tool dirs + system (so cmake/git/ninja work).
+export PATH="${IDF_PATH}/tools:${IDF_ONLY_PATH}:${SYSTEM_PATH}:${PATH}"
+
+# Coordinate with the serial monitor for actions that take the port.
+# Protocol:
+#   SIGUSR1 → monitor releases the port (with a 60s safety-net deadline)
+#   SIGUSR2 → monitor may reconnect immediately (sent unconditionally on exit)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PID_FILE="${SCRIPT_DIR}/../logs/serial-monitor.pid"
+needs_port=0
+for arg in "$@"; do
+  case "$arg" in
+    flash|erase-flash|erase_flash|monitor) needs_port=1 ;;
+  esac
+done
+
+monitor_pid=""
+if [[ $needs_port -eq 1 && -f "$PID_FILE" ]]; then
+  candidate="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$candidate" ]] && kill -0 "$candidate" 2>/dev/null; then
+    monitor_pid="$candidate"
+  fi
+fi
+
+release_monitor() {
+  if [[ -n "$monitor_pid" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+    kill -USR2 "$monitor_pid" 2>/dev/null || true
+    echo "[idf] notified serial monitor (pid=$monitor_pid) to resume" >&2
+  fi
+}
+
+if [[ -n "$monitor_pid" ]]; then
+  echo "[idf] notifying serial monitor (pid=$monitor_pid) to yield port..." >&2
+  kill -USR1 "$monitor_pid"
+  trap release_monitor EXIT INT TERM
+  # Tiny pause so the monitor's main loop wakes up and closes the port before
+  # esptool tries to open it. SIGUSR1 isn't synchronous and the read() call has
+  # a 200ms timeout — 0.3s is enough headroom in practice.
+  sleep 0.3
+fi
+
+# Run idf.py and forward its exit code. The trap above makes sure the monitor
+# is released regardless of how idf.py exits (success, failure, or signal).
+idf.py "$@"

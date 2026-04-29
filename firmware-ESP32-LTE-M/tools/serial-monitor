@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Wrapper that runs serial_monitor.py with the ESP-IDF v6.0 venv Python
+# (so pyserial is guaranteed to be available). All arguments are forwarded
+# to the Python script.
+#
+# Examples:
+#   tools/serial-monitor                    # auto-detect port, default log
+#   tools/serial-monitor --truncate         # start fresh log
+#   tools/serial-monitor --log logs/foo.log
+#   tools/serial-monitor --port /dev/cu.usbmodem1101 --baud 115200
+
+set -euo pipefail
+
+VENV_PY="/Users/cmd0s/.espressif/tools/python/v6.0/venv/bin/python"
+
+if [[ ! -x "$VENV_PY" ]]; then
+  echo "ERROR: ESP-IDF v6.0 venv Python not found at: $VENV_PY" >&2
+  echo "Make sure ESP-IDF v6.0 is installed via the ESP-IDF Installation Manager (EIM)." >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$VENV_PY" "$SCRIPT_DIR/serial_monitor.py" "$@"
