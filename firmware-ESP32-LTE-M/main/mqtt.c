@@ -132,20 +132,12 @@ esp_err_t mqtt_client_start(void)
                            "{\"client\":\"%s\",\"online\":false}",
                            s_client_id);
 
-    /*
-     * TODO(security): re-enable TLS verification once broker.w3p.ovh ships
-     * a real Let's Encrypt cert (currently EMQX presents its bundled
-     * self-signed cert with CN=localhost). For now we accept ANY cert from
-     * the broker — connection is still encrypted, but vulnerable to MITM.
-     * Tracked in TODO.md ("MQTT TLS verification disabled").
-     *
-     * To restore: re-enable .broker.verification.crt_bundle_attach below
-     * and remove .broker.verification.skip_cert_common_name_check.
-     */
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
-        /* .broker.verification.crt_bundle_attach = esp_crt_bundle_attach, */
-        .broker.verification.skip_cert_common_name_check = true,
+        /* TLS verification via mbedTLS-bundled root CAs. The mqtt.w3p.ovh
+         * domain is fronted by Traefik with a Let's Encrypt cert, so the
+         * default bundle (which includes ISRG Root X1/X2) covers it. */
+        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
         .credentials.username = MQTT_USERNAME,
         .credentials.client_id = s_client_id,
         .credentials.authentication.password = MQTT_PASSWORD,
