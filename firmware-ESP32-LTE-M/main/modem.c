@@ -37,6 +37,14 @@
 #define EVT_LOST_IP       BIT1
 #define EVT_PPP_FAIL      BIT2
 
+/* Supervisor backoff: start short, cap at 60s. After this many consecutive
+ * bring-up failures we give the modem a full PWRKEY power cycle, since the
+ * radio side can wedge in ways AT-only recovery can't fix. */
+#define PPP_BACKOFF_MIN_MS       1000
+#define PPP_BACKOFF_MAX_MS      60000
+#define PPP_FAILS_BEFORE_PWRCYCLE   5
+#define PPP_GOT_IP_TIMEOUT_MS   60000
+
 static EventGroupHandle_t s_modem_evt;
 static esp_netif_t       *s_ppp_netif;
 static esp_modem_dce_t   *s_dce;
@@ -225,27 +233,13 @@ static void run_http_get_test(void)
     esp_http_client_cleanup(client);
 }
 
-/* --- bring-up task ------------------------------------------------------- */
+/* --- DCE bring-up / teardown -------------------------------------------- */
 
-static void ppp_bringup_task(void *arg)
+/* Create the DCE, sync at AT level, log identity, and switch to data (PPP)
+ * mode. On success the DCE is owned by `s_dce` and the PPP layer is racing
+ * to acquire an IP — caller waits on EVT_GOT_IP / EVT_PPP_FAIL. */
+static esp_err_t ppp_bringup_dce(void)
 {
-    (void)arg;
-
-    /* esp_modem requires a default event loop + esp_netif initialized. */
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(esp_netif_init());
-
-    /* Set up the PPP netif. */
-    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_PPP();
-    s_ppp_netif = esp_netif_new(&netif_cfg);
-    assert(s_ppp_netif);
-
-    s_modem_evt = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID,
-                                               on_ip_event, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID,
-                                               on_netif_ppp_status, NULL));
-
     /* DTE = Data Terminal Equipment side (us) — UART parameters. */
     esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
     dte_cfg.uart_config.tx_io_num   = MODEM_TX_GPIO;
@@ -268,25 +262,25 @@ static void ppp_bringup_task(void *arg)
                               &dte_cfg, &dce_cfg, s_ppp_netif);
     if (!s_dce) {
         ESP_LOGE(MODEM_TAG, "esp_modem_new_dev failed");
-        vTaskDelete(NULL);
-        return;
+        return ESP_FAIL;
     }
     ESP_LOGI(MODEM_TAG, "DCE created (SIM7070 class)");
 
     /* Probe the modem at AT level a few times so we know it's awake before
      * we tell esp_modem to switch to PPP/data mode. esp_modem starts in
      * COMMAND mode, so AT works. */
+    bool synced = false;
     for (int i = 0; i < 20; i++) {
         if (esp_modem_sync(s_dce) == ESP_OK) {
             ESP_LOGI(MODEM_TAG, "modem responsive (after %d AT retries)", i);
+            synced = true;
             break;
         }
         vTaskDelay(pdMS_TO_TICKS(500));
-        if (i == 19) {
-            ESP_LOGE(MODEM_TAG, "modem did not respond to AT after 20 tries");
-            vTaskDelete(NULL);
-            return;
-        }
+    }
+    if (!synced) {
+        ESP_LOGE(MODEM_TAG, "modem did not respond to AT after 20 tries");
+        return ESP_ERR_TIMEOUT;
     }
 
     /* A few sanity-check at-level reads before going to data mode. */
@@ -304,48 +298,149 @@ static void ppp_bringup_task(void *arg)
     esp_err_t err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DATA);
     if (err != ESP_OK) {
         ESP_LOGE(MODEM_TAG, "esp_modem_set_mode(DATA) failed: %s", esp_err_to_name(err));
-        vTaskDelete(NULL);
-        return;
+        return err;
     }
+    return ESP_OK;
+}
 
-    /* Wait for IP. */
-    EventBits_t bits = xEventGroupWaitBits(s_modem_evt,
-                                           EVT_GOT_IP | EVT_PPP_FAIL,
-                                           pdFALSE, pdFALSE,
-                                           pdMS_TO_TICKS(60000));
-    if (bits & EVT_GOT_IP) {
-        ESP_LOGI(MODEM_TAG, "PPP up — TCP/IP stack is on the cellular interface");
+/* Tear down the DCE and free its UART driver so the next bring-up can claim
+ * the port cleanly. Best-effort exit from data mode first; we don't care if
+ * it fails (likely the link is already down). */
+static void ppp_teardown_dce(void)
+{
+    if (!s_dce) return;
+    esp_err_t err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_COMMAND);
+    if (err != ESP_OK) {
+        ESP_LOGW(MODEM_TAG, "set_mode(COMMAND) on teardown failed (%s) — "
+                            "continuing with destroy",
+                 esp_err_to_name(err));
+    }
+    esp_modem_destroy(s_dce);
+    s_dce = NULL;
+    ESP_LOGI(MODEM_TAG, "DCE destroyed");
+}
 
-        /* Wall-clock time, needed by TLS cert validity check below. */
-        wait_for_time_sync(15000);
+/* --- supervisor task ----------------------------------------------------- */
 
-        /* End-to-end proof from C: hit a public HTTP server through lwIP →
-         * PPP → modem → 1nce → internet. If this returns 200 with a body,
-         * it means esp-mqtt / esp_http_client / sockets work natively from
-         * here on. */
-        run_http_get_test();
+/*
+ * Long-lived task. Brings PPP up, runs first-boot smoke tests + starts the
+ * MQTT client, then watches for PPP_LOST_IP / PPP_FAIL and tears down +
+ * recreates the DCE. esp-mqtt has its own reconnect timer, so it stays
+ * started across PPP cycles and reconnects on its own once a route exists.
+ *
+ * Backoff: doubles from PPP_BACKOFF_MIN_MS up to PPP_BACKOFF_MAX_MS.
+ * If we hit PPP_FAILS_BEFORE_PWRCYCLE bring-ups in a row without an IP we
+ * pulse PWRKEY (full hardware power cycle) to recover from a wedged radio.
+ */
+static void ppp_supervisor_task(void *arg)
+{
+    (void)arg;
 
-        /* Bring up the MQTT client (TLS + auth, see main/secrets.h). It runs
-         * in its own task; we return as soon as it's been kicked off. */
-        ESP_LOGI(MODEM_TAG, "starting MQTT client...");
-        if (mqtt_client_start() != ESP_OK) {
-            ESP_LOGE(MODEM_TAG, "mqtt_client_start failed");
+    /* esp_modem requires a default event loop + esp_netif initialized. */
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    /* Set up the PPP netif (one-shot — kept across DCE recreation). */
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_PPP();
+    s_ppp_netif = esp_netif_new(&netif_cfg);
+    assert(s_ppp_netif);
+
+    s_modem_evt = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID,
+                                               on_ip_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID,
+                                               on_netif_ppp_status, NULL));
+
+    bool     mqtt_started = false;
+    uint32_t backoff_ms   = PPP_BACKOFF_MIN_MS;
+    int      consecutive_fails = 0;
+
+    for (;;) {
+        /* Clear any stale event bits from a previous iteration so we don't
+         * trip on a LOST_IP that was already serviced. */
+        xEventGroupClearBits(s_modem_evt,
+                             EVT_GOT_IP | EVT_LOST_IP | EVT_PPP_FAIL);
+
+        esp_err_t err = ppp_bringup_dce();
+        if (err == ESP_OK) {
+            EventBits_t bits = xEventGroupWaitBits(
+                s_modem_evt,
+                EVT_GOT_IP | EVT_PPP_FAIL,
+                pdFALSE, pdFALSE,
+                pdMS_TO_TICKS(PPP_GOT_IP_TIMEOUT_MS));
+
+            if (bits & EVT_GOT_IP) {
+                ESP_LOGI(MODEM_TAG, "PPP up — TCP/IP stack is on the cellular interface");
+                consecutive_fails = 0;
+                backoff_ms = PPP_BACKOFF_MIN_MS;
+
+                if (!mqtt_started) {
+                    /* Wall-clock time, needed by TLS cert validity check. */
+                    wait_for_time_sync(15000);
+
+                    /* End-to-end proof from C: hit a public HTTP server
+                     * through lwIP → PPP → modem → 1nce → internet. */
+                    run_http_get_test();
+
+                    ESP_LOGI(MODEM_TAG, "starting MQTT client...");
+                    if (mqtt_client_start() == ESP_OK) {
+                        mqtt_started = true;
+                    } else {
+                        ESP_LOGE(MODEM_TAG, "mqtt_client_start failed");
+                    }
+                } else {
+                    ESP_LOGI(MODEM_TAG, "PPP reconnected — esp-mqtt will resume on its own");
+                }
+
+                /* Block until the link drops. PPP_LOST_IP is the normal
+                 * disconnect path; PPP_FAIL covers user-initiated/auth
+                 * errors. Either way, we tear down and rebuild. */
+                xEventGroupWaitBits(s_modem_evt,
+                                    EVT_LOST_IP | EVT_PPP_FAIL,
+                                    pdFALSE, pdFALSE,
+                                    portMAX_DELAY);
+                ESP_LOGW(MODEM_TAG, "PPP link lost — tearing down DCE");
+            } else if (bits & EVT_PPP_FAIL) {
+                ESP_LOGE(MODEM_TAG, "PPP setup failed");
+                consecutive_fails++;
+            } else {
+                ESP_LOGE(MODEM_TAG, "PPP setup timed out (%d ms)",
+                         PPP_GOT_IP_TIMEOUT_MS);
+                consecutive_fails++;
+            }
+        } else {
+            consecutive_fails++;
         }
-    } else if (bits & EVT_PPP_FAIL) {
-        ESP_LOGE(MODEM_TAG, "PPP setup failed");
-    } else {
-        ESP_LOGE(MODEM_TAG, "PPP setup timed out (60s)");
-    }
 
-    vTaskDelete(NULL);
+        ppp_teardown_dce();
+
+        if (consecutive_fails >= PPP_FAILS_BEFORE_PWRCYCLE) {
+            ESP_LOGW(MODEM_TAG,
+                     "%d consecutive bring-up failures — power-cycling modem",
+                     consecutive_fails);
+            /* PWRKEY pulse on a powered modem toggles it off, then on again.
+             * The 8-second post-PWRKEY boot delay matches main.c's initial
+             * wait so the SIM7080G has time to be ready for AT. */
+            modem_power_on();
+            vTaskDelay(pdMS_TO_TICKS(8000));
+            consecutive_fails = 0;
+        }
+
+        ESP_LOGI(MODEM_TAG, "backing off %u ms before retry",
+                 (unsigned)backoff_ms);
+        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+        backoff_ms *= 2;
+        if (backoff_ms > PPP_BACKOFF_MAX_MS) backoff_ms = PPP_BACKOFF_MAX_MS;
+    }
 }
 
 void modem_at_pass_through_start(void)
 {
-    /* Despite the legacy name, this now spawns the PPP bring-up task using
-     * espressif/esp_modem. Once it returns success, lwIP routes traffic
-     * through the cellular interface and esp-mqtt / esp_http_client / sockets
-     * "just work". */
-    xTaskCreate(ppp_bringup_task, "ppp_up", 8192, NULL, 5, NULL);
-    ESP_LOGI(MODEM_TAG, "PPP bring-up task started (esp_modem)");
+    /* Despite the legacy name, this now spawns the PPP supervisor task
+     * (espressif/esp_modem). It brings PPP up, starts esp-mqtt on first
+     * success, and then runs forever — re-creating the DCE whenever PPP
+     * drops so production devices don't go silent on a transient cellular
+     * outage. */
+    xTaskCreate(ppp_supervisor_task, "ppp_sup", 8192, NULL, 5, NULL);
+    ESP_LOGI(MODEM_TAG, "PPP supervisor task started (esp_modem)");
 }
