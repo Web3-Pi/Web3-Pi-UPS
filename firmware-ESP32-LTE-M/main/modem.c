@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_event.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_modem_api.h"
 #include "esp_modem_config.h"
@@ -112,6 +113,78 @@ static void on_netif_ppp_status(void *arg, esp_event_base_t base, int32_t id, vo
     }
 }
 
+/* --- HTTP GET smoke test ------------------------------------------------ */
+
+/*
+ * Capture the first chunk of the response body so we have proof in the log
+ * that real bytes flowed in from the network (not just a 200 OK status).
+ */
+static char   s_http_body_preview[128];
+static size_t s_http_body_preview_len;
+
+static esp_err_t http_event_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id != HTTP_EVENT_ON_DATA) {
+        return ESP_OK;
+    }
+    size_t remaining = sizeof(s_http_body_preview) - 1 - s_http_body_preview_len;
+    if (remaining == 0 || evt->data_len <= 0) {
+        return ESP_OK;
+    }
+    size_t n = (size_t)evt->data_len < remaining ? (size_t)evt->data_len : remaining;
+    memcpy(s_http_body_preview + s_http_body_preview_len, evt->data, n);
+    s_http_body_preview_len += n;
+    s_http_body_preview[s_http_body_preview_len] = '\0';
+    return ESP_OK;
+}
+
+static void run_http_get_test(void)
+{
+    static const char *URL = "http://example.com/";
+
+    ESP_LOGI(MODEM_TAG, "--- HTTP GET %s over PPP (esp_http_client) ---", URL);
+
+    s_http_body_preview_len = 0;
+    s_http_body_preview[0] = '\0';
+
+    esp_http_client_config_t cfg = {
+        .url           = URL,
+        .timeout_ms    = 15000,
+        .event_handler = http_event_handler,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(MODEM_TAG, "esp_http_client_init failed");
+        return;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int status = esp_http_client_get_status_code(client);
+        int64_t len = esp_http_client_get_content_length(client);
+        ESP_LOGI(MODEM_TAG,
+                 "HTTP %d, content_length=%lld, captured %u byte(s) of body",
+                 status, len, (unsigned)s_http_body_preview_len);
+        if (s_http_body_preview_len > 0) {
+            /* Strip embedded newlines so the log line stays readable. */
+            for (size_t i = 0; i < s_http_body_preview_len; i++) {
+                if (s_http_body_preview[i] == '\n' || s_http_body_preview[i] == '\r') {
+                    s_http_body_preview[i] = ' ';
+                }
+            }
+            ESP_LOGI(MODEM_TAG, "HTTP body[0..%u]: %.*s%s",
+                     (unsigned)s_http_body_preview_len,
+                     (int)s_http_body_preview_len, s_http_body_preview,
+                     (size_t)len > s_http_body_preview_len ? " ..." : "");
+        }
+    } else {
+        ESP_LOGE(MODEM_TAG, "esp_http_client_perform failed: %s",
+                 esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
+}
+
 /* --- bring-up task ------------------------------------------------------- */
 
 static void ppp_bringup_task(void *arg)
@@ -202,6 +275,11 @@ static void ppp_bringup_task(void *arg)
                                            pdMS_TO_TICKS(60000));
     if (bits & EVT_GOT_IP) {
         ESP_LOGI(MODEM_TAG, "PPP up — TCP/IP stack is on the cellular interface");
+        /* End-to-end proof from C: hit a public HTTP server through lwIP →
+         * PPP → modem → 1nce → internet. If this returns 200 with a body,
+         * it means esp-mqtt / esp_http_client / sockets work natively from
+         * here on. */
+        run_http_get_test();
     } else if (bits & EVT_PPP_FAIL) {
         ESP_LOGE(MODEM_TAG, "PPP setup failed");
     } else {
