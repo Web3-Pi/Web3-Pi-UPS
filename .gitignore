@@ -41,3 +41,6 @@ Project\ Outputs/
 
 # Local working scratch
 docs/tmp/
+
+# Local AI assistant context / scratchpads (not part of the codebase itself)
+/PROGRESS.md

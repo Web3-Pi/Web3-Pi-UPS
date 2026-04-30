@@ -8,12 +8,12 @@ constexpr uint8_t I2C0_SDA_PIN = 8;
 constexpr uint8_t I2C0_SCL_PIN = 9;
 TwoWire WireCustom(i2c0, I2C0_SDA_PIN, I2C0_SCL_PIN);
 
-// --- UART0 RX only ---
-constexpr uint8_t GPIO16_PIN = 16;   // GPIO16 - UART0 TX pad, keep as floating input
+// --- UART0 bidirectional (RP2040 <-> CH32X) ---
+constexpr uint8_t GPIO16_PIN = 16;   // GPIO16 - UART0 TX (commands to CH32X)
 constexpr uint8_t GPIO18_PIN = 18;   // GPIO18 - not used, set as input pullup
 constexpr uint8_t GPIO19_PIN = 19;   // GPIO19 - not used, set as input pullup
 constexpr uint8_t GPIO20_PIN = 20;   // GPIO20 - not used, set as input pullup
-constexpr uint8_t UART0_RX_PIN = 17; // GPIO17 - RP_UART0_RX
+constexpr uint8_t UART0_RX_PIN = 17; // GPIO17 - UART0 RX (status + responses from CH32X)
 
 // --- GPIO26/27 - unused, set as output LOW ---
 constexpr uint8_t GPIO26_PIN = 26;
@@ -99,6 +99,16 @@ int uartIdx = 0;
 // --- UART debug message buffer ---
 char dbgBuffer[128];
 int dbgIdx = 0;
+
+// --- Host (USB-CDC) -> CH32X command framing ---
+// Host writes single-line JSON commands like {"cmd":"ups.power.cycle","id":7}
+// to the USB-CDC port. We accumulate brace-balanced frames and forward verbatim
+// to Serial1 (CH32X). Responses come back via Serial1 and are forwarded out
+// USB-CDC unchanged (without the ADC-augmentation we apply to status JSONs).
+char hostBuffer[256];
+int hostIdx = 0;
+bool hostInJson = false;
+uint32_t nextCmdId = 1;
 int json_t = 0;    // temperature
 int json_vs = 0;   // voltage source
 int json_is = 0;   // current source
@@ -537,6 +547,48 @@ static void drawScreenPDInfo() {
   drawScreenIndicator(3);
 }
 
+// Send a JSON command to CH32X over Serial1.
+// Returns the auto-assigned command id so the caller can match responses.
+static uint32_t sendUpsCommand(const char* cmd) {
+  uint32_t id = nextCmdId++;
+  Serial1.print(F("{\"cmd\":\""));
+  Serial1.print(cmd);
+  Serial1.print(F("\",\"id\":"));
+  Serial1.print(id);
+  Serial1.println(F("}"));
+  return id;
+}
+
+// Drain USB-CDC input: collect brace-balanced frames from the host service
+// and forward them verbatim to CH32X. The host-side service issues commands
+// like {"cmd":"ups.power.cycle","id":7}\n.
+static void drainHostSerial() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '{') {
+      hostIdx = 0;
+      hostBuffer[hostIdx++] = c;
+      hostInJson = true;
+    } else if (hostInJson) {
+      if (hostIdx >= (int)sizeof(hostBuffer) - 1) {
+        // Frame too long: discard
+        hostIdx = 0;
+        hostInJson = false;
+        continue;
+      }
+      hostBuffer[hostIdx++] = c;
+      if (c == '}') {
+        hostBuffer[hostIdx] = '\0';
+        Serial1.print(hostBuffer);
+        Serial1.print(F("\r\n"));
+        hostIdx = 0;
+        hostInJson = false;
+      }
+    }
+    // Bytes outside frames are ignored (host should send line-framed JSON only).
+  }
+}
+
 // Check buttons with debounce, returns: -1=left, 0=none, +1=right
 static int8_t checkButtons() {
   static unsigned long lastDebounceLeft = 0;
@@ -586,9 +638,6 @@ void setup() {
   pinMode(BTN_LEFT_PIN, INPUT_PULLUP);
   pinMode(BTN_RIGHT_PIN, INPUT_PULLUP);
 
-  // GPIO16 - floating input (UART0 TX pad, not used)
-  pinMode(GPIO16_PIN, INPUT);
-
   // GPIO18, 19, 20 - set as input with pullup (not floating)
   pinMode(GPIO18_PIN, INPUT_PULLUP);
   pinMode(GPIO19_PIN, INPUT_PULLUP);
@@ -607,11 +656,12 @@ void setup() {
   while (!Serial && millis() < 3000); // Wait for USB Serial (max 3s)
   Serial.println(F("Starting..."));
 
-  // UART0 RX only on GPIO17
+  // UART0 to CH32X: RX on GPIO17 (status JSON + responses), TX on GPIO16 (commands)
   Serial1.setRX(UART0_RX_PIN);
+  Serial1.setTX(GPIO16_PIN);
   Serial1.setFIFOSize(256);  // Increase RX buffer (default is 32)
   Serial1.begin(921600);
-  Serial.println(F("UART0 RX listening on GPIO17 @ 921600"));
+  Serial.println(F("UART0 bidir on GPIO17/16 @ 921600"));
 
   // Init I2C for OLED
   WireCustom.begin();
@@ -644,6 +694,9 @@ void setup() {
 }
 
 void loop() {
+  // Drain commands from the host service (USB-CDC) and forward to CH32X.
+  drainHostSerial();
+
   // Read ADC values (single sample, EMA filtering handles noise)
   int rawBattVolt = analogRead(ADC_BATT_VOLT_PIN);
   int rawVbusOut  = analogRead(ADC_VBUS_OUT_PIN);
@@ -766,11 +819,16 @@ void loop() {
   int soc = (int)(filtered_soc + 0.5f);
   json_soc = soc;
 
-  // Output JSON with ADC battery values merged in
+  // Forward incoming JSON from CH32X to USB-CDC.
+  // - Status frames: augment with RP2040-measured bv/SOC/bd/vo before re-emitting.
+  // - Command responses (contain "resp":): forward verbatim, no augmentation.
   if (newJsonReceived) {
-    // Find closing brace and replace with battery values + closing brace
+    bool isResponse = (strstr(uartBuffer, "\"resp\":") != nullptr);
     int len = strlen(uartBuffer);
-    if (len > 0 && uartBuffer[len - 1] == '}') {
+
+    if (isResponse) {
+      Serial.println(uartBuffer);
+    } else if (len > 0 && uartBuffer[len - 1] == '}') {
       uartBuffer[len - 1] = '\0';  // Remove closing brace
       Serial.print(uartBuffer);
       Serial.print(F(",\"bv\":"));
