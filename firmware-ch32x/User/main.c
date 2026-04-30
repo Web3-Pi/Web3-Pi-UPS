@@ -25,6 +25,7 @@
  */
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "debug.h"
 #include "PD_Process.h"
@@ -253,6 +254,7 @@ void USART2_Init(uint32_t baudrate)
 {
     GPIO_InitTypeDef  GPIO_InitStructure = {0};
     USART_InitTypeDef USART_InitStructure = {0};
+    NVIC_InitTypeDef  NVIC_InitStructure = {0};
 
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
@@ -263,14 +265,28 @@ void USART2_Init(uint32_t baudrate)
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
+    /* PA3: USART2_RX */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
     USART_InitStructure.USART_BaudRate = baudrate;
     USART_InitStructure.USART_WordLength = USART_WordLength_8b;
     USART_InitStructure.USART_StopBits = USART_StopBits_1;
     USART_InitStructure.USART_Parity = USART_Parity_No;
     USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
-    USART_InitStructure.USART_Mode = USART_Mode_Tx;
+    USART_InitStructure.USART_Mode = USART_Mode_Tx | USART_Mode_Rx;
 
     USART_Init(USART2, &USART_InitStructure);
+
+    USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
+
+    NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
     USART_Cmd(USART2, ENABLE);
 }
 
@@ -287,6 +303,190 @@ void USART2_SendString(const char *s)
     {
         while (USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET);
         USART_SendData(USART2, *s++);
+    }
+}
+
+/*********************************************************************
+ * USART2 RX ring buffer + JSON command framing.
+ *
+ * Frames are brace-balanced, single-line: {"cmd":"<name>","id":<int>}\n
+ * The host (RP2040 forwarding from the Pi service) pushes commands; we
+ * push back a response or push the status JSON on demand.
+ */
+#define UART_RX_BUF_SIZE  128
+#define UART_RX_LINE_SIZE 128
+
+static volatile uint8_t  Uart_Rx_Buf[UART_RX_BUF_SIZE];
+static volatile uint16_t Uart_Rx_Head = 0;
+static volatile uint16_t Uart_Rx_Tail = 0;
+
+void USART2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+
+void USART2_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART2, USART_IT_RXNE) != RESET)
+    {
+        uint8_t c = (uint8_t)USART_ReceiveData(USART2); /* clears RXNE */
+        uint16_t next = (uint16_t)((Uart_Rx_Head + 1) % UART_RX_BUF_SIZE);
+        if (next != Uart_Rx_Tail)
+        {
+            Uart_Rx_Buf[Uart_Rx_Head] = c;
+            Uart_Rx_Head = next;
+        }
+        /* else: buffer full, drop byte. Main loop is too slow if this happens. */
+    }
+}
+
+static int Uart_Rx_Pop(uint8_t *out)
+{
+    if (Uart_Rx_Head == Uart_Rx_Tail) return 0;
+    *out = Uart_Rx_Buf[Uart_Rx_Tail];
+    Uart_Rx_Tail = (uint16_t)((Uart_Rx_Tail + 1) % UART_RX_BUF_SIZE);
+    return 1;
+}
+
+/* Power-cycle state machine: VBUS off -> wait POWERCYCLE_OFF_MS -> VBUS on. */
+typedef enum {
+    POWERCYCLE_IDLE = 0,
+    POWERCYCLE_OFF_WAIT
+} powercycle_state_t;
+
+static powercycle_state_t Powercycle_State = POWERCYCLE_IDLE;
+static UINT16 Powercycle_Timer_Ms = 0;
+#define POWERCYCLE_OFF_MS 1500
+
+static int Json_Get_Int(const char *json, const char *key, int *out)
+{
+    char search[24];
+    int n = snprintf(search, sizeof(search), "\"%s\":", key);
+    if (n <= 0 || n >= (int)sizeof(search)) return 0;
+
+    const char *p = strstr(json, search);
+    if (!p) return 0;
+    p += n;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '-' && (*p < '0' || *p > '9')) return 0;
+    *out = atoi(p);
+    return 1;
+}
+
+static int Json_Get_Str(const char *json, const char *key, char *out, int max_len)
+{
+    char search[24];
+    int n = snprintf(search, sizeof(search), "\"%s\":\"", key);
+    if (n <= 0 || n >= (int)sizeof(search)) return 0;
+
+    const char *p = strstr(json, search);
+    if (!p) return 0;
+    p += n;
+    int i = 0;
+    while (*p && *p != '"' && i < max_len - 1) out[i++] = *p++;
+    out[i] = '\0';
+    return i;
+}
+
+static void Cmd_Send_Resp(const char *cmd, int id, int ok, const char *err)
+{
+    char buf[96];
+    if (err)
+    {
+        snprintf(buf, sizeof(buf),
+                 "{\"resp\":\"%s\",\"id\":%d,\"ok\":%d,\"err\":\"%s\"}\r\n",
+                 cmd, id, ok, err);
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf),
+                 "{\"resp\":\"%s\",\"id\":%d,\"ok\":%d}\r\n",
+                 cmd, id, ok);
+    }
+    USART2_SendString(buf);
+}
+
+static void Cmd_Dispatch(const char *json)
+{
+    char cmd[32] = {0};
+    int  id = 0;
+
+    Json_Get_Int(json, "id", &id);
+    if (!Json_Get_Str(json, "cmd", cmd, sizeof(cmd)))
+    {
+        Cmd_Send_Resp("?", id, 0, "no_cmd");
+        return;
+    }
+
+    if (strcmp(cmd, "ping") == 0)
+    {
+        Cmd_Send_Resp(cmd, id, 1, NULL);
+    }
+    else if (strcmp(cmd, "ups.status") == 0)
+    {
+        Cmd_Send_Resp(cmd, id, 1, NULL);
+        Send_JSON_Status();
+    }
+    else if (strcmp(cmd, "ups.power.disable") == 0)
+    {
+        VBUS_disable();
+        Cmd_Send_Resp(cmd, id, 1, NULL);
+    }
+    else if (strcmp(cmd, "ups.power.enable") == 0)
+    {
+        VBUS_set_5V();
+        Cmd_Send_Resp(cmd, id, 1, NULL);
+    }
+    else if (strcmp(cmd, "ups.power.cycle") == 0)
+    {
+        VBUS_disable();
+        Powercycle_Timer_Ms = 0;
+        Powercycle_State = POWERCYCLE_OFF_WAIT;
+        Cmd_Send_Resp(cmd, id, 1, NULL);
+    }
+    else if (strcmp(cmd, "ups.reset") == 0)
+    {
+        Cmd_Send_Resp(cmd, id, 1, NULL);
+        Delay_Ms(50); /* let TX FIFO drain before reset */
+        NVIC_SystemReset();
+    }
+    else
+    {
+        Cmd_Send_Resp(cmd, id, 0, "unknown");
+    }
+}
+
+/* Drain the RX ring, accumulate bytes between '{' and matching '}', dispatch. */
+static void Cmd_Rx_Drain(void)
+{
+    static char    rx_line[UART_RX_LINE_SIZE];
+    static uint8_t rx_idx = 0;
+    static uint8_t rx_in_json = 0;
+
+    uint8_t c;
+    while (Uart_Rx_Pop(&c))
+    {
+        if (c == '{')
+        {
+            rx_idx = 0;
+            rx_line[rx_idx++] = (char)c;
+            rx_in_json = 1;
+        }
+        else if (rx_in_json)
+        {
+            if (rx_idx >= UART_RX_LINE_SIZE - 1)
+            {
+                rx_idx = 0;
+                rx_in_json = 0;
+                continue; /* line too long: discard frame */
+            }
+            rx_line[rx_idx++] = (char)c;
+            if (c == '}')
+            {
+                rx_line[rx_idx] = '\0';
+                rx_in_json = 0;
+                rx_idx = 0;
+                Cmd_Dispatch(rx_line);
+            }
+        }
+        /* else: byte outside frame -> ignore (no debug stream from RP2040) */
     }
 }
 
@@ -374,6 +574,20 @@ int main(void)
 
 		/* role manager tick: uses Tmr_Ms_Dlt */
         PD_Role_Manager_Tick();
+
+        /* Drain UART RX ring and dispatch any complete command frames. */
+        Cmd_Rx_Drain();
+
+        /* Power-cycle state machine: re-enable VBUS after off window. */
+        if (Powercycle_State == POWERCYCLE_OFF_WAIT)
+        {
+            Powercycle_Timer_Ms += Tmr_Ms_Dlt;
+            if (Powercycle_Timer_Ms >= POWERCYCLE_OFF_MS)
+            {
+                VBUS_set_5V();
+                Powercycle_State = POWERCYCLE_IDLE;
+            }
+        }
 
         PD_Ctl.Det_Timer += Tmr_Ms_Dlt;
         if( PD_Ctl.Det_Timer > 4 )
