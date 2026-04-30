@@ -54,6 +54,7 @@ u16 Get_ADC_Val(u8 ch);
 void USART2_Init(uint32_t baudrate);
 void USART2_SendString(const char *s);
 void Send_JSON_Status(void);
+static void Usart2_Dma_Rx_Init(void);
 #if(Wake_up_mode==USBPDWake_up)
 void USBPDWakeUp_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 #elif(Wake_up_mode==GPIOWake_up)
@@ -254,7 +255,6 @@ void USART2_Init(uint32_t baudrate)
 {
     GPIO_InitTypeDef  GPIO_InitStructure = {0};
     USART_InitTypeDef USART_InitStructure = {0};
-    NVIC_InitTypeDef  NVIC_InitStructure = {0};
 
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
@@ -279,13 +279,9 @@ void USART2_Init(uint32_t baudrate)
 
     USART_Init(USART2, &USART_InitStructure);
 
-    USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
-
-    NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;
-    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
-    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
-    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
-    NVIC_Init(&NVIC_InitStructure);
+    /* DMA-based RX: configure channel and route USART2 RX requests to it. */
+    Usart2_Dma_Rx_Init();
+    USART_DMACmd(USART2, USART_DMAReq_Rx, ENABLE);
 
     USART_Cmd(USART2, ENABLE);
 }
@@ -313,36 +309,43 @@ void USART2_SendString(const char *s)
  * The host (RP2040 forwarding from the Pi service) pushes commands; we
  * push back a response or push the status JSON on demand.
  */
-#define UART_RX_BUF_SIZE  128
 #define UART_RX_LINE_SIZE 128
 
-static volatile uint8_t  Uart_Rx_Buf[UART_RX_BUF_SIZE];
-static volatile uint16_t Uart_Rx_Head = 0;
-static volatile uint16_t Uart_Rx_Tail = 0;
+/* DMA1 Channel 6 receives USART2 RX bytes into this circular buffer. The DMA
+ * controller writes incoming bytes regardless of CPU activity (USBPD IRQ,
+ * etc.), so even tens-of-microsecond CPU stalls cannot cause overruns. The
+ * main loop polls DMA1_Channel6->CNTR to find the current write head and
+ * drains anything new since the last pass. */
+#define DMA_RX_BUF_SIZE 256
+static volatile uint8_t  Dma_Rx_Buf[DMA_RX_BUF_SIZE];
+static volatile uint16_t Dma_Rx_Tail = 0;
+/* Lightweight monitoring counters surfaced in status JSON. */
+static volatile uint32_t Uart_Rx_Total = 0;         /* total RX bytes drained from DMA */
+static volatile uint32_t Cmd_Frames_Dispatched = 0; /* JSON command frames dispatched */
+static volatile uint32_t Uart_Ore_Count = 0;        /* USART2 overrun errors (should stay 0) */
 
-void USART2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-
-void USART2_IRQHandler(void)
+/* DMA-based RX: enabled by Usart2_Dma_Rx_Init(). USART2_IRQHandler is no
+ * longer used — RXNE/ORE flags are handled implicitly by the DMA controller. */
+static void Usart2_Dma_Rx_Init(void)
 {
-    if (USART_GetITStatus(USART2, USART_IT_RXNE) != RESET)
-    {
-        uint8_t c = (uint8_t)USART_ReceiveData(USART2); /* clears RXNE */
-        uint16_t next = (uint16_t)((Uart_Rx_Head + 1) % UART_RX_BUF_SIZE);
-        if (next != Uart_Rx_Tail)
-        {
-            Uart_Rx_Buf[Uart_Rx_Head] = c;
-            Uart_Rx_Head = next;
-        }
-        /* else: buffer full, drop byte. Main loop is too slow if this happens. */
-    }
-}
+    DMA_InitTypeDef DMA_InitStructure = {0};
 
-static int Uart_Rx_Pop(uint8_t *out)
-{
-    if (Uart_Rx_Head == Uart_Rx_Tail) return 0;
-    *out = Uart_Rx_Buf[Uart_Rx_Tail];
-    Uart_Rx_Tail = (uint16_t)((Uart_Rx_Tail + 1) % UART_RX_BUF_SIZE);
-    return 1;
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+    DMA_DeInit(DMA1_Channel6);
+
+    DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)(&USART2->DATAR);
+    DMA_InitStructure.DMA_MemoryBaseAddr = (uint32_t)Dma_Rx_Buf;
+    DMA_InitStructure.DMA_DIR = DMA_DIR_PeripheralSRC;
+    DMA_InitStructure.DMA_BufferSize = DMA_RX_BUF_SIZE;
+    DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
+    DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;
+    DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte;
+    DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_Byte;
+    DMA_InitStructure.DMA_Mode = DMA_Mode_Circular;
+    DMA_InitStructure.DMA_Priority = DMA_Priority_VeryHigh;
+    DMA_InitStructure.DMA_M2M = DMA_M2M_Disable;
+    DMA_Init(DMA1_Channel6, &DMA_InitStructure);
+    DMA_Cmd(DMA1_Channel6, ENABLE);
 }
 
 /* Power-cycle state machine: VBUS off -> wait POWERCYCLE_OFF_MS -> VBUS on. */
@@ -453,16 +456,32 @@ static void Cmd_Dispatch(const char *json)
     }
 }
 
-/* Drain the RX ring, accumulate bytes between '{' and matching '}', dispatch. */
+/* Drain the DMA RX buffer, accumulate bytes between '{' and matching '}', dispatch. */
 static void Cmd_Rx_Drain(void)
 {
     static char    rx_line[UART_RX_LINE_SIZE];
     static uint8_t rx_idx = 0;
     static uint8_t rx_in_json = 0;
 
-    uint8_t c;
-    while (Uart_Rx_Pop(&c))
+    /* DMA should keep RXNE drained fast enough that ORE never sets. Track
+     * any occurrence anyway — non-zero ore in status JSON would mean the
+     * DMA controller stalled (e.g. high-priority bus contention). */
+    if (USART2->STATR & 0x08u) {
+        Uart_Ore_Count++;
+        (void)USART2->DATAR;  /* "read SR + read DR" sequence clears ORE */
+    }
+
+    /* DMA write head = bytes_total - bytes_remaining_to_transfer.
+     * The CNTR register decrements as DMA writes each byte. In circular mode,
+     * when CNTR reaches 0 it reloads to BufferSize and DMA continues. */
+    uint16_t head = DMA_RX_BUF_SIZE - (uint16_t)DMA1_Channel6->CNTR;
+
+    while (Dma_Rx_Tail != head)
     {
+        uint8_t c = Dma_Rx_Buf[Dma_Rx_Tail];
+        Dma_Rx_Tail = (uint16_t)((Dma_Rx_Tail + 1) % DMA_RX_BUF_SIZE);
+        Uart_Rx_Total++;
+
         if (c == '{')
         {
             rx_idx = 0;
@@ -483,6 +502,7 @@ static void Cmd_Rx_Drain(void)
                 rx_line[rx_idx] = '\0';
                 rx_in_json = 0;
                 rx_idx = 0;
+                Cmd_Frames_Dispatched++;
                 Cmd_Dispatch(rx_line);
             }
         }
@@ -507,7 +527,8 @@ void Send_JSON_Status(void)
         "\"t\":%d,"
         "\"vs\":%d,\"is\":%d,\"vr\":%d,\"ir\":%d,"
         "\"bp\":%d,\"bp2\":%d,\"cs\":%d,\"pg\":%d,"
-        "\"vi\":%d,\"ii\":%d,\"vb\":%d,\"ci\":%d,\"cf\":%d}\r\n",
+        "\"vi\":%d,\"ii\":%d,\"vb\":%d,\"ci\":%d,\"cf\":%d,"
+        "\"rxc\":%lu,\"cmd\":%lu,\"ore\":%lu}\r\n",
         (unsigned long)Uptime_Sec,
         (int)PD_Ctl.PD_State,
         (int)PD_Get_SinkReqPDOIndex(),
@@ -529,7 +550,10 @@ void Send_JSON_Status(void)
         (int)Chg_Data.iin_ma,
         (int)Chg_Data.vbat_mv,
         (int)Chg_Data.ichg_ma,
-        (int)Chg_Data.fault
+        (int)Chg_Data.fault,
+        (unsigned long)Uart_Rx_Total,
+        (unsigned long)Cmd_Frames_Dispatched,
+        (unsigned long)Uart_Ore_Count
     );
     USART2_SendString(json_buf);
 }

@@ -3,8 +3,10 @@
 #
 # Modes:
 #   ./flash.sh                Dev re-flash. Assumes chip is already unprotected.
-#   ./flash.sh --first        First flash on a fresh CH32X035. Runs `wchisp config unprotect`
-#                             before flashing (factory chips ship with RDPR=0xFF).
+#   ./flash.sh --first        First flash on a fresh CH32X035. Sends WRITE_CONFIG to
+#                             unprotect, then erase/flash/verify in the same USB
+#                             session — only ONE BOOT+reset needed.
+#                             Requires patched wchisp (with `flash --unprotect`).
 #   ./flash.sh --prod         Production flash. Skips verify and leaves RDPR engaged so
 #                             end users cannot read firmware out of the chip.
 #
@@ -17,7 +19,7 @@ MODE="${1:-dev}"
 
 case "$MODE" in
   -h|--help)
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
   dev|--first|--prod) ;;
@@ -41,16 +43,21 @@ wait_for_boot() {
 
 wait_for_boot
 
-if [ "$MODE" = "--first" ]; then
-  echo "Unprotecting flash (one-time per chip)..."
-  wchisp config unprotect
-  wait_for_boot   # unprotect resets the chip — re-enter boot mode
-fi
-
-if [ "$MODE" = "--prod" ]; then
-  wchisp flash --no-verify "$HEX"
-else
-  wchisp flash "$HEX"
-fi
+case "$MODE" in
+  --first)
+    if ! wchisp flash --help 2>/dev/null | grep -q -- '--unprotect'; then
+      echo "ERROR: this wchisp build doesn't support 'flash --unprotect'." >&2
+      echo "Rebuild from /Users/cmd0s/data/repos/wchisp (the local fork) and re-run." >&2
+      exit 3
+    fi
+    wchisp flash --unprotect "$HEX"
+    ;;
+  --prod)
+    wchisp flash --no-verify "$HEX"
+    ;;
+  dev)
+    wchisp flash "$HEX"
+    ;;
+esac
 
 echo "✓ Flashed at $(date '+%H:%M:%S')"

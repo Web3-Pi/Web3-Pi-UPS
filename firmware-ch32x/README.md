@@ -126,11 +126,19 @@ Programming uses the **CH32X035 built-in USB ISP bootloader** — no WCH-Link re
 
 ### Prerequisites
 
+This project uses a **locally-patched fork of `wchisp`** that adds a `flash --unprotect` flag (`-U`). The flag does WRITE_CONFIG → ISP_KEY → ERASE → PROGRAM → VERIFY in a **single USB session**, mirroring what WCHISPTool's GUI does. With upstream `wchisp` 0.3.0 you have to run `wchisp config unprotect` separately, which sends `IspEnd(1)` and resets the MCU out of the bootloader, forcing a second BOOT+RESET — the patch eliminates that.
+
+Install (Rust toolchain required):
+
 ```bash
-# install wchisp (Rust toolchain required, or grab a release binary from the repo)
-cargo install wchisp
-wchisp --version    # tested with 0.3.0
+git clone https://github.com/ch32-rs/wchisp.git ~/data/repos/wchisp
+cd ~/data/repos/wchisp
+# apply the local patch (see /Users/cmd0s/data/repos/wchisp/ for the diff against upstream)
+cargo install --path . --force
+wchisp flash --help | grep -- --unprotect    # confirm the flag is present
 ```
+
+Stock upstream still works for `dev` re-flashes; you only need the patch for `--first` mode.
 
 ### Entering boot mode
 
@@ -150,19 +158,26 @@ wchisp probe
 
 ### First flash on a fresh CH32X035
 
-Factory chips ship with **read-out protection enabled** (`RDPR ≠ 0xA5`), which causes `verify` to fail because the bootloader returns `0xFF` on read. Unprotect once per chip:
+Factory chips ship with **read-out protection enabled** (`RDPR = 0xFF`, not `0xA5`). Without unprotecting first, `wchisp flash` writes the firmware fine but **`verify` fails with `mismatch`** because the bootloader returns `0xFF` on read.
+
+With the **patched `wchisp`** (see Prerequisites), one BOOT+RESET is enough:
 
 ```bash
-wchisp config unprotect
-# NOTE: unprotect resets the device — re-enter boot mode before the next command.
-wchisp flash obj/USB-PD.hex
+wchisp flash --unprotect obj/USB-PD.hex
 ```
 
-`wchisp flash` performs erase → program → verify → reset in a single step.
+This sends WRITE_CONFIG (unprotect) → ISP_KEY → ERASE → PROGRAM → VERIFY → RESET in one USB session — same flow as WCHISPTool GUI.
+
+> **Stock upstream `wchisp` (no patch)** — you'd need two CLI calls and **two** BOOT+RESET sequences:
+> ```bash
+> wchisp config unprotect              # sends IspEnd(1) → MCU resets out of bootloader
+> # BOOT + RESET again here
+> wchisp flash obj/USB-PD.hex
+> ```
 
 ### Subsequent flashes during development
 
-Once unprotected, the chip stays unprotected across power cycles. Just enter boot mode and:
+Once unprotected, the chip stays unprotected across power cycles. BOOT + RESET, then:
 
 ```bash
 wchisp flash obj/USB-PD.hex
@@ -176,7 +191,7 @@ For shipped units, **keep RDPR engaged** to prevent end-user firmware readback. 
 wchisp flash --no-verify obj/USB-PD.hex
 ```
 
-The write itself still completes; only the verify pass (which would fail against a protected chip) is skipped.
+The write itself still completes; only the verify pass (which would fail against a protected chip) is skipped. RDPR remains `0xFF` after flashing.
 
 ### Helper script: `flash.sh`
 
@@ -184,7 +199,8 @@ A ready-made wrapper lives at [`firmware-ch32x/flash.sh`](flash.sh). Build the `
 
 ```bash
 ./flash.sh                    # Dev re-flash (chip already unprotected)
-./flash.sh --first            # Fresh chip — runs `wchisp config unprotect` then flashes
+./flash.sh --first            # Fresh chip — single-session unprotect + flash (one BOOT+RESET).
+                              # Requires patched wchisp; the script aborts if the --unprotect flag is missing.
 ./flash.sh --prod             # Production — flashes with --no-verify, RDPR stays engaged
 ./flash.sh --help             # Usage summary
 ```
@@ -196,8 +212,9 @@ The script waits for the MCU to enter boot mode before flashing, so for a 50-uni
 | Symptom                                              | Cause / fix                                                                              |
 |------------------------------------------------------|------------------------------------------------------------------------------------------|
 | `No WCH ISP USB device found (4348:55e0 ...)`        | Not in boot mode. Re-do BOOT + RESET sequence.                                           |
-| `Verify failed, mismatch` after `flash`              | RDPR engaged. Run `wchisp config unprotect` (then re-enter boot, re-flash), or use `--no-verify`. |
-| Device disappears after `wchisp config unprotect`    | Expected — `unprotect` resets the chip. Re-enter boot mode and continue.                 |
+| `Verify failed, mismatch` after `flash` on a fresh chip | RDPR engaged. Use `wchisp flash --unprotect` (patched build) or `wchisp config unprotect` + re-enter boot + `wchisp flash` (upstream), or `--no-verify` for production. |
+| `flash.sh --first` aborts with "this wchisp build doesn't support 'flash --unprotect'" | `~/.cargo/bin/wchisp` is the upstream build. Reinstall the patched fork: `cd ~/data/repos/wchisp && cargo install --path . --force`. |
+| Device disappears after `wchisp config unprotect`    | Expected — upstream `unprotect` resets the chip via `IspEnd(1)`. Re-enter boot mode, or use the patched `flash --unprotect` instead. |
 | Data-only USB cable                                  | Use a known-good USB-C / USB-A data cable.                                               |
 
 ## JSON Status Protocol
