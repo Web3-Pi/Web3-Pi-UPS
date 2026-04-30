@@ -2,11 +2,83 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <SerialPIO.h>
 
 // --- I2C for OLED ---
 constexpr uint8_t I2C0_SDA_PIN = 8;
 constexpr uint8_t I2C0_SCL_PIN = 9;
 TwoWire WireCustom(i2c0, I2C0_SDA_PIN, I2C0_SCL_PIN);
+
+// --- Debug serial via PIO software UART (J350 -> Raspberry Pi Debug Probe UART) ---
+// Both hardware UARTs are claimed (UART0 = CH32X on GPIO16/17, UART1 reserved
+// for the M.2 ESP32). J350 uses GPIO0 (TX) / GPIO1 (RX) — same data the host
+// service sees on USB-CDC, mirrored here so we can monitor with the Probe
+// while the Pi 5 holds the USB-CDC port.
+constexpr uint8_t DBG_TX_PIN = 0;
+constexpr uint8_t DBG_RX_PIN = 1;
+constexpr uint32_t DBG_BAUD = 921600;  // match CH32X UART baud — no need to remember different speeds
+SerialPIO dbgSerial(DBG_TX_PIN, DBG_RX_PIN, 32);
+
+// Software ring buffer in front of dbgSerial. Earlephilhower's SerialPIO has
+// only an 8-byte hardware TX FIFO and its write() calls pio_sm_put_blocking,
+// so writing a 250-byte status JSON straight to it would stall loop() for
+// ~22 ms (or forever if the PIO TX SM stops draining). DbgRing absorbs bursts
+// in 1 KB of RAM, drops bytes silently when full, and is drained in loop()
+// only as fast as the PIO HW FIFO has room — fully non-blocking.
+class DbgRing : public Print {
+public:
+  static constexpr size_t SIZE = 1024;
+  size_t write(uint8_t c) override {
+    size_t next = (_head + 1) % SIZE;
+    if (next == _tail) return 0;  // full, drop
+    _buf[_head] = c;
+    _head = next;
+    return 1;
+  }
+  size_t write(const uint8_t* buf, size_t n) override {
+    size_t written = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (write(buf[i]) == 0) break;
+      written++;
+    }
+    return written;
+  }
+  // Pump drains the ring. SerialPIO::write blocks max ~11 us per byte at
+  // 921600, so worst-case pump time = SIZE * 11 us = 11 ms (full ring) —
+  // well within the 50 ms loop budget. Bound by ring capacity to be safe.
+  void pump(Stream& dst) {
+    size_t budget = SIZE;
+    while (_head != _tail && budget--) {
+      dst.write(_buf[_tail]);
+      _tail = (_tail + 1) % SIZE;
+    }
+  }
+private:
+  uint8_t _buf[SIZE];
+  size_t _head = 0;
+  size_t _tail = 0;
+};
+DbgRing dbgRing;
+
+// Print fan-out to USB-CDC (authoritative) and dbgRing (best-effort).
+class TeePrint : public Print {
+public:
+  TeePrint(Print& a, Print& b) : _a(a), _b(b) {}
+  size_t write(uint8_t c) override {
+    _a.write(c);
+    _b.write(c);
+    return 1;
+  }
+  size_t write(const uint8_t* buf, size_t n) override {
+    _a.write(buf, n);
+    _b.write(buf, n);
+    return n;
+  }
+private:
+  Print& _a;
+  Print& _b;
+};
+TeePrint dbgOut(Serial, dbgRing);
 
 // --- UART0 bidirectional (RP2040 <-> CH32X) ---
 constexpr uint8_t GPIO16_PIN = 16;   // GPIO16 - UART0 TX (commands to CH32X)
@@ -100,15 +172,20 @@ int uartIdx = 0;
 char dbgBuffer[128];
 int dbgIdx = 0;
 
-// --- Host (USB-CDC) -> CH32X command framing ---
-// Host writes single-line JSON commands like {"cmd":"ups.power.cycle","id":7}
-// to the USB-CDC port. We accumulate brace-balanced frames and forward verbatim
-// to Serial1 (CH32X). Responses come back via Serial1 and are forwarded out
-// USB-CDC unchanged (without the ADC-augmentation we apply to status JSONs).
-char hostBuffer[256];
-int hostIdx = 0;
-bool hostInJson = false;
+// --- Command framing from a host-side stream -> CH32X ---
+// Hosts write single-line JSON commands like {"cmd":"ups.power.cycle","id":7}
+// to either USB-CDC (Pi 5 service) or the Probe UART (J350). We accumulate
+// brace-balanced frames and forward verbatim to Serial1 (CH32X). One state
+// struct per source so the two streams can interleave bytes safely.
+struct CmdRxState {
+  char buffer[256];
+  int  idx = 0;
+  bool inJson = false;
+};
+CmdRxState hostRx;
+CmdRxState dbgRx;
 uint32_t nextCmdId = 1;
+volatile uint32_t cmdFramesForwarded = 0;  // diagnostic — read via SWD to confirm forwarding works
 int json_t = 0;    // temperature
 int json_vs = 0;   // voltage source
 int json_is = 0;   // current source
@@ -189,7 +266,7 @@ bool extractInt(const char* json, const char* key, int& outVal) {
 void parseJson(const char* json) {
   // Basic validation: must start with { and contain at least one :
   if (json[0] != '{' || strchr(json, ':') == nullptr) {
-    Serial.println(F("JSON: invalid format"));
+    dbgOut.println(F("JSON: invalid format"));
     return;
   }
 
@@ -559,33 +636,32 @@ static uint32_t sendUpsCommand(const char* cmd) {
   return id;
 }
 
-// Drain USB-CDC input: collect brace-balanced frames from the host service
-// and forward them verbatim to CH32X. The host-side service issues commands
-// like {"cmd":"ups.power.cycle","id":7}\n.
-static void drainHostSerial() {
-  while (Serial.available()) {
-    char c = (char)Serial.read();
+// Drain a command stream: collect brace-balanced frames and forward verbatim
+// to CH32X. Bytes outside frames are ignored.
+static void drainCmdStream(Stream& src, CmdRxState& st) {
+  while (src.available()) {
+    char c = (char)src.read();
     if (c == '{') {
-      hostIdx = 0;
-      hostBuffer[hostIdx++] = c;
-      hostInJson = true;
-    } else if (hostInJson) {
-      if (hostIdx >= (int)sizeof(hostBuffer) - 1) {
+      st.idx = 0;
+      st.buffer[st.idx++] = c;
+      st.inJson = true;
+    } else if (st.inJson) {
+      if (st.idx >= (int)sizeof(st.buffer) - 1) {
         // Frame too long: discard
-        hostIdx = 0;
-        hostInJson = false;
+        st.idx = 0;
+        st.inJson = false;
         continue;
       }
-      hostBuffer[hostIdx++] = c;
+      st.buffer[st.idx++] = c;
       if (c == '}') {
-        hostBuffer[hostIdx] = '\0';
-        Serial1.print(hostBuffer);
+        st.buffer[st.idx] = '\0';
+        Serial1.print(st.buffer);
         Serial1.print(F("\r\n"));
-        hostIdx = 0;
-        hostInJson = false;
+        cmdFramesForwarded++;
+        st.idx = 0;
+        st.inJson = false;
       }
     }
-    // Bytes outside frames are ignored (host should send line-framed JSON only).
   }
 }
 
@@ -653,15 +729,21 @@ void setup() {
   analogReadResolution(ADC_BITS);
 
   Serial.begin(115200);
+  dbgSerial.begin(DBG_BAUD);
   while (!Serial && millis() < 3000); // Wait for USB Serial (max 3s)
-  Serial.println(F("Starting..."));
+  dbgOut.println(F("Web3 Pi UPS RP2040 boot"));
 
   // UART0 to CH32X: RX on GPIO17 (status JSON + responses), TX on GPIO16 (commands)
   Serial1.setRX(UART0_RX_PIN);
   Serial1.setTX(GPIO16_PIN);
   Serial1.setFIFOSize(256);  // Increase RX buffer (default is 32)
   Serial1.begin(921600);
-  Serial.println(F("UART0 bidir on GPIO17/16 @ 921600"));
+  // Bump GPIO16 drive 4 mA -> 12 mA + slewfast for cleaner edges through patch wire.
+  // PADS reg layout: [0]=SLEWFAST, [1]=SCHMITT, [2]=PDE, [3]=PUE, [5:4]=DRIVE, [6]=IE, [7]=OD
+  // Touch only DRIVE (5:4) and SLEWFAST (0); leave SCHMITT, PDE, PUE, IE alone.
+  volatile uint32_t* gpio16_pads = (volatile uint32_t*)(0x4001c000u + 0x04u + 16u * 4u);
+  *gpio16_pads = (*gpio16_pads & ~0x31u) | 0x31u;
+  dbgOut.println(F("UART0 bidir on GPIO17/16 @ 921600, GPIO16 drive=12mA"));
 
   // Init I2C for OLED
   WireCustom.begin();
@@ -669,7 +751,7 @@ void setup() {
 
   // Start OLED
   if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    Serial.println(F("SSD1306 init failed!"));
+    dbgOut.println(F("SSD1306 init failed!"));
     while (true) { delay(1000); }
   }
 
@@ -694,8 +776,14 @@ void setup() {
 }
 
 void loop() {
-  // Drain commands from the host service (USB-CDC) and forward to CH32X.
-  drainHostSerial();
+  // Drain commands from the host service (USB-CDC) and the Probe UART (J350)
+  // and forward both to CH32X. Each source has its own framing state.
+  drainCmdStream(Serial, hostRx);
+  drainCmdStream(dbgSerial, dbgRx);
+
+  // Shovel as much of the debug ring buffer as the SerialPIO HW FIFO can
+  // accept, then return. Non-blocking, runs every loop iteration (~50 ms).
+  dbgRing.pump(dbgSerial);
 
   // Read ADC values (single sample, EMA filtering handles noise)
   int rawBattVolt = analogRead(ADC_BATT_VOLT_PIN);
@@ -750,7 +838,7 @@ void loop() {
         // End of debug line
         dbgBuffer[dbgIdx] = '\0';
         if (dbgIdx > 0) {
-          Serial.println(dbgBuffer);
+          dbgOut.println(dbgBuffer);
         }
         dbgIdx = 0;
       }
@@ -761,7 +849,7 @@ void loop() {
       else if (dbgIdx >= (int)sizeof(dbgBuffer) - 1) {
         // Debug buffer overflow - flush
         dbgBuffer[dbgIdx] = '\0';
-        Serial.println(dbgBuffer);
+        dbgOut.println(dbgBuffer);
         dbgIdx = 0;
       }
     }
@@ -827,21 +915,21 @@ void loop() {
     int len = strlen(uartBuffer);
 
     if (isResponse) {
-      Serial.println(uartBuffer);
+      dbgOut.println(uartBuffer);
     } else if (len > 0 && uartBuffer[len - 1] == '}') {
       uartBuffer[len - 1] = '\0';  // Remove closing brace
-      Serial.print(uartBuffer);
-      Serial.print(F(",\"bv\":"));
-      Serial.print(json_bv);
-      Serial.print(F(",\"SOC\":"));
-      Serial.print(soc);
-      Serial.print(F(",\"bd\":"));
-      Serial.print(soc);
-      Serial.print(F(",\"vo\":"));
-      Serial.print(vbus_out_mV);
-      Serial.println(F("}"));
+      dbgOut.print(uartBuffer);
+      dbgOut.print(F(",\"bv\":"));
+      dbgOut.print(json_bv);
+      dbgOut.print(F(",\"SOC\":"));
+      dbgOut.print(soc);
+      dbgOut.print(F(",\"bd\":"));
+      dbgOut.print(soc);
+      dbgOut.print(F(",\"vo\":"));
+      dbgOut.print(vbus_out_mV);
+      dbgOut.println(F("}"));
     } else {
-      Serial.println(uartBuffer);  // Fallback: print as-is
+      dbgOut.println(uartBuffer);  // Fallback: print as-is
     }
     newJsonReceived = false;
   }
