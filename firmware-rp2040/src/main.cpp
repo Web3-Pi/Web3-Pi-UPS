@@ -60,7 +60,24 @@ private:
 };
 DbgRing dbgRing;
 
-// Print fan-out to USB-CDC (authoritative) and dbgRing (best-effort).
+// Drops writes when the USB-CDC host has no port open. Earlephilhower's
+// SerialUSB::write blocks ~50 ms per byte waiting for buffer space when
+// DTR is deasserted — without this guard a 290-byte status JSON freezes
+// the loop for ~14 s, and nothing reaches the probe UART either.
+class UsbCdcDropIfDetached : public Print {
+public:
+  size_t write(uint8_t c) override {
+    if (Serial) Serial.write(c);
+    return 1;
+  }
+  size_t write(const uint8_t* buf, size_t n) override {
+    if (Serial) Serial.write(buf, n);
+    return n;
+  }
+};
+UsbCdcDropIfDetached usbCdcOut;
+
+// Print fan-out to USB-CDC (best-effort, dropped when no host) and dbgRing.
 class TeePrint : public Print {
 public:
   TeePrint(Print& a, Print& b) : _a(a), _b(b) {}
@@ -78,7 +95,7 @@ private:
   Print& _a;
   Print& _b;
 };
-TeePrint dbgOut(Serial, dbgRing);
+TeePrint dbgOut(usbCdcOut, dbgRing);
 
 // --- UART0 bidirectional (RP2040 <-> CH32X) ---
 constexpr uint8_t GPIO16_PIN = 16;   // GPIO16 - UART0 TX (commands to CH32X)
@@ -142,7 +159,8 @@ constexpr uint8_t BTN_RIGHT_PIN = 14;  // GPIO14 - right button (active LOW)
 constexpr unsigned long DEBOUNCE_MS = 50;
 
 // --- Screen navigation ---
-constexpr uint8_t SCREEN_COUNT = 4;
+constexpr uint8_t SCREEN_COUNT = 5;
+constexpr uint8_t SCREEN_POWER_CTRL = 4;  // last screen — buttons act as power on/off
 constexpr unsigned long AUTO_RETURN_MS = 15000;  // Auto-return to home after 15s
 
 // --- Bad charger alert state ---
@@ -444,7 +462,7 @@ static void playCriticalBatteryBeep() {
 
 // Draw screen indicator dots (4 dots, current screen filled)
 static void drawScreenIndicator(uint8_t screen) {
-  const int baseX = 56;
+  const int baseX = 64 - (SCREEN_COUNT * 2);
   const int y = 30;
 
   for (uint8_t i = 0; i < SCREEN_COUNT; i++) {
@@ -622,6 +640,37 @@ static void drawScreenPDInfo() {
   oled.print(F("V"));
 
   drawScreenIndicator(3);
+}
+
+// Screen 4: Power Control — LEFT disables VBUS_OUT, RIGHT re-enables it.
+static void drawScreenPowerCtrl() {
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  // Line 0: header
+  oled.setCursor(0, 0);
+  oled.print(F("Power Ctrl"));
+
+  // Line 1: ON / OFF status — derived from RP2040's own VBUS_OUT ADC so
+  // we don't depend on the cached CH32X TPS55289 set values for the truth.
+  bool outputOn = (vbus_out_mV > 1000);
+  oled.setCursor(0, 8);
+  oled.print(F("OUT: "));
+  oled.print(outputOn ? F("ON") : F("OFF"));
+
+  // Line 2: button hint — LEFT turns off, RIGHT turns on
+  oled.setCursor(0, 16);
+  oled.print(F("<OFF  ON>"));
+
+  // Line 3: measured output voltage + screen indicator
+  oled.setCursor(0, 24);
+  oled.print(F("Vo:"));
+  oled.print(vbus_out_mV / 1000);
+  oled.print(F("."));
+  oled.print((vbus_out_mV % 1000) / 100);
+  oled.print(F("V"));
+
+  drawScreenIndicator(SCREEN_POWER_CTRL);
 }
 
 // Send a JSON command to CH32X over Serial1.
@@ -856,19 +905,32 @@ void loop() {
 #endif
   }
 
-  // --- Button navigation ---
+  // --- Button handling ---
+  // On the Power Control screen the buttons trigger ups.power.* commands.
+  // On every other screen they navigate left/right.
   int8_t btnAction = checkButtons();
   if (btnAction != 0) {
     lastInteractionTime = millis();
 
-    if (btnAction > 0) {
-      // RIGHT pressed - next screen (wrap)
-      currentScreen = (currentScreen + 1) % SCREEN_COUNT;
+    if (currentScreen == SCREEN_POWER_CTRL) {
+      if (btnAction < 0) {
+        uint32_t id = sendUpsCommand("ups.power.disable");
+        dbgOut.print(F("[btn] LEFT -> ups.power.disable id="));
+        dbgOut.println(id);
+      } else {
+        uint32_t id = sendUpsCommand("ups.power.enable");
+        dbgOut.print(F("[btn] RIGHT -> ups.power.enable id="));
+        dbgOut.println(id);
+      }
     } else {
-      // LEFT pressed - previous screen (wrap)
-      currentScreen = (currentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT;
+      if (btnAction > 0) {
+        // RIGHT pressed - next screen (wrap)
+        currentScreen = (currentScreen + 1) % SCREEN_COUNT;
+      } else {
+        // LEFT pressed - previous screen (wrap)
+        currentScreen = (currentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT;
+      }
     }
-    // Button click feedback
     tone(BUZZER_PIN, 1000, 20);
   }
 
@@ -1041,6 +1103,9 @@ void loop() {
         break;
       case 3:
         drawScreenPDInfo();
+        break;
+      case SCREEN_POWER_CTRL:
+        drawScreenPowerCtrl();
         break;
     }
   }
