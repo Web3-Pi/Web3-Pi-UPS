@@ -65,6 +65,7 @@ void tps55289_set_cdc_compensation(UINT8 level);
 // Get cached set values (in 0.1V and 0.1A units)
 int16_t tps55289_get_voltage_set_v10(void);
 int16_t tps55289_get_current_set_a10(void);
+void    tps55289_clear_set_cache(void);
 
 // Read back configured values from I2C
 float tps55289_read_voltage(void);

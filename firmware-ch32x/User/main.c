@@ -106,6 +106,14 @@ void VBUS_disable(void)
 //	GPIO_WriteBit(GPIOB, GPIO_Pin_12, 0);
 //tps55289 disable
 	tps55289_enable_output(0);
+	/* Clear cached telemetry so the JSON status reflects "off" rather
+	 * than the last negotiated 15V/1.8A. Otherwise vs/is/vr/ir/pdo would
+	 * keep showing the pre-disable contract and the UI/host would have
+	 * no way to tell the rail is actually down. */
+	tps55289_clear_set_cache();
+	Tps_Vread_v10 = 0;
+	Tps_Iread_a10 = 0;
+	PD_Ctl.ReqPDO_Idx = 0;
 }
 /*********************************************************************/
 void VBUS_set_5V(void)
@@ -116,6 +124,28 @@ void VBUS_set_5V(void)
 	tps55289_set_current_limit(3.0);
 	tps55289_set_voltage(5.1);
 	tps55289_enable_output(1);
+}
+
+/* Re-arm the PD source FSM for a fresh negotiation. Without this the
+ * FSM stays at STA_IDLE post-PS_RDY and a sink that previously negotiated
+ * >5V (e.g. our 15V test load) just sees VBUS_set_5V come back at 5.1V
+ * with no new SRC_CAP and no way to renegotiate.
+ *
+ * Skip STA_DISCONNECT path: that case calls PD_PHY_Reset() every tick,
+ * which appears to drop the Rp pull-up on CC. With Rp gone, PD_Det_Proc
+ * never sees the still-attached sink (CC reads as floating) and the FSM
+ * gets stuck — confirmed in test logs where vo stayed 0 after enable.
+ *
+ * Push the FSM straight to STA_SINK_CONNECT with timers reset. Its 159 ms
+ * dwell drops us into STA_TX_SRC_CAP which broadcasts a fresh SRC_CAP.
+ * The sink, having just lost VBUS, treats the new SRC_CAP as a clean
+ * renegotiation and requests its preferred PDO. */
+static void Power_Output_Restart(void)
+{
+	VBUS_set_5V();
+	PD_Ctl.PD_State = STA_SINK_CONNECT;
+	PD_Ctl.PD_Comm_Timer = 0;
+	PD_Ctl.Src_Cap_Cnt = 0;
 }
 /*********************************************************************
  * @fn      GPIO_Port_Init
@@ -434,7 +464,7 @@ static void Cmd_Dispatch(const char *json)
     }
     else if (strcmp(cmd, "ups.power.enable") == 0)
     {
-        VBUS_set_5V();
+        Power_Output_Restart();
         Cmd_Send_Resp(cmd, id, 1, NULL);
     }
     else if (strcmp(cmd, "ups.power.cycle") == 0)
@@ -608,7 +638,7 @@ int main(void)
             Powercycle_Timer_Ms += Tmr_Ms_Dlt;
             if (Powercycle_Timer_Ms >= POWERCYCLE_OFF_MS)
             {
-                VBUS_set_5V();
+                Power_Output_Restart();
                 Powercycle_State = POWERCYCLE_IDLE;
             }
         }

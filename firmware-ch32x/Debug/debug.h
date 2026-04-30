@@ -26,8 +26,13 @@ extern "C" {
 #define DEBUG_UART3    3
 
 /* DEBUG UATR Definition */
+/* Route printf through USART2 (PA2 TX) — the same line that carries the
+ * status JSON to the RP2040. This way CH32X PD-stack debug prints
+ * ("Disconnect", "CC SINK Connect", "Send Source Cap Successfully", …)
+ * reach the probe UART through the RP2040's debug-line parser, instead
+ * of getting lost on USART1/PB10 (unconnected pin). */
 #ifndef DEBUG
-#define DEBUG   DEBUG_UART1
+#define DEBUG   DEBUG_UART2
 #endif
 
 /* SDI Printf Definition */

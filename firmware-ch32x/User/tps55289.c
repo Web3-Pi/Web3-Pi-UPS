@@ -139,6 +139,7 @@ UINT8 tps55289_set_voltage(float vout)
 // -----------------------------------------------------------------------------
 int16_t tps55289_get_voltage_set_v10(void) { return g_voltage_set_v10; }
 int16_t tps55289_get_current_set_a10(void) { return g_current_set_a10; }
+void    tps55289_clear_set_cache(void)     { g_voltage_set_v10 = 0; g_current_set_a10 = 0; }
 // -----------------------------------------------------------------------------
 //  Read back configured voltage from I2C registers
 // -----------------------------------------------------------------------------
