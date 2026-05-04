@@ -33,6 +33,7 @@
 #include "tps55289.h"
 #include "lm75b.h"
 #include "mp2762a.h"
+#include "wups_proto.h"
 
 /* ADC WWDG Mode Definition*/
 #define NoSCAN_MODE_WDT   0
@@ -53,8 +54,9 @@ void ADC_Function_Init(void);
 u16 Get_ADC_Val(u8 ch);
 void USART2_Init(uint32_t baudrate);
 void USART2_SendString(const char *s);
-void Send_JSON_Status(void);
 static void Usart2_Dma_Rx_Init(void);
+static void wups_send_power_status(uint8_t dst, uint8_t flags, uint8_t seq);
+static void wups_send_hello_bcast(void);
 #if(Wake_up_mode==USBPDWake_up)
 void USBPDWakeUp_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 #elif(Wake_up_mode==GPIOWake_up)
@@ -333,13 +335,13 @@ void USART2_SendString(const char *s)
 }
 
 /*********************************************************************
- * USART2 RX ring buffer + JSON command framing.
+ * USART2 RX ring buffer.
  *
- * Frames are brace-balanced, single-line: {"cmd":"<name>","id":<int>}\n
- * The host (RP2040 forwarding from the Pi service) pushes commands; we
- * push back a response or push the status JSON on demand.
+ * DMA1 Channel 6 fills `Dma_Rx_Buf` in circular mode regardless of CPU
+ * activity (USBPD IRQ etc.), so even tens-of-microsecond stalls cannot
+ * cause overruns. The deframer (further down in this file) is fed one
+ * byte at a time by `Cmd_Rx_Drain()` which polls the DMA write head.
  */
-#define UART_RX_LINE_SIZE 128
 
 /* DMA1 Channel 6 receives USART2 RX bytes into this circular buffer. The DMA
  * controller writes incoming bytes regardless of CPU activity (USBPD IRQ,
@@ -351,7 +353,7 @@ static volatile uint8_t  Dma_Rx_Buf[DMA_RX_BUF_SIZE];
 static volatile uint16_t Dma_Rx_Tail = 0;
 /* Lightweight monitoring counters surfaced in status JSON. */
 static volatile uint32_t Uart_Rx_Total = 0;         /* total RX bytes drained from DMA */
-static volatile uint32_t Cmd_Frames_Dispatched = 0; /* JSON command frames dispatched */
+static volatile uint32_t Cmd_Frames_Dispatched = 0; /* binary frames successfully deframed */
 static volatile uint32_t Uart_Ore_Count = 0;        /* USART2 overrun errors (should stay 0) */
 
 /* DMA-based RX: enabled by Usart2_Dma_Rx_Init(). USART2_IRQHandler is no
@@ -388,122 +390,323 @@ static powercycle_state_t Powercycle_State = POWERCYCLE_IDLE;
 static UINT16 Powercycle_Timer_Ms = 0;
 #define POWERCYCLE_OFF_MS 1500
 
-static int Json_Get_Int(const char *json, const char *key, int *out)
+/*********************************************************************
+ * Web3 Pi UPS — binary wire protocol v1 (CH32X side).
+ *
+ * Replaces the earlier brace-balanced JSON command/status path. Spec:
+ * Web3-Pi-UPS/common/protocol_desc.md. CH32X is a leaf node at
+ * address WUPS_ADDR_CH32X, connected to RP2040 over USART2 @ 921600.
+ *
+ * Outbound:
+ *   - power.status (CLASS=0x02 OP=0x01) every 1 s as EVENT, unicast to RP2040.
+ *   - system.hello broadcast on boot.
+ *   - power.event broadcast on state change (helper provided, wiring TBD).
+ *
+ * Inbound:
+ *   - system.ping (REQ) -> system.ping (RESP) with uptime + fw_version.
+ *   - system.status_query (REQ) -> power.status (RESP).
+ *   - power.{enable,disable,cycle,reset} (REQ).
+ *   - All other classes / ops are silently ignored — CH32X is a leaf
+ *     and only owns the POWER + SYSTEM classes.
+ */
+
+/* Synchronous TX byte sender. The PD stack also writes ASCII printf
+ * strings to USART2 (DEBUG = DEBUG_UART2). Both writers run from the
+ * main thread, so they serialize at byte granularity. ASCII bytes
+ * appearing between binary frames are harmless: the receiver state
+ * machine stays in SYNC1 until the next 0xAA 0x55 sequence. */
+static void Usart2_Send_Bytes(const uint8_t *buf, uint32_t len)
 {
-    char search[24];
-    int n = snprintf(search, sizeof(search), "\"%s\":", key);
-    if (n <= 0 || n >= (int)sizeof(search)) return 0;
-
-    const char *p = strstr(json, search);
-    if (!p) return 0;
-    p += n;
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p != '-' && (*p < '0' || *p > '9')) return 0;
-    *out = atoi(p);
-    return 1;
-}
-
-static int Json_Get_Str(const char *json, const char *key, char *out, int max_len)
-{
-    char search[24];
-    int n = snprintf(search, sizeof(search), "\"%s\":\"", key);
-    if (n <= 0 || n >= (int)sizeof(search)) return 0;
-
-    const char *p = strstr(json, search);
-    if (!p) return 0;
-    p += n;
-    int i = 0;
-    while (*p && *p != '"' && i < max_len - 1) out[i++] = *p++;
-    out[i] = '\0';
-    return i;
-}
-
-static void Cmd_Send_Resp(const char *cmd, int id, int ok, const char *err)
-{
-    char buf[96];
-    if (err)
+    for (uint32_t i = 0; i < len; ++i)
     {
-        snprintf(buf, sizeof(buf),
-                 "{\"resp\":\"%s\",\"id\":%d,\"ok\":%d,\"err\":\"%s\"}\r\n",
-                 cmd, id, ok, err);
+        while (USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET);
+        USART_SendData(USART2, buf[i]);
     }
-    else
-    {
-        snprintf(buf, sizeof(buf),
-                 "{\"resp\":\"%s\",\"id\":%d,\"ok\":%d}\r\n",
-                 cmd, id, ok);
-    }
-    USART2_SendString(buf);
 }
 
-static void Cmd_Dispatch(const char *json)
-{
-    char cmd[32] = {0};
-    int  id = 0;
+/* Single TX sequence counter for this leaf node. Receivers use SRC+SEQ
+ * to demultiplex; we don't track per-destination sequences here. */
+static uint8_t Wups_Tx_Seq = 0;
 
-    Json_Get_Int(json, "id", &id);
-    if (!Json_Get_Str(json, "cmd", cmd, sizeof(cmd)))
+static void wups_send_frame(uint8_t dst, uint8_t cls, uint8_t op,
+                            uint8_t flags, uint8_t seq,
+                            const void *payload, uint16_t payload_len)
+{
+    uint8_t header[10];
+    header[0] = WUPS_SYNC1;
+    header[1] = WUPS_SYNC2;
+    header[2] = dst;
+    header[3] = WUPS_ADDR_CH32X;
+    header[4] = cls;
+    header[5] = op;
+    header[6] = flags;
+    header[7] = seq;
+    header[8] = (uint8_t)(payload_len & 0xFFu);
+    header[9] = (uint8_t)((payload_len >> 8) & 0xFFu);
+
+    /* Fletcher-8 over DST..LEN_H..payload. SYNC and end marker excluded. */
+    uint8_t a = 0, b = 0;
+    for (int i = 2; i < 10; ++i)
     {
-        Cmd_Send_Resp("?", id, 0, "no_cmd");
+        a = (uint8_t)(a + header[i]);
+        b = (uint8_t)(b + a);
+    }
+    const uint8_t *p = (const uint8_t *)payload;
+    for (uint16_t i = 0; i < payload_len; ++i)
+    {
+        a = (uint8_t)(a + p[i]);
+        b = (uint8_t)(b + a);
+    }
+    uint8_t trailer[4] = { a, b, WUPS_END1, WUPS_END2 };
+
+    Usart2_Send_Bytes(header, 10);
+    if (payload_len) Usart2_Send_Bytes(p, payload_len);
+    Usart2_Send_Bytes(trailer, 4);
+}
+
+/* Compose power.status from current globals and send to `dst`.
+ * Used both for the 1 Hz periodic EVENT (dst=RP2040) and as RESP to
+ * system.status_query (dst=requester). */
+static void wups_send_power_status(uint8_t dst, uint8_t flags, uint8_t seq)
+{
+    wups_power_status_v1_t s;
+    s.version        = 1;
+    s.charge_state   = (uint8_t)Chg_Data.chg_state;
+    s.vbus_in_mV     = (uint16_t)Chg_Data.vin_mv;
+    /* Tps_Vread_v10 / Tps_Iread_a10 are 0.1 V / 0.1 A units — *100 → mV / mA. */
+    s.vbus_out_mV    = (uint16_t)((int32_t)Tps_Vread_v10 * 100);
+    s.ibus_out_mA    = (int16_t)((int32_t)Tps_Iread_a10 * 100);
+    s.vbat_mV        = (uint16_t)Chg_Data.vbat_mv;
+    s.ibat_mA        = (int16_t)Chg_Data.ichg_ma;
+    s.temp_dC        = Board_Temp_c10;
+    s.pd_contract_mV = (uint16_t)((uint32_t)PD_Get_Snk_Voltage_100mV() * 100u);
+    s.pd_contract_mA = (uint16_t)((uint32_t)PD_Get_Snk_Current_100mA() * 100u);
+    s.faults         = (uint16_t)Chg_Data.fault;
+
+    wups_send_frame(dst, WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
+                    flags, seq, &s, sizeof(s));
+}
+
+/* system.hello broadcast — emitted once at boot. */
+static void wups_send_hello_bcast(void)
+{
+    wups_sys_hello_v1_t h;
+    h.version       = 1;
+    h.proto_version = WUPS_PROTO_VERSION;
+    h.node_addr     = WUPS_ADDR_CH32X;
+    h.reserved      = 0;
+    h.fw_version    = (uint16_t)((1u << 8) | 0u); /* 1.0 — bump on release */
+    h.caps_classes  = WUPS_CAP_SYSTEM | WUPS_CAP_POWER;
+    h.build_id      = 0;
+    wups_send_frame(WUPS_ADDR_BROADCAST, WUPS_CLASS_SYSTEM,
+                    WUPS_OP_SYS_HELLO, WUPS_FLAG_EVENT, Wups_Tx_Seq++,
+                    &h, sizeof(h));
+}
+
+/* power.event broadcast helper. Not yet wired into a detector — kept
+ * here so the event taxonomy is callable when we add edge detection. */
+__attribute__((unused))
+static void wups_send_power_event(uint8_t event)
+{
+    wups_power_event_v1_t e;
+    e.version = 1;
+    e.event   = event;
+    wups_send_frame(WUPS_ADDR_BROADCAST, WUPS_CLASS_POWER,
+                    WUPS_OP_PWR_EVENT, WUPS_FLAG_EVENT, Wups_Tx_Seq++,
+                    &e, sizeof(e));
+}
+
+/* Inbound dispatch — invoked when the deframer has a complete frame. */
+static void wups_handle_frame(uint8_t dst, uint8_t src, uint8_t cls,
+                              uint8_t op, uint8_t flags, uint8_t seq,
+                              const uint8_t *payload, uint16_t len)
+{
+    (void)payload;
+    (void)len;
+
+    /* Drop frames not addressed to us, broadcast, or internal multicast.
+     * CH32X is a leaf — it does not retransmit anything. */
+    if (dst != WUPS_ADDR_CH32X &&
+        dst != WUPS_ADDR_BROADCAST &&
+        dst != WUPS_ADDR_INTERNAL)
+    {
         return;
     }
 
-    if (strcmp(cmd, "ping") == 0)
+    if (cls == WUPS_CLASS_SYSTEM)
     {
-        Cmd_Send_Resp(cmd, id, 1, NULL);
+        if (op == WUPS_OP_SYS_PING && (flags & WUPS_FLAG_REQ))
+        {
+            wups_sys_pong_v1_t pong;
+            pong.version    = 1;
+            pong.reserved   = 0;
+            pong.fw_version = (uint16_t)((1u << 8) | 0u);
+            pong.uptime_ms  = (uint32_t)Uptime_Sec * 1000u;
+            wups_send_frame(src, WUPS_CLASS_SYSTEM, WUPS_OP_SYS_PING,
+                            WUPS_FLAG_RESP, seq, &pong, sizeof(pong));
+        }
+        else if (op == WUPS_OP_SYS_STATUS_QUERY && (flags & WUPS_FLAG_REQ))
+        {
+            wups_send_power_status(src, WUPS_FLAG_RESP, seq);
+        }
+        return;
     }
-    else if (strcmp(cmd, "ups.status") == 0)
+
+    if (cls == WUPS_CLASS_POWER && (flags & WUPS_FLAG_REQ))
     {
-        Cmd_Send_Resp(cmd, id, 1, NULL);
-        Send_JSON_Status();
-    }
-    else if (strcmp(cmd, "ups.power.disable") == 0)
-    {
-        VBUS_disable();
-        Cmd_Send_Resp(cmd, id, 1, NULL);
-    }
-    else if (strcmp(cmd, "ups.power.enable") == 0)
-    {
-        Power_Output_Restart();
-        Cmd_Send_Resp(cmd, id, 1, NULL);
-    }
-    else if (strcmp(cmd, "ups.power.cycle") == 0)
-    {
-        VBUS_disable();
-        Powercycle_Timer_Ms = 0;
-        Powercycle_State = POWERCYCLE_OFF_WAIT;
-        Cmd_Send_Resp(cmd, id, 1, NULL);
-    }
-    else if (strcmp(cmd, "ups.reset") == 0)
-    {
-        Cmd_Send_Resp(cmd, id, 1, NULL);
-        Delay_Ms(50); /* let TX FIFO drain before reset */
-        NVIC_SystemReset();
-    }
-    else
-    {
-        Cmd_Send_Resp(cmd, id, 0, "unknown");
+        switch (op)
+        {
+        case WUPS_OP_PWR_ENABLE:
+            Power_Output_Restart();
+            break;
+        case WUPS_OP_PWR_DISABLE:
+            VBUS_disable();
+            break;
+        case WUPS_OP_PWR_CYCLE:
+            VBUS_disable();
+            Powercycle_Timer_Ms = 0;
+            Powercycle_State = POWERCYCLE_OFF_WAIT;
+            break;
+        case WUPS_OP_PWR_RESET:
+            /* No NEED_ACK protocol in v1 — best-effort drain then reset. */
+            Delay_Ms(50);
+            NVIC_SystemReset();
+            break;
+        default:
+            break;
+        }
+        return;
     }
 }
 
-/* Drain the DMA RX buffer, accumulate bytes between '{' and matching '}', dispatch. */
+/* Receive state machine — fed one byte at a time from the DMA ring. */
+typedef enum {
+    WUPS_RX_SYNC1 = 0,
+    WUPS_RX_SYNC2,
+    WUPS_RX_DST,
+    WUPS_RX_SRC,
+    WUPS_RX_CLASS,
+    WUPS_RX_OP,
+    WUPS_RX_FLAGS,
+    WUPS_RX_SEQ,
+    WUPS_RX_LEN_L,
+    WUPS_RX_LEN_H,
+    WUPS_RX_PAYLOAD,
+    WUPS_RX_CK_A,
+    WUPS_RX_CK_B,
+    WUPS_RX_END1,
+    WUPS_RX_END2,
+} wups_rx_state_t;
+
+static struct {
+    wups_rx_state_t state;
+    uint8_t  dst, src, cls, op, flags, seq;
+    uint16_t len;
+    uint16_t pidx;
+    uint8_t  payload[WUPS_MAX_PAYLOAD];
+    uint8_t  rx_ck_a, rx_ck_b;
+    uint8_t  exp_a, exp_b;
+} Wups_Rx;
+
+static inline void wups_rx_reset(void) { Wups_Rx.state = WUPS_RX_SYNC1; }
+
+static inline void wups_rx_step(uint8_t b)
+{
+    Wups_Rx.exp_a = (uint8_t)(Wups_Rx.exp_a + b);
+    Wups_Rx.exp_b = (uint8_t)(Wups_Rx.exp_b + Wups_Rx.exp_a);
+}
+
+static void wups_rx_byte(uint8_t b)
+{
+    switch (Wups_Rx.state)
+    {
+    case WUPS_RX_SYNC1:
+        if (b == WUPS_SYNC1) Wups_Rx.state = WUPS_RX_SYNC2;
+        break;
+    case WUPS_RX_SYNC2:
+        if (b == WUPS_SYNC2)
+        {
+            Wups_Rx.exp_a = 0;
+            Wups_Rx.exp_b = 0;
+            Wups_Rx.pidx  = 0;
+            Wups_Rx.state = WUPS_RX_DST;
+        }
+        else
+        {
+            wups_rx_reset();
+        }
+        break;
+    case WUPS_RX_DST:    Wups_Rx.dst = b;   wups_rx_step(b); Wups_Rx.state = WUPS_RX_SRC;   break;
+    case WUPS_RX_SRC:    Wups_Rx.src = b;   wups_rx_step(b); Wups_Rx.state = WUPS_RX_CLASS; break;
+    case WUPS_RX_CLASS:  Wups_Rx.cls = b;   wups_rx_step(b); Wups_Rx.state = WUPS_RX_OP;    break;
+    case WUPS_RX_OP:     Wups_Rx.op = b;    wups_rx_step(b); Wups_Rx.state = WUPS_RX_FLAGS; break;
+    case WUPS_RX_FLAGS:  Wups_Rx.flags = b; wups_rx_step(b); Wups_Rx.state = WUPS_RX_SEQ;   break;
+    case WUPS_RX_SEQ:    Wups_Rx.seq = b;   wups_rx_step(b); Wups_Rx.state = WUPS_RX_LEN_L; break;
+    case WUPS_RX_LEN_L:
+        Wups_Rx.len = b;
+        wups_rx_step(b);
+        Wups_Rx.state = WUPS_RX_LEN_H;
+        break;
+    case WUPS_RX_LEN_H:
+        Wups_Rx.len |= (uint16_t)((uint16_t)b << 8);
+        wups_rx_step(b);
+        if (Wups_Rx.len > WUPS_MAX_PAYLOAD) { wups_rx_reset(); break; }
+        Wups_Rx.state = (Wups_Rx.len == 0) ? WUPS_RX_CK_A : WUPS_RX_PAYLOAD;
+        break;
+    case WUPS_RX_PAYLOAD:
+        Wups_Rx.payload[Wups_Rx.pidx++] = b;
+        wups_rx_step(b);
+        if (Wups_Rx.pidx >= Wups_Rx.len) Wups_Rx.state = WUPS_RX_CK_A;
+        break;
+    case WUPS_RX_CK_A:
+        Wups_Rx.rx_ck_a = b;
+        Wups_Rx.state = WUPS_RX_CK_B;
+        break;
+    case WUPS_RX_CK_B:
+        Wups_Rx.rx_ck_b = b;
+        if (Wups_Rx.rx_ck_a == Wups_Rx.exp_a && Wups_Rx.rx_ck_b == Wups_Rx.exp_b)
+        {
+            Wups_Rx.state = WUPS_RX_END1;
+        }
+        else
+        {
+            wups_rx_reset();
+        }
+        break;
+    case WUPS_RX_END1:
+        Wups_Rx.state = (b == WUPS_END1) ? WUPS_RX_END2 : WUPS_RX_SYNC1;
+        break;
+    case WUPS_RX_END2:
+        if (b == WUPS_END2)
+        {
+            Cmd_Frames_Dispatched++;
+            wups_handle_frame(Wups_Rx.dst, Wups_Rx.src, Wups_Rx.cls,
+                              Wups_Rx.op, Wups_Rx.flags, Wups_Rx.seq,
+                              Wups_Rx.payload, Wups_Rx.len);
+        }
+        wups_rx_reset();
+        break;
+    default:
+        wups_rx_reset();
+        break;
+    }
+}
+
+/* Drain the DMA RX buffer and feed bytes to the deframer. */
 static void Cmd_Rx_Drain(void)
 {
-    static char    rx_line[UART_RX_LINE_SIZE];
-    static uint8_t rx_idx = 0;
-    static uint8_t rx_in_json = 0;
-
-    /* DMA should keep RXNE drained fast enough that ORE never sets. Track
-     * any occurrence anyway — non-zero ore in status JSON would mean the
-     * DMA controller stalled (e.g. high-priority bus contention). */
-    if (USART2->STATR & 0x08u) {
+    /* DMA should keep RXNE drained fast enough that ORE never sets.
+     * Track any occurrence — non-zero ore means the DMA controller
+     * stalled (e.g. high-priority bus contention). */
+    if (USART2->STATR & 0x08u)
+    {
         Uart_Ore_Count++;
-        (void)USART2->DATAR;  /* "read SR + read DR" sequence clears ORE */
+        (void)USART2->DATAR; /* "read SR + read DR" sequence clears ORE */
     }
 
     /* DMA write head = bytes_total - bytes_remaining_to_transfer.
-     * The CNTR register decrements as DMA writes each byte. In circular mode,
-     * when CNTR reaches 0 it reloads to BufferSize and DMA continues. */
+     * CNTR decrements as DMA writes each byte. In circular mode it
+     * reloads to BufferSize when reaching 0. */
     uint16_t head = DMA_RX_BUF_SIZE - (uint16_t)DMA1_Channel6->CNTR;
 
     while (Dma_Rx_Tail != head)
@@ -511,81 +714,8 @@ static void Cmd_Rx_Drain(void)
         uint8_t c = Dma_Rx_Buf[Dma_Rx_Tail];
         Dma_Rx_Tail = (uint16_t)((Dma_Rx_Tail + 1) % DMA_RX_BUF_SIZE);
         Uart_Rx_Total++;
-
-        if (c == '{')
-        {
-            rx_idx = 0;
-            rx_line[rx_idx++] = (char)c;
-            rx_in_json = 1;
-        }
-        else if (rx_in_json)
-        {
-            if (rx_idx >= UART_RX_LINE_SIZE - 1)
-            {
-                rx_idx = 0;
-                rx_in_json = 0;
-                continue; /* line too long: discard frame */
-            }
-            rx_line[rx_idx++] = (char)c;
-            if (c == '}')
-            {
-                rx_line[rx_idx] = '\0';
-                rx_in_json = 0;
-                rx_idx = 0;
-                Cmd_Frames_Dispatched++;
-                Cmd_Dispatch(rx_line);
-            }
-        }
-        /* else: byte outside frame -> ignore (no debug stream from RP2040) */
+        wups_rx_byte(c);
     }
-}
-
-/*********************************************************************
- * @fn      Send_JSON_Status
- *
- * @brief   Build and send JSON status message via USART2 to RP2040.
- *
- * @return  none
- */
-static char json_buf[300];
-
-void Send_JSON_Status(void)
-{
-    sprintf(json_buf,
-        "{\"up\":%lu,\"pd\":%d,\"pdo\":%d,\"cc\":%d,\"role\":%d,"
-        "\"snk_ok\":%d,\"snk_v\":%d,\"snk_i\":%d,"
-        "\"t\":%d,"
-        "\"vs\":%d,\"is\":%d,\"vr\":%d,\"ir\":%d,"
-        "\"bp\":%d,\"bp2\":%d,\"cs\":%d,\"pg\":%d,"
-        "\"vi\":%d,\"ii\":%d,\"vb\":%d,\"ci\":%d,\"cf\":%d,"
-        "\"rxc\":%lu,\"cmd\":%lu,\"ore\":%lu}\r\n",
-        (unsigned long)Uptime_Sec,
-        (int)PD_Ctl.PD_State,
-        (int)PD_Get_SinkReqPDOIndex(),
-        (int)PD_Ctl.Flag.Bit.Connected,
-        (int)PD_Get_Role(),
-        (int)PD_ProfileAccepted_Get(),
-        (int)PD_Get_Snk_Voltage_100mV(),
-        (int)PD_Get_Snk_Current_100mA(),
-        (int)Board_Temp_c10,
-        (int)tps55289_get_voltage_set_v10(),
-        (int)tps55289_get_current_set_a10(),
-        (int)Tps_Vread_v10,
-        (int)Tps_Iread_a10,
-        (int)(!mp2762a_is_battery_uvlo()),
-        (int)mp2762a_is_battery_present(),
-        (int)Chg_Data.chg_state,
-        (int)Chg_Data.power_good,
-        (int)Chg_Data.vin_mv,
-        (int)Chg_Data.iin_ma,
-        (int)Chg_Data.vbat_mv,
-        (int)Chg_Data.ichg_ma,
-        (int)Chg_Data.fault,
-        (unsigned long)Uart_Rx_Total,
-        (unsigned long)Cmd_Frames_Dispatched,
-        (unsigned long)Uart_Ore_Count
-    );
-    USART2_SendString(json_buf);
 }
 
 /*********************************************************************
@@ -616,6 +746,10 @@ int main(void)
     EXTI_INIT();
     TIM1_Init( 999, 48-1);
     USART2_Init(921600);
+
+    /* Announce ourselves on the bus. RP2040 (the hub) caches hellos to
+     * track which nodes are alive. Sent once; not retried. */
+    wups_send_hello_bcast();
 
     while(1)
     {
@@ -695,16 +829,17 @@ int main(void)
             }
         }
 
-        /* Periodic JSON status output via USART2 */
+        /* Periodic power.status push to RP2040 (1 Hz, EVENT flag). */
         Json_Timer_Ms += Tmr_Ms_Dlt;
         if (Json_Timer_Ms >= JSON_INTERVAL_MS)
         {
             Json_Timer_Ms = 0;
 
-            /* DC input voltage from cached PA1 ADC: Vin = ADC * 3300 * (27.4+5.1) / 5.1 / 4096 */
+            /* DC input voltage from cached PA1 ADC: Vin = ADC * 3300 * (27.4+5.1) / 5.1 / 4096.
+             * Computed but not yet surfaced in power.status v1 — keep cached for future use. */
             DC_Inp_Voltage_mV = (UINT16)((UINT32)DC_Inp_ADC_Val * 21029 / 4096);
 
-            Send_JSON_Status();
+            wups_send_power_status(WUPS_ADDR_RP2040, WUPS_FLAG_EVENT, Wups_Tx_Seq++);
         }
     }
 }
