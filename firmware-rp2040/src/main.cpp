@@ -3,6 +3,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <SerialPIO.h>
+#include <string.h>
+#include "wups_proto.h"
+#include "wups_router.h"
 
 // --- I2C for OLED ---
 constexpr uint8_t I2C0_SDA_PIN = 8;
@@ -101,8 +104,18 @@ TeePrint dbgOut(usbCdcOut, dbgRing);
 constexpr uint8_t GPIO16_PIN = 16;   // GPIO16 - UART0 TX (commands to CH32X)
 constexpr uint8_t GPIO18_PIN = 18;   // GPIO18 - not used, set as input pullup
 constexpr uint8_t GPIO19_PIN = 19;   // GPIO19 - not used, set as input pullup
-constexpr uint8_t GPIO20_PIN = 20;   // GPIO20 - not used, set as input pullup
 constexpr uint8_t UART0_RX_PIN = 17; // GPIO17 - UART0 RX (status + responses from CH32X)
+
+// --- UART1 (Serial2) — RP2040 <-> M.2 ESP32, hardware UART with full flow control ---
+// All four pins are wired through the M.2 connector. CTS/RTS are wired up
+// from day one so we never lose bytes when either side momentarily can't
+// drain its FIFO; the deframer is robust against drops, but flow control
+// keeps the link "boring" and saves debugging time later.
+constexpr uint8_t  UART1_TX_PIN  = 20;  // GPIO20 - hardware UART1 TX
+constexpr uint8_t  UART1_RX_PIN  = 21;  // GPIO21 - hardware UART1 RX
+constexpr uint8_t  UART1_CTS_PIN = 22;  // GPIO22 - hardware UART1 CTS (input from ESP32 RTS)
+constexpr uint8_t  UART1_RTS_PIN = 23;  // GPIO23 - hardware UART1 RTS (output to ESP32 CTS)
+constexpr uint32_t UART1_BAUD    = 921600;
 
 // --- GPIO26/27 - unused, set as output LOW ---
 constexpr uint8_t GPIO26_PIN = 26;
@@ -182,28 +195,14 @@ unsigned long lastInteractionTime = 0;
 bool lastBtnLeftState = HIGH;
 bool lastBtnRightState = HIGH;
 
-// --- UART JSON data ---
-char uartBuffer[256];
-int uartIdx = 0;
+// --- Cached CH32X power.status (binary v1) and projection to legacy json_* ---
+// CH32X emits a power.status frame every 1 s. wups_on_local_frame() copies the
+// payload here and projects fields into the legacy `json_*` globals so the
+// existing OLED / alarm code works unchanged. Some old fields (PD detail,
+// snk_*) are not in v1 power.status — they stay 0 until extended.
+wups_power_status_v1_t Last_Power_Status = {};
+unsigned long Last_Power_Status_Ms = 0;
 
-// --- UART debug message buffer ---
-char dbgBuffer[128];
-int dbgIdx = 0;
-
-// --- Command framing from a host-side stream -> CH32X ---
-// Hosts write single-line JSON commands like {"cmd":"ups.power.cycle","id":7}
-// to either USB-CDC (Pi 5 service) or the Probe UART (J350). We accumulate
-// brace-balanced frames and forward verbatim to Serial1 (CH32X). One state
-// struct per source so the two streams can interleave bytes safely.
-struct CmdRxState {
-  char buffer[256];
-  int  idx = 0;
-  bool inJson = false;
-};
-CmdRxState hostRx;
-CmdRxState dbgRx;
-uint32_t nextCmdId = 1;
-volatile uint32_t cmdFramesForwarded = 0;  // diagnostic — read via SWD to confirm forwarding works
 int json_t = 0;    // temperature
 int json_vs = 0;   // voltage source
 int json_is = 0;   // current source
@@ -255,60 +254,6 @@ constexpr int CS_CHANGE_DEBOUNCE = 10;  // ~500ms stability before changing disp
 bool startupComplete = false;
 constexpr unsigned long STARTUP_STABILIZE_MS = 3000;
 unsigned long startupEndTime = 0;
-
-// Debug mode - raw UART passthrough (set to 1 to enable)
-#define DEBUG_RAW_UART 0
-
-// Extract integer value for a given key from JSON
-// Returns true if found and valid, false otherwise
-bool extractInt(const char* json, const char* key, int& outVal) {
-  char searchKey[16];
-  snprintf(searchKey, sizeof(searchKey), "\"%s\":", key);
-
-  const char* p = strstr(json, searchKey);
-  if (p == nullptr) return false;
-
-  p += strlen(searchKey);
-
-  // Skip whitespace
-  while (*p == ' ' || *p == '\t') p++;
-
-  // Check if we have a valid number start
-  if (*p != '-' && (*p < '0' || *p > '9')) return false;
-
-  outVal = atoi(p);
-  return true;
-}
-
-// Parse JSON - only updates values that are found and valid
-void parseJson(const char* json) {
-  // Basic validation: must start with { and contain at least one :
-  if (json[0] != '{' || strchr(json, ':') == nullptr) {
-    dbgOut.println(F("JSON: invalid format"));
-    return;
-  }
-
-  int newVal;
-  if (extractInt(json, "t", newVal)) json_t = newVal;
-  if (extractInt(json, "vs", newVal)) json_vs = newVal;
-  if (extractInt(json, "is", newVal)) json_is = newVal;
-  if (extractInt(json, "vr", newVal)) json_vr = newVal;
-  if (extractInt(json, "ir", newVal)) json_ir = newVal;
-  if (extractInt(json, "cs", newVal)) json_cs = newVal;
-  if (extractInt(json, "pd", newVal)) json_pd = newVal;
-  if (extractInt(json, "pdo", newVal)) json_pdo = newVal;
-  if (extractInt(json, "pg", newVal)) json_pg = newVal;
-  if (extractInt(json, "vi", newVal)) json_vi = newVal;
-  if (extractInt(json, "ci", newVal)) json_ci = newVal;
-  if (extractInt(json, "cf", newVal)) json_cf = newVal;
-  if (extractInt(json, "bp", newVal)) json_bp = newVal;
-  if (extractInt(json, "vb", newVal)) json_vb = newVal;
-  if (extractInt(json, "vbc", newVal)) json_vbc = newVal;
-  if (extractInt(json, "role", newVal)) json_role = newVal;
-  if (extractInt(json, "snk_ok", newVal)) json_snk_ok = newVal;
-  if (extractInt(json, "snk_v", newVal)) json_snk_v = newVal;
-  if (extractInt(json, "snk_i", newVal)) json_snk_i = newVal;
-}
 
 // Convert battery voltage (2S pack, mV) to SOC percentage
 // Based on Panasonic CGR18650CH 2250mAh discharge curve
@@ -673,45 +618,113 @@ static void drawScreenPowerCtrl() {
   drawScreenIndicator(SCREEN_POWER_CTRL);
 }
 
-// Send a JSON command to CH32X over Serial1.
-// Returns the auto-assigned command id so the caller can match responses.
-static uint32_t sendUpsCommand(const char* cmd) {
-  uint32_t id = nextCmdId++;
-  Serial1.print(F("{\"cmd\":\""));
-  Serial1.print(cmd);
-  Serial1.print(F("\",\"id\":"));
-  Serial1.print(id);
-  Serial1.println(F("}"));
-  return id;
+// --- Web3 Pi UPS binary wire protocol v1 — RP2040 hub-side handling ---
+//
+// The router (wups_router.cpp) deframes bytes from USB-CDC, UART0 and UART1
+// and calls back here when a frame is destined for RP2040 itself, broadcast,
+// or the INTERNAL multicast. Forwarding to other ports is already done
+// inside the router by the time we get here — this function is for *local*
+// consumption only.
+//
+// Application behaviour for v1:
+//   - CH32X power.status (cls=POWER op=PWR_STATUS, src=CH32X)
+//       → cache in Last_Power_Status, project to legacy `json_*`,
+//         re-emit unicast to RPi as a push aggregate (preserving SRC=CH32X).
+//   - system.ping (REQ) addressed to us
+//       → reply with system.ping (RESP) carrying uptime + fw_version.
+//   - system.hello broadcast
+//       → ignored for now (could populate a presence map later).
+//   - everything else
+//       → silently dropped.
+//
+// Defined here (in main.cpp) because the body needs access to RP2040
+// firmware globals (json_*, lastJsonTime, etc.). Declared in wups_router.h.
+void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
+  (void)inbound_port;
+
+  // CH32X power.status — cache and project to the legacy `json_*` globals
+  // so the existing OLED / alarm code keeps working unchanged. Some old
+  // fields (PD detail, snk_*) are not in v1 power.status and stay 0.
+  if (f.cls == WUPS_CLASS_POWER && f.op == WUPS_OP_PWR_STATUS &&
+      f.src == WUPS_ADDR_CH32X &&
+      f.len >= sizeof(wups_power_status_v1_t)) {
+    wups_power_status_v1_t s;
+    memcpy(&s, f.payload, sizeof(s));
+    if (s.version != 1) return;
+
+    Last_Power_Status    = s;
+    Last_Power_Status_Ms = millis();
+
+    json_t   = s.temp_dC;
+    json_cs  = s.charge_state;
+    json_pg  = (s.vbus_in_mV > 5000) ? 1 : 0;     // derived: input "good"
+    json_vi  = s.vbus_in_mV;
+    json_ci  = s.ibat_mA;
+    json_cf  = s.faults;
+    json_bp  = (s.vbat_mV > 100) ? 1 : 0;          // derived: battery present
+    json_vb  = s.vbat_mV;
+    json_vbc = s.vbat_mV;                          // single source in v1
+    // Set vs read separation lost in v1: report measured values for both.
+    json_vs  = (int)(s.pd_contract_mV / 100);
+    json_is  = (int)(s.pd_contract_mA / 100);
+    json_vr  = (int)(s.vbus_out_mV / 100);
+    json_ir  = (int)(s.ibus_out_mA / 100);
+    // PD detail (pd, pdo, role, snk_*) is not in v1 power.status — hold previous values.
+
+    newJsonReceived = true;
+    lastJsonTime    = millis();
+
+    // Push-mode aggregate to RPi: forward the same frame on USB-CDC with
+    // SRC=CH32X preserved. RPi service decodes and treats it as authoritative.
+    wups_send_with_src(WUPS_PORT_RPI, WUPS_ADDR_RPI, WUPS_ADDR_CH32X,
+                       WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
+                       WUPS_FLAG_EVENT, f.seq, &s, sizeof(s));
+    return;
+  }
+
+  // system.ping → respond with uptime + fw_version.
+  if (f.cls == WUPS_CLASS_SYSTEM && f.op == WUPS_OP_SYS_PING &&
+      (f.flags & WUPS_FLAG_REQ)) {
+    wups_sys_pong_v1_t pong;
+    pong.version    = 1;
+    pong.reserved   = 0;
+    pong.fw_version = (uint16_t)((1u << 8) | 0u); /* 1.0 — bump on release */
+    pong.uptime_ms  = (uint32_t)millis();
+
+    uint8_t out_port = WUPS_PORT_NONE;
+    if      (f.src == WUPS_ADDR_RPI)   out_port = WUPS_PORT_RPI;
+    else if (f.src == WUPS_ADDR_CH32X) out_port = WUPS_PORT_CH32X;
+    else if (f.src == WUPS_ADDR_ESP32) out_port = WUPS_PORT_ESP32;
+    if (out_port != WUPS_PORT_NONE) {
+      wups_send_seq(out_port, f.src, WUPS_CLASS_SYSTEM, WUPS_OP_SYS_PING,
+                    WUPS_FLAG_RESP, f.seq, &pong, sizeof(pong));
+    }
+    return;
+  }
+
+  // Other classes/ops: ignored in v1.
 }
 
-// Drain a command stream: collect brace-balanced frames and forward verbatim
-// to CH32X. Bytes outside frames are ignored.
-static void drainCmdStream(Stream& src, CmdRxState& st) {
-  while (src.available()) {
-    char c = (char)src.read();
-    if (c == '{') {
-      st.idx = 0;
-      st.buffer[st.idx++] = c;
-      st.inJson = true;
-    } else if (st.inJson) {
-      if (st.idx >= (int)sizeof(st.buffer) - 1) {
-        // Frame too long: discard
-        st.idx = 0;
-        st.inJson = false;
-        continue;
-      }
-      st.buffer[st.idx++] = c;
-      if (c == '}') {
-        st.buffer[st.idx] = '\0';
-        Serial1.print(st.buffer);
-        Serial1.print(F("\r\n"));
-        cmdFramesForwarded++;
-        st.idx = 0;
-        st.inJson = false;
-      }
-    }
-  }
+// Send `system.hello` broadcast on boot so other nodes can discover us.
+static void wupsSendHelloBcast(void) {
+  wups_sys_hello_v1_t h;
+  h.version       = 1;
+  h.proto_version = WUPS_PROTO_VERSION;
+  h.node_addr     = WUPS_ADDR_RP2040;
+  h.reserved      = 0;
+  h.fw_version    = (uint16_t)((1u << 8) | 0u);
+  h.caps_classes  = WUPS_CAP_SYSTEM | WUPS_CAP_UI;
+  h.build_id      = 0;
+  // Broadcast goes to every reachable MCU port (and USB-CDC if a host is
+  // attached). The router handles fan-out to all ports for us — but for
+  // hello we want to reach every link, not just the address-mapped one,
+  // so we issue three explicit sends with DST=BROADCAST.
+  wups_send(WUPS_PORT_RPI,   WUPS_ADDR_BROADCAST, WUPS_CLASS_SYSTEM,
+            WUPS_OP_SYS_HELLO, WUPS_FLAG_EVENT, &h, sizeof(h));
+  wups_send(WUPS_PORT_CH32X, WUPS_ADDR_BROADCAST, WUPS_CLASS_SYSTEM,
+            WUPS_OP_SYS_HELLO, WUPS_FLAG_EVENT, &h, sizeof(h));
+  wups_send(WUPS_PORT_ESP32, WUPS_ADDR_BROADCAST, WUPS_CLASS_SYSTEM,
+            WUPS_OP_SYS_HELLO, WUPS_FLAG_EVENT, &h, sizeof(h));
 }
 
 // Check buttons with debounce, returns: -1=left, 0=none, +1=right
@@ -763,10 +776,9 @@ void setup() {
   pinMode(BTN_LEFT_PIN, INPUT_PULLUP);
   pinMode(BTN_RIGHT_PIN, INPUT_PULLUP);
 
-  // GPIO18, 19, 20 - set as input with pullup (not floating)
+  // GPIO18, 19 - unused, set as input with pullup (not floating)
   pinMode(GPIO18_PIN, INPUT_PULLUP);
   pinMode(GPIO19_PIN, INPUT_PULLUP);
-  pinMode(GPIO20_PIN, INPUT_PULLUP);
 
   // GPIO26, 27 - unused ADC pins, drive LOW
   pinMode(GPIO26_PIN, OUTPUT);
@@ -782,7 +794,7 @@ void setup() {
   while (!Serial && millis() < 3000); // Wait for USB Serial (max 3s)
   dbgOut.println(F("Web3 Pi UPS RP2040 boot"));
 
-  // UART0 to CH32X: RX on GPIO17 (status JSON + responses), TX on GPIO16 (commands)
+  // UART0 to CH32X: RX on GPIO17, TX on GPIO16, binary protocol v1.
   Serial1.setRX(UART0_RX_PIN);
   Serial1.setTX(GPIO16_PIN);
   Serial1.setFIFOSize(256);  // Increase RX buffer (default is 32)
@@ -793,6 +805,23 @@ void setup() {
   volatile uint32_t* gpio16_pads = (volatile uint32_t*)(0x4001c000u + 0x04u + 16u * 4u);
   *gpio16_pads = (*gpio16_pads & ~0x31u) | 0x31u;
   dbgOut.println(F("UART0 bidir on GPIO17/16 @ 921600, GPIO16 drive=12mA"));
+
+  // UART1 to M.2 ESP32 — hardware Serial2 with CTS/RTS flow control. setCTS
+  // and setRTS must be called before begin(); arduino-pico enables HW flow
+  // control automatically when both pins are configured.
+  Serial2.setTX(UART1_TX_PIN);
+  Serial2.setRX(UART1_RX_PIN);
+  Serial2.setCTS(UART1_CTS_PIN);
+  Serial2.setRTS(UART1_RTS_PIN);
+  Serial2.setFIFOSize(256);
+  Serial2.begin(UART1_BAUD);
+  dbgOut.println(F("UART1 bidir on GPIO20(TX)/21(RX) + CTS22/RTS23 @ 921600"));
+
+  // Wire the binary router up to all three streams. Bytes arriving on any
+  // of these now feed wups_router_drain() in loop() and dispatch via
+  // wups_on_local_frame() (defined above).
+  wups_router_init(&Serial, &Serial1, &Serial2);
+  wupsSendHelloBcast();
 
   // Init I2C for OLED
   WireCustom.begin();
@@ -827,8 +856,9 @@ void setup() {
 void loop() {
   // Drain commands from the host service (USB-CDC) and the Probe UART (J350)
   // and forward both to CH32X. Each source has its own framing state.
-  drainCmdStream(Serial, hostRx);
-  drainCmdStream(dbgSerial, dbgRx);
+  // Drain USB-CDC, UART0 (CH32X) and UART1 (ESP32) into per-port deframers,
+  // route forwarded frames, and dispatch local frames to wups_on_local_frame().
+  wups_router_drain();
 
   // Shovel as much of the debug ring buffer as the SerialPIO HW FIFO can
   // accept, then return. Non-blocking, runs every loop iteration (~50 ms).
@@ -850,60 +880,10 @@ void loop() {
   float vbusAdc_mV = rawVbusOut * adcLsb_mV;
   vbus_out_mV = (int)(vbusAdc_mV / VBUS_DIVIDER_RATIO + 0.5f);
 
-  // Read UART1
-  while (Serial1.available()) {
-    char c = Serial1.read();
-
-#if DEBUG_RAW_UART
-    Serial.print(c);
-#else
-
-    // Normal mode: parse JSON and debug messages
-    if (c == '{') {
-      // Start of JSON
-      uartIdx = 0;
-      uartBuffer[uartIdx++] = c;
-      dbgIdx = 0; // Cancel any debug message in progress
-    }
-    else if (uartIdx > 0 && uartIdx < (int)sizeof(uartBuffer) - 1) {
-      // Inside JSON
-      uartBuffer[uartIdx++] = c;
-
-      if (c == '}') {
-        uartBuffer[uartIdx] = '\0';
-        parseJson(uartBuffer);
-        newJsonReceived = true;  // Will output merged JSON later
-        lastJsonTime = millis();
-        uartIdx = 0;
-      }
-    }
-    else if (uartIdx >= (int)sizeof(uartBuffer) - 1) {
-      // JSON buffer overflow
-      uartIdx = 0;
-    }
-    else if (uartIdx == 0) {
-      // Not inside JSON - handle debug messages
-      if (c == '\n') {
-        // End of debug line
-        dbgBuffer[dbgIdx] = '\0';
-        if (dbgIdx > 0) {
-          dbgOut.println(dbgBuffer);
-        }
-        dbgIdx = 0;
-      }
-      else if (c != '\r' && dbgIdx < (int)sizeof(dbgBuffer) - 1) {
-        // Accumulate debug characters (skip \r)
-        dbgBuffer[dbgIdx++] = c;
-      }
-      else if (dbgIdx >= (int)sizeof(dbgBuffer) - 1) {
-        // Debug buffer overflow - flush
-        dbgBuffer[dbgIdx] = '\0';
-        dbgOut.println(dbgBuffer);
-        dbgIdx = 0;
-      }
-    }
-#endif
-  }
+  // CH32X bytes are pulled from Serial1 by wups_router_drain() (called at the
+  // top of loop()). Out-of-frame bytes (e.g. CH32X printf debug strings on
+  // USART2) are silently dropped by the deframer in v1. If we ever need them
+  // back, the router can grow a per-port "stray byte sink".
 
   // --- Button handling ---
   // On the Power Control screen the buttons trigger ups.power.* commands.
@@ -913,15 +893,16 @@ void loop() {
     lastInteractionTime = millis();
 
     if (currentScreen == SCREEN_POWER_CTRL) {
-      if (btnAction < 0) {
-        uint32_t id = sendUpsCommand("ups.power.disable");
-        dbgOut.print(F("[btn] LEFT -> ups.power.disable id="));
-        dbgOut.println(id);
-      } else {
-        uint32_t id = sendUpsCommand("ups.power.enable");
-        dbgOut.print(F("[btn] RIGHT -> ups.power.enable id="));
-        dbgOut.println(id);
-      }
+      // Power Control screen: send a binary REQ to CH32X. No NEED_ACK in v1,
+      // so we don't wait for a response — confirmation comes via the next
+      // power.status push (vbus_out_mV transitioning).
+      uint8_t op  = (btnAction < 0) ? WUPS_OP_PWR_DISABLE : WUPS_OP_PWR_ENABLE;
+      uint8_t seq = wups_send(WUPS_PORT_CH32X, WUPS_ADDR_CH32X,
+                              WUPS_CLASS_POWER, op, WUPS_FLAG_REQ,
+                              nullptr, 0);
+      dbgOut.print(btnAction < 0 ? F("[btn] LEFT -> power.disable seq=")
+                                 : F("[btn] RIGHT -> power.enable seq="));
+      dbgOut.println(seq);
     } else {
       if (btnAction > 0) {
         // RIGHT pressed - next screen (wrap)
@@ -969,32 +950,11 @@ void loop() {
   int soc = (int)(filtered_soc + 0.5f);
   json_soc = soc;
 
-  // Forward incoming JSON from CH32X to USB-CDC.
-  // - Status frames: augment with RP2040-measured bv/SOC/bd/vo before re-emitting.
-  // - Command responses (contain "resp":): forward verbatim, no augmentation.
-  if (newJsonReceived) {
-    bool isResponse = (strstr(uartBuffer, "\"resp\":") != nullptr);
-    int len = strlen(uartBuffer);
-
-    if (isResponse) {
-      dbgOut.println(uartBuffer);
-    } else if (len > 0 && uartBuffer[len - 1] == '}') {
-      uartBuffer[len - 1] = '\0';  // Remove closing brace
-      dbgOut.print(uartBuffer);
-      dbgOut.print(F(",\"bv\":"));
-      dbgOut.print(json_bv);
-      dbgOut.print(F(",\"SOC\":"));
-      dbgOut.print(soc);
-      dbgOut.print(F(",\"bd\":"));
-      dbgOut.print(soc);
-      dbgOut.print(F(",\"vo\":"));
-      dbgOut.print(vbus_out_mV);
-      dbgOut.println(F("}"));
-    } else {
-      dbgOut.println(uartBuffer);  // Fallback: print as-is
-    }
-    newJsonReceived = false;
-  }
+  // CH32X power.status is forwarded to RPi inside wups_on_local_frame() at
+  // the moment of arrival (preserving SRC=CH32X). Augmenting with RP2040's
+  // bv/SOC/vo would require a separate v2 power.aggregate op — deferred.
+  // For now we simply consume `newJsonReceived` as a "data updated" flag.
+  newJsonReceived = false;
 
   // --- Startup stabilization gate ---
   // During first 3 seconds, let ADC/EMA settle before making decisions
