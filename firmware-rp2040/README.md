@@ -25,3 +25,47 @@ Project layout
 
 Dependencies
 - Managed via PlatformIO (e.g., Adafruit GFX and Adafruit SSD1306)
+
+## Flashing
+
+### Via SWD (Raspberry Pi Debug Probe) — preferred
+
+Lets the Raspberry Pi 5 stay powered and connected the whole time
+(the USB-C output port doubles as the RP2040 USB data port, so
+flashing over USB-C requires unplugging the Pi 5).
+
+Requirements:
+- Raspberry Pi Debug Probe wired to **J401** on the UPS PCB (4-pin
+  JST SH: probe `D` SC→J401.3 SWCLK, GND→J401.4, SD→J401.2 SWDIO).
+- The board powered from any source (PD input, barrel jack, or battery)
+  — the probe does not source 3.3 V.
+
+Command (run from this directory):
+
+```sh
+~/.platformio/penv/bin/pio run -e pico_swd -t upload
+```
+
+This builds the `pico_swd` env and flashes via OpenOCD + CMSIS-DAP. A
+successful run ends with `** Verified OK **` and `[SUCCESS]`.
+
+### Via USB-C (picotool)
+
+Bench bring-up only. Requires a USB-C cable from the dev machine to
+the UPS output USB-C port and disconnects the Pi 5 for the duration
+of the flash.
+
+```sh
+~/.platformio/penv/bin/pio run -e pico -t upload
+```
+
+### Serial monitor (USB-CDC, host-side)
+
+```sh
+~/.platformio/penv/bin/pio device monitor
+```
+
+Note: with the binary wire protocol v1, USB-CDC carries framed bytes
+(start `0xAA 0x55`, end `0x55 0xAA`). The monitor will show them as
+non-printable characters — use a hex viewer or the host-side service
+to decode.
