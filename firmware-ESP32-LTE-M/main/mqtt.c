@@ -21,6 +21,7 @@ static esp_mqtt_client_handle_t s_client;
 static char s_client_id[32];     /* "ups-XXXXXXXXXXXX" — last 6 bytes of MAC */
 static char s_topic_status[64];  /* "web3piups/<id>/status" */
 static char s_topic_cmd[64];     /* "web3piups/<id>/cmd"    */
+static mqtt_data_cb_t s_data_handler;
 
 static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
 {
@@ -73,6 +74,10 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
         ESP_LOGI(TAG, "DATA topic=%.*s len=%d payload=%.*s",
                  evt->topic_len, evt->topic, evt->data_len,
                  evt->data_len, evt->data);
+        if (s_data_handler) {
+            s_data_handler(evt->topic, (size_t)evt->topic_len,
+                           evt->data, (size_t)evt->data_len);
+        }
         break;
 
     case MQTT_EVENT_ERROR:
@@ -172,4 +177,20 @@ esp_err_t mqtt_client_start(void)
 
     ESP_LOGI(TAG, "starting client_id=%s broker=%s", s_client_id, MQTT_BROKER_URI);
     return esp_mqtt_client_start(s_client);
+}
+
+int mqtt_publish_raw(const char *topic, const void *payload, size_t payload_len,
+                     int qos, int retain)
+{
+    if (!s_client) {
+        return -1;
+    }
+    return esp_mqtt_client_publish(s_client, topic,
+                                   (const char *)payload, (int)payload_len,
+                                   qos, retain);
+}
+
+void mqtt_set_data_handler(mqtt_data_cb_t cb)
+{
+    s_data_handler = cb;
 }

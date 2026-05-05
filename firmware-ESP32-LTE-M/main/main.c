@@ -31,6 +31,7 @@
 
 #include "modem.h"
 #include "pmu.h"
+#include "wups_link.h"
 
 static const char *TAG = "app";
 
@@ -100,6 +101,12 @@ void app_main(void)
     ESP_LOGI(TAG, "waiting %d ms for modem boot...", MODEM_BOOT_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_DELAY_MS));
 
+    /* Bring up the binary protocol link to RP2040 (UART2 with HW flow control,
+     * MQTT data → net.downlink hook). Done before PPP/MQTT so RP2040 can
+     * already start talking to us; net.publish from any caller will simply
+     * fail until MQTT connects. */
+    ESP_ERROR_CHECK(wups_link_init());
+
     /* Hand the UART over to the bidirectional bridge. */
     modem_at_pass_through_start();
 
@@ -115,6 +122,8 @@ void app_main(void)
         ESP_LOGI(TAG,
                  "tick=%" PRIu32 " uptime=%" PRIu32 "s free_heap=%" PRIu32 "B min_heap=%" PRIu32 "B",
                  tick, uptime_s, free_heap, min_heap);
+
+        wups_link_log_stats();
 
         tick++;
         vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS));
