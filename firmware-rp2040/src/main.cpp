@@ -24,10 +24,11 @@ SerialPIO dbgSerial(DBG_TX_PIN, DBG_RX_PIN, 32);
 
 // Software ring buffer in front of dbgSerial. Earlephilhower's SerialPIO has
 // only an 8-byte hardware TX FIFO and its write() calls pio_sm_put_blocking,
-// so writing a 250-byte status JSON straight to it would stall loop() for
-// ~22 ms (or forever if the PIO TX SM stops draining). DbgRing absorbs bursts
-// in 1 KB of RAM, drops bytes silently when full, and is drained in loop()
-// only as fast as the PIO HW FIFO has room — fully non-blocking.
+// so writing a ~250-byte burst (e.g. a debug log line) straight to it would
+// stall loop() for ~22 ms (or forever if the PIO TX SM stops draining).
+// DbgRing absorbs bursts in 1 KB of RAM, drops bytes silently when full, and
+// is drained in loop() only as fast as the PIO HW FIFO has room — fully
+// non-blocking.
 class DbgRing : public Print {
 public:
   static constexpr size_t SIZE = 1024;
@@ -65,7 +66,7 @@ DbgRing dbgRing;
 
 // Drops writes when the USB-CDC host has no port open. Earlephilhower's
 // SerialUSB::write blocks ~50 ms per byte waiting for buffer space when
-// DTR is deasserted — without this guard a 290-byte status JSON freezes
+// DTR is deasserted — without this guard a ~290-byte debug burst freezes
 // the loop for ~14 s, and nothing reaches the probe UART either.
 class UsbCdcDropIfDetached : public Print {
 public:
@@ -187,7 +188,7 @@ bool powerLossAlertPlayed = false;  // Prevent repeated alerts
 // --- Low battery warning state ---
 unsigned long lastLowBatteryBeep = 0;
 
-unsigned long lastJsonTime = 0;  // Track when last JSON was received
+unsigned long lastFrameTime = 0;  // millis() of the last power.status frame received
 
 // --- Screen navigation state ---
 uint8_t currentScreen = 0;
@@ -195,37 +196,35 @@ unsigned long lastInteractionTime = 0;
 bool lastBtnLeftState = HIGH;
 bool lastBtnRightState = HIGH;
 
-// --- Cached CH32X power.status (binary v1) and projection to legacy json_* ---
-// CH32X emits a power.status frame every 1 s. wups_on_local_frame() copies the
-// payload here and projects fields into the legacy `json_*` globals so the
-// existing OLED / alarm code works unchanged. Some old fields (PD detail,
-// snk_*) are not in v1 power.status — they stay 0 until extended.
+// --- Cached CH32X power.status (binary v1) ---
+// CH32X emits a power.status frame every 1 s. wups_on_local_frame() copies
+// the payload here and projects fields into the `ui` snapshot below.
 wups_power_status_v1_t Last_Power_Status = {};
 unsigned long Last_Power_Status_Ms = 0;
 
-int json_t = 0;    // temperature
-int json_vs = 0;   // voltage source
-int json_is = 0;   // current source
-int json_vr = 0;   // voltage regulated
-int json_ir = 0;   // current regulated
-int json_cs = 0;   // charge state (0-3)
-int json_pd = 0;   // PD negotiation status (OUTPUT side, not input!)
-int json_pdo = 0;  // Power Delivery Object (OUTPUT side)
-int json_pg = 0;   // Power Good (1 = power connected)
-int json_vi = 0;   // Input voltage (mV) from MP2762A
-int json_ci = 0;   // Charge current (mA) from MP2762A
-int json_cf = 0;   // Charger fault flags from MP2762A
-int json_bp = 0;   // Battery present (0/1)
-int json_vb = 0;   // Battery voltage (mV) from remote MCU ADC
-int json_vbc = 0;  // Battery voltage (mV) from MP2762A charger IC
-int json_role = 0;    // Current role (0=SINK, 1=SOURCE)
-int json_snk_ok = 0;  // SINK negotiation success
-int json_snk_v = 0;   // Negotiated SINK voltage (0.1V)
-int json_snk_i = 0;   // Negotiated SINK current (0.1A)
-
-// --- Battery values calculated from ADC (for compatibility) ---
-int json_bv = 0;   // battery voltage (mV) - from ADC
-int json_soc = 0;  // state of charge (%) - calculated from voltage
+// --- UPS view: snapshot for OLED rendering and alarm logic ----------------
+// Populated by wups_on_local_frame() from CH32X power.status (binary v1)
+// plus RP2040-local ADC readings (bv, soc). Read-only from the loop's PoV.
+// PD detail (pd, pdo) and snk_* / role are not in v1 power.status — they
+// stay at last-known until the protocol is extended.
+static struct {
+    // From CH32X power.status (binary v1):
+    int t;          // tenths of °C
+    int cs;         // charge state 0..3 (DSC/PRE/CHG/FUL)
+    int pg;         // 1 if input good (derived: vbus_in_mV > 5 V)
+    int vi;         // input voltage (mV)
+    int ci;         // charge current (mA, signed)
+    int cf;         // charger faults bitmap
+    int bp;         // battery present 0/1 (derived: vbat_mV > 100)
+    int vb, vbc;    // battery voltage (mV) — primary and from charger IC
+    int vs, is;     // PD contract V/A (0.1 V / 0.1 A units)
+    int vr, ir;     // VBUS_OUT V/A (0.1 V / 0.1 A units)
+    // Held at last known from previous protocol; not yet in v1 power.status:
+    int pd, pdo, role, snk_ok, snk_v, snk_i;
+    // Computed locally on RP2040:
+    int bv;         // battery voltage (mV, ADC + EMA)
+    int soc;        // 0..100 from LUT + adaptive EMA
+} ui;
 
 // --- VBUS output voltage from ADC ---
 int vbus_out_mV = 0;  // USB-C VBUS output voltage (mV) from ADC3
@@ -238,7 +237,7 @@ constexpr float EMA_ALPHA = 0.1f;
 float filtered_soc = -1.0f;
 constexpr float SOC_EMA_ALPHA = 0.05f;
 constexpr int SOC_SNAP_THRESHOLD = 3;  // Snap immediately if SOC changes by more than 3%
-bool newJsonReceived = false;
+bool newFrameReceived = false;
 
 // --- Battery presence debounce ---
 bool noBatteryDebounced = false;
@@ -456,18 +455,18 @@ static void drawScreenHome(int soc, bool noBattery, uint8_t animPhase) {
   }
   // Battery voltage (right of charge state)
   oled.setCursor(39, 16);
-  oled.print(json_bv / 1000);
+  oled.print(ui.bv / 1000);
   oled.print(F("."));
-  oled.print((json_bv % 1000) / 100);
+  oled.print((ui.bv % 1000) / 100);
   oled.print(F("V"));
 
   // Bottom line: input voltage + output voltage
   oled.setCursor(0, 25);
   // Input voltage (vi)
-  if (json_vi > 0) {
-    oled.print(json_vi / 1000);
+  if (ui.vi > 0) {
+    oled.print(ui.vi / 1000);
     oled.print(F("."));
-    oled.print((json_vi % 1000) / 100);
+    oled.print((ui.vi % 1000) / 100);
     oled.print(F("V"));
   } else {
     oled.print(F("-.-V"));
@@ -492,13 +491,13 @@ static void drawScreenPower() {
 
   // Line 1: Voltage SET, Current SET
   oled.setCursor(0, 8);
-  oled.print(json_vs / 10);
+  oled.print(ui.vs / 10);
   oled.print(F("."));
-  oled.print(json_vs % 10);
+  oled.print(ui.vs % 10);
   oled.print(F("V "));
-  oled.print(json_is / 10);
+  oled.print(ui.is / 10);
   oled.print(F("."));
-  oled.print(json_is % 10);
+  oled.print(ui.is % 10);
   oled.print(F("A"));
 
   // Line 2: Header
@@ -507,13 +506,13 @@ static void drawScreenPower() {
 
   // Line 3: Voltage READ, Current READ
   oled.setCursor(0, 24);
-  oled.print(json_vr / 10);
+  oled.print(ui.vr / 10);
   oled.print(F("."));
-  oled.print(json_vr % 10);
+  oled.print(ui.vr % 10);
   oled.print(F("V "));
-  oled.print(json_ir / 10);
+  oled.print(ui.ir / 10);
   oled.print(F("."));
-  oled.print(json_ir % 10);
+  oled.print(ui.ir % 10);
   oled.print(F("A"));
 
   drawScreenIndicator(1);
@@ -527,17 +526,17 @@ static void drawScreenBattery() {
   // Line 0: Temperature
   oled.setCursor(0, 0);
   oled.print(F("T:"));
-  oled.print(json_t / 10);
+  oled.print(ui.t / 10);
   oled.print(F("."));
-  oled.print(abs(json_t % 10));
+  oled.print(abs(ui.t % 10));
   oled.print(F("C"));
 
   // Line 1: Battery voltage (from ADC)
   oled.setCursor(0, 8);
   oled.print(F("Bat:"));
-  oled.print(json_bv / 1000);
+  oled.print(ui.bv / 1000);
   oled.print(F("."));
-  int frac = (json_bv % 1000) / 10;
+  int frac = (ui.bv % 1000) / 10;
   if (frac < 10) oled.print(F("0"));
   oled.print(frac);
   oled.print(F("V"));
@@ -545,13 +544,13 @@ static void drawScreenBattery() {
   // Line 2: Charger fault flags (hex)
   oled.setCursor(0, 16);
   oled.print(F("CF:0x"));
-  if (json_cf < 16) oled.print(F("0"));
-  oled.print(json_cf, HEX);
+  if (ui.cf < 16) oled.print(F("0"));
+  oled.print(ui.cf, HEX);
 
   // Line 3: Charge current
   oled.setCursor(0, 24);
   oled.print(F("CI:"));
-  oled.print(json_ci);
+  oled.print(ui.ci);
   oled.print(F("mA"));
 
   drawScreenIndicator(2);
@@ -569,12 +568,12 @@ static void drawScreenPDInfo() {
   // Line 1: PD State
   oled.setCursor(0, 8);
   oled.print(F("State:"));
-  oled.print(json_pd);
+  oled.print(ui.pd);
 
   // Line 2: PDO Index
   oled.setCursor(0, 16);
   oled.print(F("PDO:"));
-  oled.print(json_pdo);
+  oled.print(ui.pdo);
 
   // Line 3: Output voltage (measured from ADC3)
   oled.setCursor(0, 24);
@@ -628,7 +627,7 @@ static void drawScreenPowerCtrl() {
 //
 // Application behaviour for v1:
 //   - CH32X power.status (cls=POWER op=PWR_STATUS, src=CH32X)
-//       → cache in Last_Power_Status, project to legacy `json_*`,
+//       → cache in Last_Power_Status, project into the `ui` snapshot,
 //         re-emit unicast to RPi as a push aggregate (preserving SRC=CH32X).
 //   - system.ping (REQ) addressed to us
 //       → reply with system.ping (RESP) carrying uptime + fw_version.
@@ -638,13 +637,13 @@ static void drawScreenPowerCtrl() {
 //       → silently dropped.
 //
 // Defined here (in main.cpp) because the body needs access to RP2040
-// firmware globals (json_*, lastJsonTime, etc.). Declared in wups_router.h.
+// firmware globals (ui, lastFrameTime, etc.). Declared in wups_router.h.
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   (void)inbound_port;
 
-  // CH32X power.status — cache and project to the legacy `json_*` globals
-  // so the existing OLED / alarm code keeps working unchanged. Some old
-  // fields (PD detail, snk_*) are not in v1 power.status and stay 0.
+  // CH32X power.status — cache and project into the `ui` snapshot so the
+  // OLED / alarm code keeps working unchanged. PD detail and snk_* are not
+  // in v1 power.status; they stay at last known.
   if (f.cls == WUPS_CLASS_POWER && f.op == WUPS_OP_PWR_STATUS &&
       f.src == WUPS_ADDR_CH32X &&
       f.len >= sizeof(wups_power_status_v1_t)) {
@@ -655,24 +654,24 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     Last_Power_Status    = s;
     Last_Power_Status_Ms = millis();
 
-    json_t   = s.temp_dC;
-    json_cs  = s.charge_state;
-    json_pg  = (s.vbus_in_mV > 5000) ? 1 : 0;     // derived: input "good"
-    json_vi  = s.vbus_in_mV;
-    json_ci  = s.ibat_mA;
-    json_cf  = s.faults;
-    json_bp  = (s.vbat_mV > 100) ? 1 : 0;          // derived: battery present
-    json_vb  = s.vbat_mV;
-    json_vbc = s.vbat_mV;                          // single source in v1
+    ui.t   = s.temp_dC;
+    ui.cs  = s.charge_state;
+    ui.pg  = (s.vbus_in_mV > 5000) ? 1 : 0;     // derived: input "good"
+    ui.vi  = s.vbus_in_mV;
+    ui.ci  = s.ibat_mA;
+    ui.cf  = s.faults;
+    ui.bp  = (s.vbat_mV > 100) ? 1 : 0;          // derived: battery present
+    ui.vb  = s.vbat_mV;
+    ui.vbc = s.vbat_mV;                          // single source in v1
     // Set vs read separation lost in v1: report measured values for both.
-    json_vs  = (int)(s.pd_contract_mV / 100);
-    json_is  = (int)(s.pd_contract_mA / 100);
-    json_vr  = (int)(s.vbus_out_mV / 100);
-    json_ir  = (int)(s.ibus_out_mA / 100);
+    ui.vs  = (int)(s.pd_contract_mV / 100);
+    ui.is  = (int)(s.pd_contract_mA / 100);
+    ui.vr  = (int)(s.vbus_out_mV / 100);
+    ui.ir  = (int)(s.ibus_out_mA / 100);
     // PD detail (pd, pdo, role, snk_*) is not in v1 power.status — hold previous values.
 
-    newJsonReceived = true;
-    lastJsonTime    = millis();
+    newFrameReceived = true;
+    lastFrameTime    = millis();
 
     // Push-mode aggregate to RPi: forward the same frame on USB-CDC with
     // SRC=CH32X preserved. RPi service decodes and treats it as authoritative.
@@ -935,26 +934,26 @@ void loop() {
     filtered_batt_mV = EMA_ALPHA * batteryVoltage_mV + (1.0f - EMA_ALPHA) * filtered_batt_mV;
   }
 
-  // Update json_bv with filtered value (for compatibility)
-  json_bv = (int)(filtered_batt_mV + 0.5f);
+  // Update ui.bv with filtered value (for compatibility)
+  ui.bv = (int)(filtered_batt_mV + 0.5f);
 
   // Calculate SOC from filtered battery voltage, then apply adaptive EMA:
   // - Snap immediately on first reading or large changes (battery plug/unplug)
   // - Smooth small oscillations from LUT boundary crossings
-  int rawSoc = voltageToSoc(json_bv);
+  int rawSoc = voltageToSoc(ui.bv);
   if (filtered_soc < 0 || abs(rawSoc - (int)filtered_soc) > SOC_SNAP_THRESHOLD) {
     filtered_soc = (float)rawSoc;
   } else {
     filtered_soc = SOC_EMA_ALPHA * rawSoc + (1.0f - SOC_EMA_ALPHA) * filtered_soc;
   }
   int soc = (int)(filtered_soc + 0.5f);
-  json_soc = soc;
+  ui.soc = soc;
 
   // CH32X power.status is forwarded to RPi inside wups_on_local_frame() at
   // the moment of arrival (preserving SRC=CH32X). Augmenting with RP2040's
   // bv/SOC/vo would require a separate v2 power.aggregate op — deferred.
-  // For now we simply consume `newJsonReceived` as a "data updated" flag.
-  newJsonReceived = false;
+  // For now we simply consume `newFrameReceived` as a "data updated" flag.
+  newFrameReceived = false;
 
   // --- Startup stabilization gate ---
   // During first 3 seconds, let ADC/EMA settle before making decisions
@@ -962,11 +961,11 @@ void loop() {
   if (!startupComplete) {
     if (millis() >= startupEndTime) {
       startupComplete = true;
-      previousPowerGood = (json_pg == 1);
+      previousPowerGood = (ui.pg == 1);
       lastLowBatteryBeep = millis();
-      displayCs = json_cs;
-      noBatteryDebounced = (lastJsonTime > 0) ? (json_bp == 0)
-                         : (json_bv > 10000 || json_bv < 5000);
+      displayCs = ui.cs;
+      noBatteryDebounced = (lastFrameTime > 0) ? (ui.bp == 0)
+                         : (ui.bv > 10000 || ui.bv < 5000);
     } else {
       delay(50);
       return;
@@ -977,10 +976,10 @@ void loop() {
   // Primary: use bp (battery present) from MP2762A charger IC (hardware UVLO threshold)
   // Fallback: voltage-based detection when no UART data received yet
   bool rawNoBattery;
-  if (lastJsonTime > 0) {
-    rawNoBattery = (json_bp == 0);
+  if (lastFrameTime > 0) {
+    rawNoBattery = (ui.bp == 0);
   } else {
-    rawNoBattery = (json_bv > 10000) || (json_bv < 5000);
+    rawNoBattery = (ui.bv > 10000) || (ui.bv < 5000);
   }
 
   // Debounce battery presence to prevent display flicker
@@ -997,10 +996,10 @@ void loop() {
 
   // Smooth displayed charge state to prevent CHG/FUL flicker at end-of-charge
   // (MP2762A toggles between CC and CV states when battery is nearly full)
-  if (json_cs != displayCs) {
+  if (ui.cs != displayCs) {
     csChangeCounter++;
     if (csChangeCounter >= CS_CHANGE_DEBOUNCE) {
-      displayCs = json_cs;
+      displayCs = ui.cs;
       csChangeCounter = 0;
     }
   } else {
@@ -1013,7 +1012,7 @@ void loop() {
   // pg=1 means power is present
   // vi < 8000 means ~5V (non-PD or PD at 5V only - not enough for 26W)
   // vi > 21000 means garbage/saturated ADC (charger not working properly)
-  bool badCharger = (json_pg == 1 && (json_vi < 8000 || json_vi > 21000));
+  bool badCharger = (ui.pg == 1 && (ui.vi < 8000 || ui.vi > 21000));
 
   if (badCharger) {
     // Buzzer alert logic
@@ -1073,7 +1072,7 @@ void loop() {
   oled.display();
 
   // --- Power transition detection (charger disconnected -> battery power) ---
-  bool currentPowerGood = (json_pg == 1);
+  bool currentPowerGood = (ui.pg == 1);
 
   // Detect transition from power connected to battery power
   if (previousPowerGood && !currentPowerGood && !powerLossAlertPlayed) {
