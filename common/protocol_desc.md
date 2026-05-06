@@ -154,12 +154,18 @@ whichever address the cloud directed (typically `RPI`).
 
 ### Class 0x04 HOST (RPi)
 
-| Op   | Name           | Direction         | Payload struct              |
-|------|----------------|-------------------|------------------------------|
-| 0x01 | status         | EVENT (RPi→RP2040 @1Hz), RESP | `wups_host_status_v1_t` |
-| 0x02 | shutdown       | REQ               | `wups_host_shutdown_v1_t`   |
-| 0x03 | reset          | REQ               | `wups_host_shutdown_v1_t`   |
-| 0x10 | event          | EVENT (broadcast) | `wups_host_event_v1_t`      |
+| Op   | Name             | Direction         | Payload struct                          |
+|------|------------------|-------------------|------------------------------------------|
+| 0x01 | status           | EVENT (RPi→RP2040 @5s), RESP | `wups_host_status_v1_t`     |
+| 0x02 | shutdown         | REQ               | `wups_host_shutdown_v1_t`                |
+| 0x03 | reset            | REQ               | `wups_host_shutdown_v1_t`                |
+| 0x04 | service_restart  | REQ               | `wups_host_service_restart_v1_hdr_t` + unit name |
+| 0x10 | event            | EVENT (broadcast) | `wups_host_event_v1_t`                   |
+
+`host.service_restart` carries a target systemd unit name (without `.service`
+suffix). The agent on the RPi enforces a whitelist configured locally; units
+not on the whitelist are rejected. A master `allow_service_restart` switch in
+the agent's config disables the op entirely.
 
 ### Class 0x05 UI (RP2040)
 
