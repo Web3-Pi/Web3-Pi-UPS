@@ -11,16 +11,19 @@ extern "C" {
 #define MP2762A_I2C_ADDR 0x5C
 
 // Register addresses (per datasheet)
-#define MP2762A_REG_INPUT_ILIM 0x00  // Input current limit 1
-#define MP2762A_REG_INPUT_VLIM 0x01  // Input voltage limit
-#define MP2762A_REG_CHG_CURR 0x02    // Charge current setting
-#define MP2762A_REG_PRETERM 0x03     // Pre-charge and termination current
-#define MP2762A_REG_VBAT_REG 0x04    // Battery-full voltage and recharge threshold
-#define MP2762A_REG_CONFIG0 0x08     // Configuration register 0
-#define MP2762A_REG_CONFIG1 0x09     // Configuration register 1
-#define MP2762A_REG_ADC_CFG 0x0B    // ADC configuration register
-#define MP2762A_REG_STATUS 0x13      // Status register
-#define MP2762A_REG_FAULT 0x14       // Fault register
+#define MP2762A_REG_INPUT_ILIM  0x00  // Input current limit 1 (sustained, lower)
+#define MP2762A_REG_INPUT_VLIM  0x01  // Input voltage limit
+#define MP2762A_REG_CHG_CURR    0x02  // Charge current setting
+#define MP2762A_REG_PRETERM     0x03  // Pre-charge and termination current
+#define MP2762A_REG_VBAT_REG    0x04  // Battery-full voltage and recharge threshold
+#define MP2762A_REG_CONFIG0     0x08  // Configuration register 0
+#define MP2762A_REG_CONFIG1     0x09  // Configuration register 1
+#define MP2762A_REG_ADC_CFG     0x0B  // ADC configuration register
+#define MP2762A_REG_INPUT_ILIM2 0x0F  // Input current limit 2 (burst, higher; default 1.5A!)
+#define MP2762A_REG_ILIM2_DUR   0x10  // Input current limit 2 duration (t_MAX)
+#define MP2762A_REG_TWO_LEVEL_PERIOD 0x11  // Two-level current limit period
+#define MP2762A_REG_STATUS  0x13      // Status register
+#define MP2762A_REG_FAULT   0x14      // Fault register
 #define MP2762A_REG_ADC_VBAT_L 0x16  // Battery voltage ADC LSB
 #define MP2762A_REG_ADC_VBAT_H 0x17  // Battery voltage ADC MSB
 #define MP2762A_REG_ADC_VSYS_L 0x18  // System voltage ADC LSB
@@ -31,6 +34,8 @@ extern "C" {
 #define MP2762A_REG_ADC_VIN_H 0x1D   // Input voltage ADC MSB
 #define MP2762A_REG_ADC_IIN_L 0x1E   // Input current ADC LSB
 #define MP2762A_REG_ADC_IIN_H 0x1F   // Input current ADC MSB
+#define MP2762A_REG_ADC_TJUNC_L 0x24 // Junction temperature ADC LSB (TJ[9:0] in bits 15:6)
+#define MP2762A_REG_ADC_TJUNC_H 0x25 // Junction temperature ADC MSB
 
 // REG08H Configuration Register 0 bits
 #define MP2762A_REG_RST     0x80  // Bit 7: Register reset
@@ -76,6 +81,8 @@ typedef struct {
   uint16_t iin_ma;  // Input current in mA
   uint16_t vbat_mv; // Battery voltage in mV
   uint16_t ichg_ma; // Charge current in mA
+  uint16_t vsys_mv; // System voltage in mV (the rail feeding TPS55289 VIN)
+  int16_t  tjunc_c10; // Junction temperature in 0.1 °C (e.g. 425 = 42.5 °C)
   uint8_t fault;    // Fault flags
 } mp2762a_data_t;
 
@@ -91,6 +98,8 @@ uint16_t mp2762a_get_input_voltage_mv(void);
 uint16_t mp2762a_get_input_current_ma(void);
 uint16_t mp2762a_get_battery_voltage_mv(void);
 uint16_t mp2762a_get_charge_current_ma(void);
+uint16_t mp2762a_get_system_voltage_mv(void);
+int16_t  mp2762a_get_junction_temp_c10(void);
 uint8_t mp2762a_get_fault(void);
 
 // Battery/charger recovery functions

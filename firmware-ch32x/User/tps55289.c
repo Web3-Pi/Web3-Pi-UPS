@@ -38,7 +38,14 @@ void write_word_lsb_first(UINT8 reg_lsb, UINT16 value)
 // -----------------------------------------------------------------------------
 void tps55289_init(void)
 {
-    tps55289_write_byte(REG_VOUT_SR, 0x01);
+    /* VOUT_SR (0x03):
+     *   bits 5:4 OCP_DELAY = 01b → 1.024 × 3 ms ≈ 3 ms response delay on
+     *     the output current overcurrent limit. Default is 128 μs which
+     *     causes false trips on PD-trigger e-load step transients
+     *     (see datasheet §7.6.3, table 7-6).
+     *   bits 1:0 SR = 01b → 2.5 mV/μs slew rate (default).
+     */
+    tps55289_write_byte(REG_VOUT_SR, (0x01 << 4) | 0x01);
     tps55289_set_cdc_compensation(CDC_COMP_0V7);  // Enable max cable droop compensation
     tps55289_enable_output(0);
 }
@@ -63,11 +70,18 @@ void tps55289_enable_output(UINT8 enable)
 {
     if (enable)
     {
-        tps55289_write_byte(REG_MODE, MODE_OE_BIT);
+        /* Reset value of MODE is 0x20 (HICCUP=1). The earlier code wrote
+         * 0x80 which silently cleared HICCUP and FPWM stayed at 0. Without
+         * HICCUP, an SCP trip latches the device off until power-cycle.
+         * Preserve HICCUP=1 (default), keep FPWM=0 (PFM at light load,
+         * default), DISCHG=0 (default), FSWDBL=0 (default). */
+        tps55289_write_byte(REG_MODE, MODE_OE_BIT | MODE_HICCUP_BIT);
 	}
     else
     {
-        tps55289_write_byte(REG_MODE, 0x00);
+        /* Disabled — keep HICCUP set so that on next enable the part
+         * starts in a known state. */
+        tps55289_write_byte(REG_MODE, MODE_HICCUP_BIT);
 	}
 }
 // -----------------------------------------------------------------------------
@@ -100,20 +114,15 @@ UINT8 tps55289_set_voltage(float vout)
 
     UINT8 intfb_bits;
 
-/*
-    if (vout <= 5.0f)
-        intfb_bits = 0;
-    else if (vout <= 10.0f)
-        intfb_bits = 1;
-    else if (vout <= 15.0f)
-        intfb_bits = 2;
-    else
-        intfb_bits = 3;
-*/
-//    float ratio = INTFB_OPTIONS[intfb_bits];
-
-	intfb_bits = 0x03;
-	float ratio = 0.0564f;
+    /* Stay on the 20 V INTFB scale (ratio 0.0564, 10 mV step). Trying to
+     * pick smaller scales for lower targets bit us during a TPS UVLO trip:
+     * the chip resets REF to its 0x1A4 default but INTFB seems to retain
+     * the last write, leaving the converter at REF_default / ratio_smaller
+     * — e.g. 282 mV / 0.1128 ≈ 2.5 V instead of the expected 5 V default.
+     * Hardcoding INTFB=11 keeps the post-reset reading at the textbook 5 V
+     * default and avoids that misleading post-trip readout. */
+    intfb_bits = 0x03;
+    float ratio = INTFB_OPTIONS[intfb_bits];
     float vref = vout * ratio;
 
     if (vref < REF_MIN_V || vref > REF_MAX_V)
@@ -167,5 +176,14 @@ float tps55289_read_current_limit(void)
     UINT8 val = reg & 0x7F; // Lower 7 bits are the value
     float amps = (float)val / IOUT_LSB_PER_AMP;
     return amps;
+}
+// -----------------------------------------------------------------------------
+//  Read STATUS register (0x07). SCP/OCP/OVP bits are sticky — they stay set
+//  until the register is read. Polling once a second from the main loop gives
+//  the host visibility into protection trips without spamming the bus.
+// -----------------------------------------------------------------------------
+UINT8 tps55289_read_status(void)
+{
+    return I2C_read_reg(TPS55289_I2C_ADDR, REG_STATUS);
 }
 // -----------------------------------------------------------------------------

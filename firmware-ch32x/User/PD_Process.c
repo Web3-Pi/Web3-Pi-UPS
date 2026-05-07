@@ -104,7 +104,7 @@ UINT16 PD_Get_Snk_Current_100mA(void) { return g_snk_neg_current_100mA; }
 //PDO profile compatible with Raspberry Pi 5 (flags, 5V@5A, 9V@3A, 12V@2.25A, 15V@1.8A)
 UINT8 SrcCap_5V5A_Tab[ 16 ] =
 {
-    0xF4, 0x91, 0x01, 0x0A,   /* flags + 5.0V/5A-ish (your original) */
+    0xF4, 0x91, 0x01, 0x0A,   /* 5V 5A   (PDO #1, dual-role + ext-power flags) */
     0x2C, 0xD1, 0x02, 0x00,   /* 9V 3A */
     0xE1, 0xC0, 0x03, 0x00,   /* 12V 2.25A */
     0xB4, 0xB0, 0x04, 0x00,   /* 15V 1.8A */
@@ -838,7 +838,7 @@ void PD_Main_Proc( void )
                         float curr = 0;
                         switch (SinkReqPDOIndex)
                         {
-                            case 1: volt = 5.1;  curr = 5.0;  break;
+                            case 1: volt = 5.0;  curr = 5.0;  break;
                             case 2: volt = 9.0;  curr = 3.0;  break;
                             case 3: volt = 12.0; curr = 2.25; break;
                             case 4: volt = 15.0; curr = 1.8;  break;

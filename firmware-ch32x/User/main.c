@@ -1,14 +1,18 @@
 /********************************** (C) COPYRIGHT *******************************
  * File Name          : main.c
- * Author             : WCH
- * Version            : V1.0.1
- * Date               : 2025/03/11
- * Description        : Main program body.
-*********************************************************************************
-* Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
-* Attention: This software (modified or not) and binary are used for
-* microcontroller manufactured by Nanjing Qinheng Microelectronics.
-*******************************************************************************/
+ * Project            : Web3 Pi UPS v2 — CH32X035 PD SRC controller firmware
+ * Author             : Robert Mordzon (Web3 Pi)
+ * Based on           : WCH "PD SRC Sample code" V1.0.1 (2025/03/11)
+ * Description        : Main program body — dual-role USB-PD, TPS55289 VBUS
+ *                      control, MP2762A charger telemetry, LM75B temperature,
+ *                      and Web3 Pi UPS binary wire protocol v1 over USART2.
+ *********************************************************************************
+ * Copyright (c) 2026 Robert Mordzon / Web3 Pi
+ * Portions Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
+ *
+ * Attention: This software (modified or not) and binary are used for
+ * microcontroller manufactured by Nanjing Qinheng Microelectronics.
+ *******************************************************************************/
 
 /*
  *@Note
@@ -49,6 +53,14 @@
 /* WWDG Reset Enable Selection */
 #define WDT_RST   WDT_RST_DISABLE
 
+/* Diagnostic mode: skip USB-PD negotiation entirely. From boot, force
+ * TPS55289 to 5.1 V / 5 A and hold VBUS_OUT_EN high. PD_Init() still
+ * runs so the CC-line Rp pull-ups exist (a sink will detect us as a
+ * non-PD 5 V source and pull as much current as its e-load asks for —
+ * up to 5 A from the TPS limit). Uncomment the define to bypass PD
+ * negotiation again. */
+/* #define DIAG_FORCE_5V_5A_NO_PD */
+
 void TIM1_UP_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void ADC_Function_Init(void);
 u16 Get_ADC_Val(u8 ch);
@@ -73,10 +85,17 @@ static UINT16   Temp_Timer_Ms = 0;
 static UINT16   Chg_Timer_Ms = 0;
 static UINT16   Tps_Timer_Ms = 0;
 static UINT16   Bat_Timer_Ms = 0;
+static UINT16   Diag_Log_Timer_Ms = 0;
+#define DIAG_LOG_INTERVAL_MS 5000
 static int16_t  Board_Temp_c10 = 0;
 static mp2762a_data_t Chg_Data = {0};
 static int16_t  Tps_Vread_v10 = 0;
 static int16_t  Tps_Iread_a10 = 0;
+/* TPS55289 STATUS register bits — accumulated across polls. SCP/OCP/OVP
+ * latch in hardware until the register is read. We OR each poll's read
+ * into Tps_Status_Latched so a brief trip is not lost between status
+ * frames; the latch is cleared once a power.status frame ships out. */
+static uint8_t  Tps_Status_Latched = 0;
 #define JSON_INTERVAL_MS 1000
 #define TEMP_INTERVAL_MS 5000
 #define CHG_INTERVAL_MS  2000
@@ -124,7 +143,7 @@ void VBUS_set_5V(void)
 //tps55289 - set 5.1V / 3A
 	tps55289_set_cdc_compensation(CDC_COMP_0V7);
 	tps55289_set_current_limit(3.0);
-	tps55289_set_voltage(5.1);
+	tps55289_set_voltage(5.0);
 	tps55289_enable_output(1);
 }
 
@@ -478,13 +497,74 @@ static void wups_send_power_status(uint8_t dst, uint8_t flags, uint8_t seq)
     s.ibus_out_mA    = (int16_t)((int32_t)Tps_Iread_a10 * 100);
     s.vbat_mV        = (uint16_t)Chg_Data.vbat_mv;
     s.ibat_mA        = (int16_t)Chg_Data.ichg_ma;
-    s.temp_dC        = Board_Temp_c10;
-    s.pd_contract_mV = (uint16_t)((uint32_t)PD_Get_Snk_Voltage_100mV() * 100u);
-    s.pd_contract_mA = (uint16_t)((uint32_t)PD_Get_Snk_Current_100mA() * 100u);
-    s.faults         = (uint16_t)Chg_Data.fault;
+    /* Hottest of LM75B (board, near TPS55289) and MP2762A junction.
+     * "Worst-of" is the right number for thermal protection logic and OLED
+     * display — if either chip is approaching its safe limit, that's what
+     * we want surfaced. Both inputs are in deci-Celsius. */
+    {
+        int16_t lm = Board_Temp_c10;
+        int16_t tj = Chg_Data.tjunc_c10;
+        s.temp_dC = (tj > lm) ? tj : lm;
+    }
+    /* SINK contract is 0 unless the UPS is being fed by an upstream PD
+     * charger. While diagnosing the SOURCE-side power path with no upstream
+     * PD, repurpose `pd_contract_mV` as VSYS (mV) and `pd_contract_mA` as
+     * IIN (mA from MP2762A) — both are critical to diagnose TPS55289 UVLO
+     * trips that don't show up in STATUS register. Once the SINK side is
+     * also exercised this aliasing has to go (real fix: protocol v2 with
+     * dedicated diag fields). */
+    if (PD_Get_Snk_Voltage_100mV() != 0)
+    {
+        s.pd_contract_mV = (uint16_t)((uint32_t)PD_Get_Snk_Voltage_100mV() * 100u);
+        s.pd_contract_mA = (uint16_t)((uint32_t)PD_Get_Snk_Current_100mA() * 100u);
+    }
+    else
+    {
+        s.pd_contract_mV = (uint16_t)Chg_Data.vsys_mv;
+        s.pd_contract_mA = (uint16_t)Chg_Data.iin_ma;
+    }
+    /* Pack TPS55289 STATUS bits into the high byte of `faults` so the
+     * MP2762A fault byte (low byte) is preserved. The host can see what
+     * tripped the converter without bumping the protocol version:
+     *   bit  8 (TPS SCP)  ← STATUS bit 7
+     *   bit  9 (TPS OCP)  ← STATUS bit 6
+     *   bit 10 (TPS OVP)  ← STATUS bit 5
+     */
+    uint16_t tps_flags = 0;
+    if (Tps_Status_Latched & STATUS_SCP_BIT) tps_flags |= (1u << 8);
+    if (Tps_Status_Latched & STATUS_OCP_BIT) tps_flags |= (1u << 9);
+    if (Tps_Status_Latched & STATUS_OVP_BIT) tps_flags |= (1u << 10);
+    s.faults = (uint16_t)(Chg_Data.fault | tps_flags);
+    /* Clear the latch only after the bits have been packed into the
+     * frame about to ship — otherwise a trip between read and frame
+     * emission would be lost. */
+    Tps_Status_Latched = 0;
 
     wups_send_frame(dst, WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
                     flags, seq, &s, sizeof(s));
+}
+
+/* system.log broadcast helper. Header layout per protocol.h:
+ *   uint8_t version = 1
+ *   uint8_t level   (0=trace 1=debug 2=info 3=warn 4=error)
+ *   uint8_t text_len
+ *   uint8_t reserved = 0
+ *   text[text_len]
+ * RP2040 hub forwards the text body to its debug stream (USB-CDC + Probe
+ * UART), which gives us a remote read-back channel without needing to
+ * solder a debug UART pin on CH32X. Used for raw register dumps. */
+static void wups_send_log(uint8_t level, const char *text)
+{
+    uint16_t text_len = 0;
+    while (text[text_len] && text_len < (WUPS_MAX_PAYLOAD - 4)) text_len++;
+    uint8_t buf[WUPS_MAX_PAYLOAD];
+    buf[0] = 1;
+    buf[1] = level;
+    buf[2] = (uint8_t)text_len;
+    buf[3] = 0;
+    for (uint16_t i = 0; i < text_len; ++i) buf[4 + i] = (uint8_t)text[i];
+    wups_send_frame(WUPS_ADDR_BROADCAST, WUPS_CLASS_SYSTEM, WUPS_OP_SYS_LOG,
+                    WUPS_FLAG_EVENT, Wups_Tx_Seq++, buf, (uint16_t)(4 + text_len));
 }
 
 /* system.hello broadcast — emitted once at boot. */
@@ -747,6 +827,17 @@ int main(void)
     TIM1_Init( 999, 48-1);
     USART2_Init(921600);
 
+#ifdef DIAG_FORCE_5V_5A_NO_PD
+    /* Force TPS55289 to 5.1 V / 5 A and assert VBUS_OUT_EN. No PD
+     * negotiation will run — see DIAG_FORCE_5V_5A_NO_PD comment above. */
+    GPIO_WriteBit(GPIOA, GPIO_Pin_7, 1);   /* VBUS_OUT_EN = 1 */
+    GPIO_WriteBit(GPIOB, GPIO_Pin_0, 1);   /* PDS_EN = 1 (TPS enable) */
+    tps55289_set_cdc_compensation(CDC_COMP_0V7);
+    tps55289_set_current_limit(5.0);
+    tps55289_set_voltage(5.0);
+    tps55289_enable_output(1);
+#endif
+
     /* Announce ourselves on the bus. RP2040 (the hub) caches hellos to
      * track which nodes are alive. Sent once; not retried. */
     wups_send_hello_bcast();
@@ -760,8 +851,10 @@ int main(void)
         //Tmr_Ms_Dlt = 1;
         TIM_ITConfig( TIM1, TIM_IT_Update , ENABLE );
 
+#ifndef DIAG_FORCE_5V_5A_NO_PD
 		/* role manager tick: uses Tmr_Ms_Dlt */
         PD_Role_Manager_Tick();
+#endif
 
         /* Drain UART RX ring and dispatch any complete command frames. */
         Cmd_Rx_Drain();
@@ -777,6 +870,7 @@ int main(void)
             }
         }
 
+#ifndef DIAG_FORCE_5V_5A_NO_PD
         PD_Ctl.Det_Timer += Tmr_Ms_Dlt;
         if( PD_Ctl.Det_Timer > 4 )
         {
@@ -784,6 +878,7 @@ int main(void)
             PD_Det_Proc( );
         }
         PD_Main_Proc( );
+#endif
 
         /* Periodic temperature reading from LM75B every 5s */
         Temp_Timer_Ms += Tmr_Ms_Dlt;
@@ -793,13 +888,32 @@ int main(void)
             Board_Temp_c10 = (int16_t)(lm75b_read_temp_c() * 10.0f);
         }
 
-        /* Read TPS55289 voltage/current every 2s */
+        /* Read TPS55289 voltage/current every 2s, plus STATUS register
+         * which holds latched SCP/OCP/OVP flags until read. */
         Tps_Timer_Ms += Tmr_Ms_Dlt;
         if (Tps_Timer_Ms >= TPS_INTERVAL_MS)
         {
             Tps_Timer_Ms = 0;
             Tps_Vread_v10 = (int16_t)(tps55289_read_voltage() * 10.0f);
             Tps_Iread_a10 = (int16_t)(tps55289_read_current_limit() * 10.0f);
+            Tps_Status_Latched |= tps55289_read_status();
+
+#ifdef DIAG_FORCE_5V_5A_NO_PD
+            /* Re-apply the full config every 2 s as a watchdog. Catches:
+             *  - INTFB / REF leftover from a previous firmware build (TPS
+             *    is not power-cycled when CH32X is reflashed, so its
+             *    registers persist across firmware loads).
+             *  - Autonomous TPS resets that might wipe REF back to default
+             *    while leaving INTFB on a stale value.
+             * Reading the registers at the top of this branch already
+             * surfaced the current state into telemetry; the reapply
+             * happens after the read so the screen briefly shows the
+             * stale value before snapping to the intended one. */
+            tps55289_set_cdc_compensation(CDC_COMP_0V7);
+            tps55289_set_current_limit(5.0);
+            tps55289_set_voltage(5.0);
+            tps55289_enable_output(1);
+#endif
         }
 
         /* Read MP2762A charger status every 2s + kick watchdog */
@@ -827,6 +941,79 @@ int main(void)
                 mp2762a_restart_charging();
                 Chg_Data.fault = 0;
             }
+        }
+
+        /* Diagnostic log: every 5 s, dump the raw bytes of the MP2762A
+         * registers we care about to system.log. RP2040 forwards it to
+         * the debug stream so a remote operator can see exactly what the
+         * chip reports without unplugging the bench setup. */
+        Diag_Log_Timer_Ms += Tmr_Ms_Dlt;
+        if (Diag_Log_Timer_Ms >= DIAG_LOG_INTERVAL_MS)
+        {
+            Diag_Log_Timer_Ms = 0;
+            uint8_t r00 = mp2762a_read_reg(MP2762A_REG_INPUT_ILIM);
+            uint8_t r0F = mp2762a_read_reg(MP2762A_REG_INPUT_ILIM2);
+            uint8_t r02 = mp2762a_read_reg(MP2762A_REG_CHG_CURR);
+            uint8_t r08 = mp2762a_read_reg(MP2762A_REG_CONFIG0);
+            uint8_t r13 = mp2762a_read_reg(MP2762A_REG_STATUS);
+            uint8_t r14 = mp2762a_read_reg(MP2762A_REG_FAULT);
+            uint8_t ichg_l = mp2762a_read_reg(MP2762A_REG_ADC_ICHG_L);
+            uint8_t ichg_h = mp2762a_read_reg(MP2762A_REG_ADC_ICHG_H);
+            uint8_t iin_l  = mp2762a_read_reg(MP2762A_REG_ADC_IIN_L);
+            uint8_t iin_h  = mp2762a_read_reg(MP2762A_REG_ADC_IIN_H);
+            uint8_t tj_l   = mp2762a_read_reg(MP2762A_REG_ADC_TJUNC_L);
+            uint8_t tj_h   = mp2762a_read_reg(MP2762A_REG_ADC_TJUNC_H);
+            char buf[160];
+            /* Hand-rolled formatter — newlib-nano printf is ~7 KB and we
+             * don't otherwise pay for it. Order matches the register map
+             * for visual scanning. */
+            const char hex[] = "0123456789ABCDEF";
+            int p = 0;
+            #define EMIT_STR(s_) do { const char *__s = (s_); while (*__s) buf[p++] = *__s++; } while(0)
+            #define EMIT_HEX(b_) do { uint8_t __b = (b_); buf[p++] = hex[(__b >> 4) & 0xF]; buf[p++] = hex[__b & 0xF]; } while(0)
+            EMIT_STR("MP2762A r00="); EMIT_HEX(r00);
+            EMIT_STR(" r0F=");        EMIT_HEX(r0F);
+            EMIT_STR(" r02=");        EMIT_HEX(r02);
+            EMIT_STR(" r08=");        EMIT_HEX(r08);
+            EMIT_STR(" r13=");        EMIT_HEX(r13);
+            EMIT_STR(" r14=");        EMIT_HEX(r14);
+            EMIT_STR(" ICHG=");       EMIT_HEX(ichg_h); EMIT_HEX(ichg_l);
+            EMIT_STR(" IIN=");        EMIT_HEX(iin_h);  EMIT_HEX(iin_l);
+            EMIT_STR(" TJraw=");      EMIT_HEX(tj_h);   EMIT_HEX(tj_l);
+            /* Decimal interpretation of the two on-board temperature
+             * sources, in tenths of a degree. Keeps the diagnostic feed
+             * self-contained so we don't have to cross-reference with the
+             * power.status text line every time. */
+            EMIT_STR(" Tboard=");
+            {
+                int16_t v = Board_Temp_c10;
+                if (v < 0) { buf[p++] = '-'; v = (int16_t)(-v); }
+                int whole = v / 10;
+                int frac  = v % 10;
+                if (whole >= 100) buf[p++] = (char)('0' + whole / 100);
+                if (whole >= 10)  buf[p++] = (char)('0' + (whole / 10) % 10);
+                buf[p++] = (char)('0' + whole % 10);
+                buf[p++] = '.';
+                buf[p++] = (char)('0' + frac);
+                buf[p++] = 'C';
+            }
+            EMIT_STR(" TJ=");
+            {
+                int16_t v = Chg_Data.tjunc_c10;
+                if (v < 0) { buf[p++] = '-'; v = (int16_t)(-v); }
+                int whole = v / 10;
+                int frac  = v % 10;
+                if (whole >= 100) buf[p++] = (char)('0' + whole / 100);
+                if (whole >= 10)  buf[p++] = (char)('0' + (whole / 10) % 10);
+                buf[p++] = (char)('0' + whole % 10);
+                buf[p++] = '.';
+                buf[p++] = (char)('0' + frac);
+                buf[p++] = 'C';
+            }
+            #undef EMIT_STR
+            #undef EMIT_HEX
+            buf[p] = 0;
+            wups_send_log(2 /* info */, buf);
         }
 
         /* Periodic power.status push to RP2040 (1 Hz, EVENT flag). */

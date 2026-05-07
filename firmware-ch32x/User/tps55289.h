@@ -28,14 +28,27 @@ extern "C" {
 // -----------------------------------------------------------------------------
 //  BITY
 // -----------------------------------------------------------------------------
-#define MODE_OE_BIT     (1 << 7)
+#define MODE_OE_BIT      (1 << 7)
+#define MODE_FSWDBL_BIT  (1 << 6)
+#define MODE_HICCUP_BIT  (1 << 5)   /* default 1 — must be preserved */
+#define MODE_DISCHG_BIT  (1 << 4)
+#define MODE_FPWM_BIT    (1 << 1)
+
+/* STATUS register (0x07) — read-only, latched on trip until read */
+#define STATUS_SCP_BIT   (1 << 7)   /* short-circuit protection tripped */
+#define STATUS_OCP_BIT   (1 << 6)   /* overcurrent protection tripped */
+#define STATUS_OVP_BIT   (1 << 5)   /* overvoltage protection tripped */
+#define STATUS_OPMODE_MASK 0x03     /* 00=Boost, 01=Buck, 10=Buck-Boost */
 
 // -----------------------------------------------------------------------------
 //  PARAMETRY TPS55289
 // -----------------------------------------------------------------------------
-#define LSB_REF_VOLTAGE   (0.0005645)   // 0.5645 mV
-#define REF_MIN_V         (0.045)
-#define REF_MAX_V         (1.129)
+#define LSB_REF_VOLTAGE   (0.0005645)   // 0.5645 mV per LSB
+#define REF_MIN_V         (0.045)       // register value 0 → 45 mV (per datasheet §7.6.1)
+// REF_MAX is set by the 11-bit field width: 0x7FF * 0.5645 mV + 45 mV = 1200.5 mV.
+// Datasheet shows "1.129 V" as one example point only (register value 0x780),
+// not as the upper limit. Sanity-checked against MikroE Buck-Boost 4 click driver.
+#define REF_MAX_V         (1.200)
 
 #define RSENSE_OHMS       (0.010)       // 10mΩ
 #define IOUT_LSB_PER_AMP  (20)          // 1A => 20 LSB
@@ -70,6 +83,9 @@ void    tps55289_clear_set_cache(void);
 // Read back configured values from I2C
 float tps55289_read_voltage(void);
 float tps55289_read_current_limit(void);
+
+// Read STATUS register (0x07). Reading clears latched SCP/OCP/OVP bits.
+UINT8 tps55289_read_status(void);
 
 extern void I2C_write_reg(UINT8 addr, UINT8 reg, UINT8 dat);
 
