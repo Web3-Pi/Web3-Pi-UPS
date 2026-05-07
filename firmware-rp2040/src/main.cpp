@@ -173,8 +173,10 @@ constexpr uint8_t BTN_RIGHT_PIN = 14;  // GPIO14 - right button (active LOW)
 constexpr unsigned long DEBOUNCE_MS = 50;
 
 // --- Screen navigation ---
-constexpr uint8_t SCREEN_COUNT = 5;
-constexpr uint8_t SCREEN_POWER_CTRL = 4;  // last screen — buttons act as power on/off
+constexpr uint8_t SCREEN_COUNT = 7;
+constexpr uint8_t SCREEN_PD_DIAG = 4;       // PD/TPS diagnostic readout
+constexpr uint8_t SCREEN_POWER_PATH = 5;    // VIN / IIN / VSYS power-path readout
+constexpr uint8_t SCREEN_POWER_CTRL = 6;    // last screen — buttons act as power on/off
 constexpr unsigned long AUTO_RETURN_MS = 15000;  // Auto-return to home after 15s
 
 // --- Bad charger alert state ---
@@ -586,7 +588,105 @@ static void drawScreenPDInfo() {
   drawScreenIndicator(3);
 }
 
-// Screen 4: Power Control — LEFT disables VBUS_OUT, RIGHT re-enables it.
+// Screen 4: PD/TPS diagnostic readout. ui.vr/ir come from CH32X reading the
+// TPS55289 REF/IOUT_LIMIT registers back, so they reflect what's currently
+// programmed on the converter — which CH32X overwrites in STA_TX_ACCEPT to
+// match the negotiated PDO:
+//   pre-PD:        5.1V / 3.0A (VBUS_set_5V default)
+//   PDO #1 5V5A:   5.1V / 5.0A
+//   PDO #2 9V3A:   9.0V / 3.0A
+//   PDO #3 12V:   12.0V / 2.25A
+//   PDO #4 15V:   15.0V / 1.8A
+// (ui.vs/is map to pd_contract_mV/mA — that's the SINK side of CH32X, i.e.
+// the upstream charger contract, not the USB-C output. Don't use here.)
+// Vo is RP2040's own ADC reading of VBUS_OUT, independent of the CH32X path.
+static void drawScreenPDDiag() {
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  oled.setCursor(0, 0);
+  oled.print(F("PD>Pi"));
+  /* TPS55289 STATUS bits packed into the high byte of `faults` by CH32X:
+   *   bit 8  = SCP (short-circuit protection)
+   *   bit 9  = OCP (overcurrent protection)
+   *   bit 10 = OVP (overvoltage protection)
+   * Show single-letter suffix when a trip is latched so it's obvious on
+   * the OLED what protection killed the rail. */
+  if (ui.cf & ((1 << 8) | (1 << 9) | (1 << 10))) {
+    oled.print(F(" !"));
+    if (ui.cf & (1 << 8))  oled.print(F("S"));
+    if (ui.cf & (1 << 9))  oled.print(F("O"));
+    if (ui.cf & (1 << 10)) oled.print(F("V"));
+  }
+
+  oled.setCursor(0, 8);
+  oled.print(F("S:"));
+  oled.print(ui.vr / 10);
+  oled.print(F("."));
+  oled.print(ui.vr % 10);
+  oled.print(F("V"));
+
+  oled.setCursor(0, 16);
+  oled.print(F("L:"));
+  oled.print(ui.ir / 10);
+  oled.print(F("."));
+  oled.print(ui.ir % 10);
+  oled.print(F("A"));
+
+  oled.setCursor(0, 24);
+  oled.print(F("Vo:"));
+  oled.print(vbus_out_mV / 1000);
+  oled.print(F("."));
+  int frac = (vbus_out_mV % 1000) / 10;
+  if (frac < 10) oled.print(F("0"));
+  oled.print(frac);
+  oled.print(F("V"));
+
+  drawScreenIndicator(SCREEN_PD_DIAG);
+}
+
+// Screen 5: Power-path diagnostic. Diagnoses TPS55289 UVLO trips that
+// don't show up in STATUS register — typical signature when running with
+// no battery to cushion VSYS during a USB-C load step.
+//   Vi = VIN to MP2762A (DC IN, e.g. 12 V from barrel jack)
+//   Ii = IIN to MP2762A (current the chip is pulling from VIN)
+//   Vs = VSYS rail (the rail feeding TPS55289 VIN — if this dips below
+//        ~3 V under load, TPS resets and VBUS_OUT collapses)
+// CH32X diagnostic-aliases pd_contract_mV/mA to VSYS/IIN whenever there
+// is no upstream PD SINK contract (i.e. nearly always on the bench),
+// so ui.vs/is carry VSYS/IIN here.
+static void drawScreenPowerPath() {
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  oled.setCursor(0, 0);
+  oled.print(F("Vi:"));
+  oled.print(ui.vi / 1000);
+  oled.print(F("."));
+  int vi_frac = (ui.vi % 1000) / 100;
+  oled.print(vi_frac);
+  oled.print(F("V"));
+
+  oled.setCursor(0, 8);
+  oled.print(F("Ii:"));
+  oled.print(ui.is / 10);
+  oled.print(F("."));
+  oled.print(ui.is % 10);
+  oled.print(F("A"));
+
+  oled.setCursor(0, 16);
+  oled.print(F("Vs:"));
+  /* ui.vs is in 0.1 V units (CH32X passes VSYS in mV through
+   * pd_contract_mV, then RP2040 divides by 100 → 0.1 V). */
+  oled.print(ui.vs / 10);
+  oled.print(F("."));
+  oled.print(ui.vs % 10);
+  oled.print(F("V"));
+
+  drawScreenIndicator(SCREEN_POWER_PATH);
+}
+
+// Screen 6: Power Control — LEFT disables VBUS_OUT, RIGHT re-enables it.
 static void drawScreenPowerCtrl() {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
@@ -673,11 +773,54 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     newFrameReceived = true;
     lastFrameTime    = millis();
 
+    // Mirror parsed power.status to the debug stream (USB-CDC + Probe UART
+    // via J350) so the firmware author can read CH32X telemetry remotely
+    // without unplugging the bench setup. One line per frame, fixed
+    // column order so it's easy to grep / diff between runs.
+    dbgOut.print(F("[t="));
+    dbgOut.print(millis() / 1000);
+    dbgOut.print(F("s] cs="));
+    dbgOut.print(s.charge_state);
+    dbgOut.print(F(" pg="));
+    dbgOut.print((s.vbus_in_mV > 5000) ? 1 : 0);
+    dbgOut.print(F(" Vin="));
+    dbgOut.print(s.vbus_in_mV);
+    dbgOut.print(F("mV Vsys="));
+    dbgOut.print(s.pd_contract_mV);   // diag-aliased (see CH32X main.c)
+    dbgOut.print(F("mV Iin="));
+    dbgOut.print(s.pd_contract_mA);   // diag-aliased
+    dbgOut.print(F("mA Vbat="));
+    dbgOut.print(s.vbat_mV);
+    dbgOut.print(F("mV Ichg="));
+    dbgOut.print(s.ibat_mA);
+    dbgOut.print(F("mA Vout="));
+    dbgOut.print(s.vbus_out_mV);
+    dbgOut.print(F("mV Iout="));
+    dbgOut.print(s.ibus_out_mA);
+    dbgOut.print(F("mA T="));
+    dbgOut.print(s.temp_dC);
+    dbgOut.print(F("dC f=0x"));
+    dbgOut.println(s.faults, HEX);
+
     // Push-mode aggregate to RPi: forward the same frame on USB-CDC with
     // SRC=CH32X preserved. RPi service decodes and treats it as authoritative.
     wups_send_with_src(WUPS_PORT_RPI, WUPS_ADDR_RPI, WUPS_ADDR_CH32X,
                        WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
                        WUPS_FLAG_EVENT, f.seq, &s, sizeof(s));
+    return;
+  }
+
+  // system.log (cls=SYSTEM op=SYS_LOG, EVENT) — CH32X uses this for raw
+  // register dumps and diagnostic snapshots. Header is 4 bytes (version,
+  // level, text_len, reserved), then `text_len` ASCII bytes (no NUL).
+  // Forward verbatim to the debug stream so `pio device monitor` on the
+  // probe UART can read it.
+  if (f.cls == WUPS_CLASS_SYSTEM && f.op == WUPS_OP_SYS_LOG && f.len >= 4) {
+    uint8_t text_len = f.payload[2];
+    if ((uint16_t)4 + text_len > f.len) return;
+    dbgOut.print(F("[CH32X log] "));
+    dbgOut.write(f.payload + 4, text_len);
+    dbgOut.println();
     return;
   }
 
@@ -1062,6 +1205,12 @@ void loop() {
         break;
       case 3:
         drawScreenPDInfo();
+        break;
+      case SCREEN_PD_DIAG:
+        drawScreenPDDiag();
+        break;
+      case SCREEN_POWER_PATH:
+        drawScreenPowerPath();
         break;
       case SCREEN_POWER_CTRL:
         drawScreenPowerCtrl();
