@@ -29,6 +29,7 @@
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
+#include "identity.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -81,6 +82,10 @@ void app_main(void)
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
+
+    /* Decode MASTER_SECRET_HEX → raw bytes once, before anyone tries to
+     * derive an MQTT password. Cheap, no I/O. */
+    ESP_ERROR_CHECK(identity_init());
 
     ESP_LOGI(TAG, "boot banner printed, calling pmu_init...");
 

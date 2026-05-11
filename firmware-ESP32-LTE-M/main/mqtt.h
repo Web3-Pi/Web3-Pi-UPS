@@ -43,3 +43,16 @@ typedef void (*mqtt_data_cb_t)(const char *topic, size_t topic_len,
  * as net.downlink frames over UART2 to RP2040.
  */
 void mqtt_set_data_handler(mqtt_data_cb_t cb);
+
+/*
+ * ICCID-scoped topic strings — valid after mqtt_client_start() has been
+ * called. Returned pointers reference statics that live for the lifetime
+ * of the firmware. Empty string if mqtt_client_start() hasn't run yet.
+ *
+ * Used by wups_link to publish raw WUPS frames straight onto the right
+ * uplink topic (telemetry / event / cmd response).
+ */
+const char *mqtt_topic_telemetry(void);
+const char *mqtt_topic_event(void);
+const char *mqtt_topic_cmd_response(void);
+const char *mqtt_topic_cmd_request(void);

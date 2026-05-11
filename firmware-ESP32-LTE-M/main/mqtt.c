@@ -1,11 +1,11 @@
 #include "mqtt.h"
+#include "identity.h"
 
 #include <stdio.h>
 #include <string.h>
 
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
-#include "esp_mac.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,13 +15,54 @@
 
 #define TAG "mqtt"
 
-#define MQTT_TOPIC_TEST    "web3piups/test"
+/* Topic buffers — sized for a 20-digit ICCID. The longest subtopic suffix is
+ * "/cmd/response" (13 chars), plus the "t/" prefix and 20-char ICCID gives
+ * 35 chars + NUL. 48 leaves room for spec drift. */
+#define TOPIC_BUF_LEN 48
 
 static esp_mqtt_client_handle_t s_client;
-static char s_client_id[32];     /* "ups-XXXXXXXXXXXX" — last 6 bytes of MAC */
-static char s_topic_status[64];  /* "web3piups/<id>/status" */
-static char s_topic_cmd[64];     /* "web3piups/<id>/cmd"    */
+
+static char s_topic_status[TOPIC_BUF_LEN];     /* t/{iccid}/status     (LWT + online retained) */
+static char s_topic_identify[TOPIC_BUF_LEN];   /* t/{iccid}/identify   (retained on connect) */
+static char s_topic_telemetry[TOPIC_BUF_LEN];  /* t/{iccid}/telemetry  (per-frame uplink) */
+static char s_topic_event[TOPIC_BUF_LEN];      /* t/{iccid}/event      (state-change uplink) */
+static char s_topic_cmd_resp[TOPIC_BUF_LEN];   /* t/{iccid}/cmd/response */
+static char s_topic_cmd_req[TOPIC_BUF_LEN];    /* c/{iccid}/cmd/request — downlink */
+
+/* LWT bytes — must outlive esp_mqtt_client_init() since the config struct
+ * stores pointers, not copies. */
+static const char k_lwt_offline[] = "{\"online\":false}";
+static const char k_status_online[] = "{\"online\":true}";
+
 static mqtt_data_cb_t s_data_handler;
+
+/* Allow callers (e.g. wups_link) to know our topic strings so they can publish
+ * raw bytes onto telemetry / event / cmd_response without hardcoding the
+ * format. */
+const char *mqtt_topic_telemetry(void)   { return s_topic_telemetry; }
+const char *mqtt_topic_event(void)       { return s_topic_event; }
+const char *mqtt_topic_cmd_response(void){ return s_topic_cmd_resp; }
+const char *mqtt_topic_cmd_request(void) { return s_topic_cmd_req; }
+
+static void publish_identify(void)
+{
+    /* {"imei":"...","fw":"...","hw":"..."} — retained, QoS 1.
+     * Backend uses this for anti-clone IMEI lock (ADR-0002) and to populate
+     * devices.fwVersionEsp32 / devices.hwRev. */
+    char body[160];
+    int n = snprintf(body, sizeof(body),
+                     "{\"imei\":\"%s\",\"fw\":\"%s\",\"hw\":\"%s\"}",
+                     identity_imei(),
+                     identity_fw_version(),
+                     identity_hw_version());
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        ESP_LOGW(TAG, "identify JSON truncated, skipping publish");
+        return;
+    }
+    int rc = esp_mqtt_client_publish(s_client, s_topic_identify, body, n,
+                                     /*qos=*/1, /*retain=*/1);
+    ESP_LOGI(TAG, "identify published rc=%d body=%s", rc, body);
+}
 
 static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
 {
@@ -30,28 +71,22 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
         ESP_LOGI(TAG, "BEFORE_CONNECT");
         break;
     case MQTT_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "CONNECTED to %s as %s", MQTT_BROKER_URI, MQTT_USERNAME);
-        /* Subscribe to our command topic and to the shared test topic
-         * (so we'll see our own publish echoed back). */
-        esp_mqtt_client_subscribe(s_client, s_topic_cmd, 1);
-        esp_mqtt_client_subscribe(s_client, MQTT_TOPIC_TEST, 0);
-        ESP_LOGI(TAG, "subscribed: %s (qos1), %s (qos0)", s_topic_cmd, MQTT_TOPIC_TEST);
+        ESP_LOGI(TAG, "CONNECTED to %s as %s", MQTT_BROKER_URI, identity_iccid());
 
-        /* Hello-world publish to the test topic. Useful as a "first byte
-         * across" proof, plus we'll see it echoed back via the subscribe. */
-        char hello[160];
-        int n = snprintf(hello, sizeof(hello),
-                         "{\"client\":\"%s\",\"msg\":\"hello over LTE-M PPP\"}",
-                         s_client_id);
-        esp_mqtt_client_publish(s_client, MQTT_TOPIC_TEST, hello, n, 0, 0);
+        /* Subscribe to the per-device downlink command topic. The broker
+         * ACL (once strict mode is on) only allows the device to subscribe
+         * to its own c/{iccid}/# subtree. */
+        esp_mqtt_client_subscribe(s_client, s_topic_cmd_req, 1);
+        ESP_LOGI(TAG, "subscribed: %s (qos1)", s_topic_cmd_req);
 
-        /* Status retained on the device topic so the broker remembers we
-         * came online even after we disconnect briefly. */
-        char status[96];
-        n = snprintf(status, sizeof(status),
-                     "{\"client\":\"%s\",\"online\":true}",
-                     s_client_id);
-        esp_mqtt_client_publish(s_client, s_topic_status, status, n, 1, 1);
+        /* Status retained "online": broker remembers we're up so a late
+         * subscriber doesn't have to wait for the next message. */
+        esp_mqtt_client_publish(s_client, s_topic_status,
+                                k_status_online, sizeof(k_status_online) - 1,
+                                /*qos=*/1, /*retain=*/1);
+
+        /* Identify retained: IMEI/fw/hw triple for the anti-clone check. */
+        publish_identify();
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -67,13 +102,12 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
         break;
 
     case MQTT_EVENT_PUBLISHED:
-        ESP_LOGI(TAG, "PUBLISHED msg_id=%d", evt->msg_id);
+        ESP_LOGD(TAG, "PUBLISHED msg_id=%d", evt->msg_id);
         break;
 
     case MQTT_EVENT_DATA:
-        ESP_LOGI(TAG, "DATA topic=%.*s len=%d payload=%.*s",
-                 evt->topic_len, evt->topic, evt->data_len,
-                 evt->data_len, evt->data);
+        ESP_LOGI(TAG, "DATA topic=%.*s len=%d",
+                 evt->topic_len, evt->topic, evt->data_len);
         if (s_data_handler) {
             s_data_handler(evt->topic, (size_t)evt->topic_len,
                            evt->data, (size_t)evt->data_len);
@@ -109,57 +143,57 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
 
 esp_err_t mqtt_client_start(void)
 {
-    /* Crank up TLS / MQTT logs so we can see exactly what handshake step
-     * is failing (cert chain, SNI, hostname, …). Crank back to INFO once
-     * we have a stable connection. */
     esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
     esp_log_level_set("esp-tls-mbedtls", ESP_LOG_VERBOSE);
     esp_log_level_set("transport_base", ESP_LOG_VERBOSE);
     esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
 
-    /* Build a stable client ID from the MAC: "ups-aabbccddeeff". Brokers
-     * disconnect old sessions when they see the same client ID, so a
-     * device-unique ID prevents two boots from fighting each other. */
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(s_client_id, sizeof(s_client_id),
-             "ups-%02x%02x%02x%02x%02x%02x",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    snprintf(s_topic_status, sizeof(s_topic_status),
-             "web3piups/%s/status", s_client_id);
-    snprintf(s_topic_cmd, sizeof(s_topic_cmd),
-             "web3piups/%s/cmd", s_client_id);
+    const char *iccid = identity_iccid();
+    if (!iccid || iccid[0] == '\0') {
+        ESP_LOGE(TAG, "no ICCID — refusing to start MQTT");
+        return ESP_ERR_INVALID_STATE;
+    }
+    const char *password = identity_mqtt_password_hex();
+    if (!password || password[0] == '\0') {
+        ESP_LOGE(TAG, "no MQTT password derived");
+        return ESP_ERR_INVALID_STATE;
+    }
 
-    /* LWT: if we go offline ungracefully, broker tells subscribers we're
-     * down. Retained so anyone who reconnects sees the latest state. */
-    char lwt[96];
-    int lwt_len = snprintf(lwt, sizeof(lwt),
-                           "{\"client\":\"%s\",\"online\":false}",
-                           s_client_id);
+    /* Build all topic strings up-front. ADR-0004 split:
+     *   t/{iccid}/...   uplink (device publishes, backend subscribes)
+     *   c/{iccid}/...   downlink (backend publishes, device subscribes) */
+    snprintf(s_topic_status,    sizeof s_topic_status,    "t/%s/status",       iccid);
+    snprintf(s_topic_identify,  sizeof s_topic_identify,  "t/%s/identify",     iccid);
+    snprintf(s_topic_telemetry, sizeof s_topic_telemetry, "t/%s/telemetry",    iccid);
+    snprintf(s_topic_event,     sizeof s_topic_event,     "t/%s/event",        iccid);
+    snprintf(s_topic_cmd_resp,  sizeof s_topic_cmd_resp,  "t/%s/cmd/response", iccid);
+    snprintf(s_topic_cmd_req,   sizeof s_topic_cmd_req,   "c/%s/cmd/request",  iccid);
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
-        /* TLS verification via mbedTLS-bundled root CAs. The mqtt.w3p.ovh
-         * domain is fronted by Traefik with a Let's Encrypt cert, so the
-         * default bundle (which includes ISRG Root X1/X2) covers it. */
+        /* TLS via the bundled root CA list — covers Let's Encrypt. */
         .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
-        .credentials.username = MQTT_USERNAME,
-        .credentials.client_id = s_client_id,
-        .credentials.authentication.password = MQTT_PASSWORD,
+
+        /* Per-device credentials (ADR-0005): username = ICCID,
+         * password = hex(HMAC-SHA256(MASTER_SECRET, ICCID)).
+         * Client ID = ICCID too so two boots of the same device cleanly
+         * displace each other on the broker. */
+        .credentials.client_id = iccid,
+        .credentials.username  = iccid,
+        .credentials.authentication.password = password,
+
         .session.last_will = {
-            .topic = s_topic_status,
-            .msg = lwt,
-            .msg_len = lwt_len,
-            .qos = 1,
-            .retain = 1,
+            .topic   = s_topic_status,
+            .msg     = k_lwt_offline,
+            .msg_len = sizeof(k_lwt_offline) - 1,
+            .qos     = 1,
+            .retain  = 1,
         },
-        .session.keepalive = 60,
-        .network.timeout_ms = 15000,
-        /* Default MQTT task stack is 6 KB, which is too tight for mbedTLS
-         * to do a Let's Encrypt handshake — it triggers stack-corruption
-         * errors that surface as MBEDTLS_ERR_X509_FATAL_ERROR (-0x3000).
-         * 12 KB gives the X509 chain validation comfortable headroom. */
-        .task.stack_size = 12 * 1024,
+        .session.keepalive   = 60,
+        .network.timeout_ms  = 15000,
+        /* 12 KB for mbedTLS X509 chain validation headroom (default 6 KB
+         * triggers stack-corruption errors during the LE handshake). */
+        .task.stack_size     = 12 * 1024,
     };
 
     s_client = esp_mqtt_client_init(&cfg);
@@ -175,7 +209,7 @@ esp_err_t mqtt_client_start(void)
         return err;
     }
 
-    ESP_LOGI(TAG, "starting client_id=%s broker=%s", s_client_id, MQTT_BROKER_URI);
+    ESP_LOGI(TAG, "starting iccid=%s broker=%s", iccid, MQTT_BROKER_URI);
     return esp_mqtt_client_start(s_client);
 }
 

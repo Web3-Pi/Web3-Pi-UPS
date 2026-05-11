@@ -1,6 +1,8 @@
 #include "modem.h"
 #include "mqtt.h"
+#include "identity.h"
 
+#include <ctype.h>
 #include <string.h>
 #include <time.h>
 
@@ -48,6 +50,8 @@
 static EventGroupHandle_t s_modem_evt;
 static esp_netif_t       *s_ppp_netif;
 static esp_modem_dce_t   *s_dce;
+static bool               s_iccid_known;       /* set true once AT+CCID populated identity */
+static bool               s_mqtt_started;
 
 esp_err_t modem_init(void)
 {
@@ -285,12 +289,62 @@ static esp_err_t ppp_bringup_dce(void)
 
     /* A few sanity-check at-level reads before going to data mode. */
     char buf[64] = {0};
-    if (esp_modem_get_imei(s_dce, buf) == ESP_OK)        ESP_LOGI(MODEM_TAG, "IMEI: %s", buf);
+    if (esp_modem_get_imei(s_dce, buf) == ESP_OK) {
+        ESP_LOGI(MODEM_TAG, "IMEI: %s", buf);
+        identity_set_imei(buf);
+    }
     if (esp_modem_get_imsi(s_dce, buf) == ESP_OK)        ESP_LOGI(MODEM_TAG, "IMSI: %s", buf);
     if (esp_modem_get_module_name(s_dce, buf) == ESP_OK) ESP_LOGI(MODEM_TAG, "module: %s", buf);
     int rssi = 99, ber = 99;
     if (esp_modem_get_signal_quality(s_dce, &rssi, &ber) == ESP_OK) {
         ESP_LOGI(MODEM_TAG, "signal: rssi=%d ber=%d", rssi, ber);
+    }
+
+    /* Read SIM ICCID — this becomes the device identity (MQTT username +
+     * topic prefix per ADR-0002). The exact response format varies between
+     * SIM7080G firmware revisions ("+CCID: 8988...", "+ICCID: 8988...", or
+     * just "8988...\r\nOK"), so we extract by scanning for the first run of
+     * digits and capping at 20. Identity is set ONCE per boot; subsequent
+     * PPP cycles preserve it. */
+    if (s_iccid_known) {
+        ESP_LOGI(MODEM_TAG, "ICCID already known: %s", identity_iccid());
+    } else {
+        char at_out[128] = {0};
+        esp_err_t at_err = esp_modem_at(s_dce, "AT+CCID", at_out, 3000);
+        if (at_err == ESP_OK && at_out[0]) {
+            ESP_LOGI(MODEM_TAG, "AT+CCID raw: %s", at_out);
+            char iccid[24] = {0};
+            size_t out_idx = 0;
+            bool started = false;
+            for (size_t i = 0; at_out[i] != '\0' && out_idx + 1 < sizeof(iccid); ++i) {
+                char c = at_out[i];
+                if (isdigit((unsigned char)c)) {
+                    iccid[out_idx++] = c;
+                    started = true;
+                } else if (started) {
+                    /* Stop at the first non-digit after we found digits, so
+                     * we don't slurp the trailing "OK". */
+                    break;
+                }
+            }
+            iccid[out_idx] = '\0';
+            /* ICCID can be 19 or 20 digits — the 20th (when present) is a
+             * Luhn check digit per ISO/IEC 7812. SIM7080G/SIM7070 AT+CCID
+             * returns the 20-digit form; 1NCE's portal (and our panel,
+             * via convention) uses the 19-digit form. Strip the Luhn so
+             * what the panel claims matches what the device publishes. */
+            if (out_idx == 20) {
+                ESP_LOGI(MODEM_TAG, "trimming Luhn check digit: %s -> %.*s",
+                         iccid, 19, iccid);
+                iccid[19] = '\0';
+            }
+            if (identity_set_iccid(iccid) == ESP_OK) {
+                s_iccid_known = true;
+            }
+        } else {
+            ESP_LOGE(MODEM_TAG, "AT+CCID failed: rc=%d (no SIM? hung modem?)",
+                     (int)at_err);
+        }
     }
 
     /* Switch to data (PPP) mode — esp_modem now drives UART and lwIP picks up. */
@@ -351,7 +405,6 @@ static void ppp_supervisor_task(void *arg)
     ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID,
                                                on_netif_ppp_status, NULL));
 
-    bool     mqtt_started = false;
     uint32_t backoff_ms   = PPP_BACKOFF_MIN_MS;
     int      consecutive_fails = 0;
 
@@ -374,7 +427,7 @@ static void ppp_supervisor_task(void *arg)
                 consecutive_fails = 0;
                 backoff_ms = PPP_BACKOFF_MIN_MS;
 
-                if (!mqtt_started) {
+                if (!s_mqtt_started) {
                     /* Wall-clock time, needed by TLS cert validity check. */
                     wait_for_time_sync(15000);
 
@@ -382,11 +435,17 @@ static void ppp_supervisor_task(void *arg)
                      * through lwIP → PPP → modem → 1nce → internet. */
                     run_http_get_test();
 
-                    ESP_LOGI(MODEM_TAG, "starting MQTT client...");
-                    if (mqtt_client_start() == ESP_OK) {
-                        mqtt_started = true;
+                    if (!s_iccid_known) {
+                        ESP_LOGE(MODEM_TAG,
+                                 "ICCID unknown — refusing to start MQTT. "
+                                 "Check SIM card / AT+CCID handling.");
                     } else {
-                        ESP_LOGE(MODEM_TAG, "mqtt_client_start failed");
+                        ESP_LOGI(MODEM_TAG, "starting MQTT client...");
+                        if (mqtt_client_start() == ESP_OK) {
+                            s_mqtt_started = true;
+                        } else {
+                            ESP_LOGE(MODEM_TAG, "mqtt_client_start failed");
+                        }
                     }
                 } else {
                     ESP_LOGI(MODEM_TAG, "PPP reconnected — esp-mqtt will resume on its own");

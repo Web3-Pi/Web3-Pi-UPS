@@ -738,6 +738,8 @@ static void drawScreenPowerCtrl() {
 //
 // Defined here (in main.cpp) because the body needs access to RP2040
 // firmware globals (ui, lastFrameTime, etc.). Declared in wups_router.h.
+static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t& s);
+
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   (void)inbound_port;
 
@@ -807,6 +809,13 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     wups_send_with_src(WUPS_PORT_RPI, WUPS_ADDR_RPI, WUPS_ADDR_CH32X,
                        WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
                        WUPS_FLAG_EVENT, f.seq, &s, sizeof(s));
+
+    // Drive the cellular uplink via net.publish to the ESP32. ESP32 is a
+    // dumb pipe to MQTT — it forwards `topic`+`payload` to the broker and
+    // auto-prefixes relative subtopics with `t/{iccid}/`. We send the full
+    // raw WUPS frame (header+payload+checksum) as the MQTT payload so the
+    // panel's wupsproto.ts decoder sees byte-for-byte what the bus sees.
+    wupsPublishTelemetryStatus(f.seq, s);
     return;
   }
 
@@ -845,6 +854,90 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   }
 
   // Other classes/ops: ignored in v1.
+}
+
+// Hand off a payload to the ESP32 for MQTT publication.
+//
+// Wire shape (per common/protocol.h `wups_net_publish_v1_hdr_t`):
+//   [version=1][qos][retain][topic_len][payload_len_le][topic[topic_len]][payload[payload_len]]
+//
+// The ESP32 implements ADR-0002 / ADR-0004 — if `topic` is a bare subtopic
+// like "telemetry" / "event" / "cmd/response", the ESP32 prepends the
+// per-device prefix `t/{iccid}/` before publishing. The RP2040 stays
+// SIM-agnostic (it has no ICCID) — it picks the *kind*, the ESP32 picks
+// the *destination*.
+//
+// Caller owns `topic` and `payload`; they're copied into the WUPS frame.
+// Returns true if the request was queued onto UART1.
+static bool wupsRequestPublish(const char* topic, uint8_t qos, uint8_t retain,
+                               const uint8_t* payload, uint16_t payload_len) {
+  size_t topic_len = strlen(topic);
+  if (topic_len == 0 || topic_len > 200) return false;
+  size_t total = sizeof(wups_net_publish_v1_hdr_t) + topic_len + payload_len;
+  if (total > WUPS_MAX_PAYLOAD) return false;
+
+  uint8_t buf[WUPS_MAX_PAYLOAD];
+  wups_net_publish_v1_hdr_t hdr;
+  hdr.version     = 1;
+  hdr.qos         = qos;
+  hdr.retain      = retain;
+  hdr.topic_len   = (uint8_t)topic_len;
+  hdr.payload_len = payload_len;
+  memcpy(buf, &hdr, sizeof(hdr));
+  memcpy(buf + sizeof(hdr), topic, topic_len);
+  if (payload_len) memcpy(buf + sizeof(hdr) + topic_len, payload, payload_len);
+
+  wups_send(WUPS_PORT_ESP32, WUPS_ADDR_ESP32,
+            WUPS_CLASS_NET, WUPS_OP_NET_PUBLISH, WUPS_FLAG_REQ,
+            buf, (uint16_t)total);
+  return true;
+}
+
+// Build a full WUPS frame (sync + header + payload + Fletcher-8 + end)
+// in-place. Used to package telemetry / event / cmd-response payloads so
+// the panel's wupsproto.ts decoder sees the same bytes the bus saw.
+// Returns total frame length written, or 0 on overflow.
+static size_t wupsBuildFrame(uint8_t* out, size_t out_cap,
+                             uint8_t dst, uint8_t src,
+                             uint8_t cls, uint8_t op,
+                             uint8_t flags, uint8_t seq,
+                             const void* payload, uint16_t payload_len) {
+  size_t need = (size_t)WUPS_FRAMING_BYTES + payload_len;
+  if (out_cap < need) return 0;
+  out[0] = WUPS_SYNC1;
+  out[1] = WUPS_SYNC2;
+  out[2] = dst;
+  out[3] = src;
+  out[4] = cls;
+  out[5] = op;
+  out[6] = flags;
+  out[7] = seq;
+  out[8] = (uint8_t)(payload_len & 0xFFu);
+  out[9] = (uint8_t)((payload_len >> 8) & 0xFFu);
+  if (payload_len) memcpy(out + 10, payload, payload_len);
+  uint8_t a = 0, b = 0;
+  for (size_t i = 2; i < 10u + (size_t)payload_len; ++i) {
+    a = (uint8_t)(a + out[i]);
+    b = (uint8_t)(b + a);
+  }
+  out[10 + payload_len]     = a;
+  out[10 + payload_len + 1] = b;
+  out[10 + payload_len + 2] = WUPS_END1;
+  out[10 + payload_len + 3] = WUPS_END2;
+  return need;
+}
+
+// Wrap a cached CH32X power.status into a WUPS frame (src=CH32X preserved
+// for the panel's audit trail) and ship it to the ESP32 as net.publish
+// onto the "telemetry" subtopic.
+static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t& s) {
+  uint8_t frame[WUPS_FRAMING_BYTES + sizeof(wups_power_status_v1_t)];
+  size_t n = wupsBuildFrame(frame, sizeof(frame),
+                            WUPS_ADDR_BROADCAST, WUPS_ADDR_CH32X,
+                            WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
+                            WUPS_FLAG_EVENT, seq, &s, sizeof(s));
+  if (n == 0) return;
+  wupsRequestPublish("telemetry", /*qos=*/0, /*retain=*/0, frame, (uint16_t)n);
 }
 
 // Send `system.hello` broadcast on boot so other nodes can discover us.

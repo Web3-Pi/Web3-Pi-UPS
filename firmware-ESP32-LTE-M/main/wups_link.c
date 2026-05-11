@@ -1,7 +1,9 @@
 #include "wups_link.h"
 #include "wups_proto.h"
 #include "mqtt.h"
+#include "identity.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 #include "driver/uart.h"
@@ -176,15 +178,41 @@ static void handle_net_publish(const uint8_t *payload, uint16_t len)
         return;
     }
 
-    /* MQTT topic must be a NUL-terminated C string; the payload is opaque. */
-    char topic[201];
-    if (hdr.topic_len >= sizeof(topic)) {
+    /* The caller (RP2040) is SIM-agnostic — it doesn't know our ICCID, so
+     * it sends relative subtopics like "telemetry" / "event" / "cmd/response"
+     * and trusts the ESP32 to prepend the per-device prefix `t/{iccid}/`
+     * (ADR-0004). Absolute "t/..." / "c/..." topics pass through verbatim
+     * as an escape hatch. */
+    char rel[201];
+    if (hdr.topic_len >= sizeof(rel)) {
         ESP_LOGW(TAG, "net.publish topic too long: %u", hdr.topic_len);
         return;
     }
-    memcpy(topic, payload + sizeof(hdr), hdr.topic_len);
-    topic[hdr.topic_len] = '\0';
+    memcpy(rel, payload + sizeof(hdr), hdr.topic_len);
+    rel[hdr.topic_len] = '\0';
     const uint8_t *mqtt_payload = payload + sizeof(hdr) + hdr.topic_len;
+
+    bool absolute = (hdr.topic_len >= 2) &&
+                    ((rel[0] == 't' || rel[0] == 'c') && rel[1] == '/');
+    char topic[64];
+    if (absolute) {
+        if (hdr.topic_len + 1 > sizeof(topic)) {
+            ESP_LOGW(TAG, "net.publish absolute topic too long: %u", hdr.topic_len);
+            return;
+        }
+        memcpy(topic, rel, hdr.topic_len + 1);
+    } else {
+        const char *iccid = identity_iccid();
+        if (!iccid || iccid[0] == '\0') {
+            ESP_LOGW(TAG, "net.publish before ICCID known — dropping (%s)", rel);
+            return;
+        }
+        int n = snprintf(topic, sizeof(topic), "t/%s/%s", iccid, rel);
+        if (n < 0 || (size_t)n >= sizeof(topic)) {
+            ESP_LOGW(TAG, "net.publish topic synthesis overflow (rel=%s)", rel);
+            return;
+        }
+    }
 
     int rc = mqtt_publish_raw(topic, mqtt_payload, hdr.payload_len,
                               hdr.qos, hdr.retain);
@@ -196,10 +224,13 @@ static void handle_net_publish(const uint8_t *payload, uint16_t len)
     }
 }
 
-static void on_local_frame(uint8_t src, uint8_t cls, uint8_t op,
+static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
                            uint8_t flags, uint8_t seq,
-                           const uint8_t *payload, uint16_t len)
+                           const uint8_t *payload, uint16_t len,
+                           uint8_t ck_a, uint8_t ck_b)
 {
+    (void)dst; (void)ck_a; (void)ck_b;
+
     if (cls == WUPS_CLASS_SYSTEM) {
         if (op == WUPS_OP_SYS_PING && (flags & WUPS_FLAG_REQ)) {
             wups_sys_pong_v1_t pong;
@@ -219,11 +250,12 @@ static void on_local_frame(uint8_t src, uint8_t cls, uint8_t op,
             handle_net_publish(payload, len);
             return;
         }
-        /* status / downlink / time_sync are outbound from us; if we ever
-         * receive them, drop silently. */
+        /* status / downlink / time_sync are outbound from us; drop. */
         return;
     }
-    /* power / host / ui — not our concern (ESP32 is dumb pipe). */
+    /* power / host / ui — ESP32 is a dumb pipe to MQTT (CLAUDE.md). RP2040
+     * decides what reaches the panel by issuing net.publish REQs; we don't
+     * second-guess class semantics here. */
 }
 
 static void deliver_frame(void)
@@ -237,8 +269,11 @@ static void deliver_frame(void)
         return;
     }
     s_frames_rx++;
-    on_local_frame(s_rx.src, s_rx.cls, s_rx.op, s_rx.flags, s_rx.seq,
-                   s_rx.payload, s_rx.len);
+    /* exp_a / exp_b were updated alongside each rx_step() and matched
+     * the on-wire CK_A/CK_B at the end of WUPS_RX_CK_B, so they're the
+     * canonical checksum bytes for re-publish. */
+    on_local_frame(s_rx.dst, s_rx.src, s_rx.cls, s_rx.op, s_rx.flags, s_rx.seq,
+                   s_rx.payload, s_rx.len, s_rx.exp_a, s_rx.exp_b);
 }
 
 /* --- RX state machine -------------------------------------------------- */
@@ -324,9 +359,10 @@ static void rx_task(void *arg)
 
 /* --- MQTT inbound → net.downlink -------------------------------------- */
 
-/* Forward an arriving MQTT message to the RPi as a net.downlink event.
- * The frame carries the topic and the raw payload; RPi-side service
- * decides what to do with it. Runs in the MQTT client task context. */
+/* Forward an arriving MQTT message to RP2040 (hub) as a net.downlink event.
+ * The frame carries the topic and the raw payload; RP2040 decides what to
+ * do with it (route to CH32X for power commands, to itself for UI/system,
+ * etc.). Runs in the MQTT client task context. */
 static void on_mqtt_data(const char *topic, size_t topic_len,
                          const void *payload, size_t payload_len)
 {
@@ -342,8 +378,6 @@ static void on_mqtt_data(const char *topic, size_t topic_len,
         return;
     }
 
-    /* Build the payload in a stack buffer (frame max = 240 B, well within
-     * default task stack). */
     uint8_t buf[WUPS_MAX_PAYLOAD];
     wups_net_downlink_v1_hdr_t hdr = {
         .version     = 1,
@@ -356,7 +390,11 @@ static void on_mqtt_data(const char *topic, size_t topic_len,
     memcpy(buf + sizeof(hdr), topic, topic_len);
     memcpy(buf + sizeof(hdr) + topic_len, payload, payload_len);
 
-    wups_link_send(WUPS_ADDR_RPI, WUPS_CLASS_NET, WUPS_OP_NET_DOWNLINK,
+    /* DST=RP2040 — hub routes by application logic. (Old code used
+     * WUPS_ADDR_RPI because RPi service was the only consumer; with the
+     * panel-side migration RP2040 is now the dispatcher, so it gets the
+     * downlink and forwards to CH32X / RPi / itself as appropriate.) */
+    wups_link_send(WUPS_ADDR_RP2040, WUPS_CLASS_NET, WUPS_OP_NET_DOWNLINK,
                    WUPS_FLAG_EVENT, buf, (uint16_t)total);
 }
 
