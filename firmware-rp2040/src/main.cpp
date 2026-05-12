@@ -819,6 +819,63 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     return;
   }
 
+  // net.downlink — ESP32 wraps each MQTT-arrived message in a net.downlink
+  // EVENT to RP2040. The wrapper payload is hdr (6 B) + topic[topic_len] +
+  // payload[payload_len]; the inner `payload` is itself a complete WUPS frame
+  // emitted by the panel backend. Deframe it (Fletcher-8 verify) and recurse
+  // back into this same dispatcher — recursion is intentional: the inner
+  // frame may carry any class/op we already handle (ui.beep, power.*, etc.)
+  // so we don't want to duplicate the dispatch table.
+  if (f.cls == WUPS_CLASS_NET && f.op == WUPS_OP_NET_DOWNLINK &&
+      (f.flags & WUPS_FLAG_EVENT) &&
+      f.len >= sizeof(wups_net_downlink_v1_hdr_t)) {
+    wups_net_downlink_v1_hdr_t dl;
+    memcpy(&dl, f.payload, sizeof(dl));
+    if (dl.version != 1) return;
+    size_t need = sizeof(dl) + dl.topic_len + dl.payload_len;
+    if (need > f.len) return;
+
+    const uint8_t* inner = f.payload + sizeof(dl) + dl.topic_len;
+    uint16_t inner_pl_len = dl.payload_len;
+    if (inner_pl_len < WUPS_FRAMING_BYTES) return;
+    if (inner[0] != WUPS_SYNC1 || inner[1] != WUPS_SYNC2) return;
+    uint16_t inner_len = (uint16_t)inner[8] | ((uint16_t)inner[9] << 8);
+    if (inner_len > WUPS_MAX_PAYLOAD) return;
+    if ((size_t)WUPS_FRAMING_BYTES + inner_len != inner_pl_len) return;
+    if (inner[WUPS_HEADER_BYTES + inner_len + 2] != WUPS_END1) return;
+    if (inner[WUPS_HEADER_BYTES + inner_len + 3] != WUPS_END2) return;
+
+    uint8_t a = 0, b = 0;
+    for (size_t i = 2; i < (size_t)WUPS_HEADER_BYTES + inner_len; i++) {
+      a = (uint8_t)(a + inner[i]);
+      b = (uint8_t)(b + a);
+    }
+    if (a != inner[WUPS_HEADER_BYTES + inner_len] ||
+        b != inner[WUPS_HEADER_BYTES + inner_len + 1]) return;
+
+    WupsFrame ifr;
+    ifr.dst   = inner[2];
+    ifr.src   = inner[3];
+    ifr.cls   = inner[4];
+    ifr.op    = inner[5];
+    ifr.flags = inner[6];
+    ifr.seq   = inner[7];
+    ifr.len   = inner_len;
+    if (inner_len) memcpy(ifr.payload, inner + WUPS_HEADER_BYTES, inner_len);
+
+    dbgOut.print(F("[net.downlink] cls=0x"));
+    dbgOut.print(ifr.cls, HEX);
+    dbgOut.print(F(" op=0x"));
+    dbgOut.print(ifr.op, HEX);
+    dbgOut.print(F(" flags=0x"));
+    dbgOut.print(ifr.flags, HEX);
+    dbgOut.print(F(" len="));
+    dbgOut.println(ifr.len);
+
+    wups_on_local_frame(inbound_port, ifr);
+    return;
+  }
+
   // system.log (cls=SYSTEM op=SYS_LOG, EVENT) — CH32X uses this for raw
   // register dumps and diagnostic snapshots. Header is 4 bytes (version,
   // level, text_len, reserved), then `text_len` ASCII bytes (no NUL).
