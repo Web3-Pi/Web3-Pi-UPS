@@ -122,7 +122,7 @@ static void emit_forward(uint8_t out_port, const WupsFrame& f)
     Wups_Frames_Forwarded[out_port]++;
 }
 
-static void route_frame(uint8_t inbound_port, const WupsFrame& f)
+void wups_route_frame(uint8_t inbound_port, const WupsFrame& f)
 {
     bool to_self     = (f.dst == WUPS_ADDR_RP2040);
     bool is_bcast    = (f.dst == WUPS_ADDR_BROADCAST);
@@ -177,7 +177,7 @@ static void deliver_frame(uint8_t inbound_port, const PortRxState& s)
     f.len   = s.len;
     if (s.len) memcpy(f.payload, s.payload, s.len);
     Wups_Frames_Rx[inbound_port]++;
-    route_frame(inbound_port, f);
+    wups_route_frame(inbound_port, f);
 }
 
 static void rx_byte(uint8_t inbound_port, PortRxState& s, uint8_t b)

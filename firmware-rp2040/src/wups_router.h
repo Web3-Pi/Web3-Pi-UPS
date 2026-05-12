@@ -67,6 +67,13 @@ void wups_send_with_src(uint8_t port, uint8_t dst, uint8_t src,
  * for application-level handling only. */
 extern void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f);
 
+/* Inject a frame into the router as if it had just arrived on
+ * `inbound_port`. Performs the same local-dispatch + forward logic as
+ * the byte-level deframer. Use this when a frame was reconstructed from
+ * an encapsulating payload (e.g. net.downlink) rather than read off the
+ * wire directly. */
+void wups_route_frame(uint8_t inbound_port, const WupsFrame& f);
+
 /* Diagnostic counters — read via SWD or system.log to confirm
  * the bus is alive without a logic analyzer. */
 extern volatile uint32_t Wups_Frames_Rx[WUPS_PORT_COUNT];

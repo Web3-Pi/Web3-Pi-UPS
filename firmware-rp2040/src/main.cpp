@@ -863,7 +863,9 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     ifr.len   = inner_len;
     if (inner_len) memcpy(ifr.payload, inner + WUPS_HEADER_BYTES, inner_len);
 
-    dbgOut.print(F("[net.downlink] cls=0x"));
+    dbgOut.print(F("[net.downlink] dst=0x"));
+    dbgOut.print(ifr.dst, HEX);
+    dbgOut.print(F(" cls=0x"));
     dbgOut.print(ifr.cls, HEX);
     dbgOut.print(F(" op=0x"));
     dbgOut.print(ifr.op, HEX);
@@ -872,7 +874,9 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     dbgOut.print(F(" len="));
     dbgOut.println(ifr.len);
 
-    wups_on_local_frame(inbound_port, ifr);
+    // Re-inject through the router so broadcast/unicast frames are also
+    // forwarded to CH32X / RPi as required (e.g. ups.power.* lives on CH32X).
+    wups_route_frame(inbound_port, ifr);
     return;
   }
 
@@ -887,6 +891,20 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     dbgOut.print(F("[CH32X log] "));
     dbgOut.write(f.payload + 4, text_len);
     dbgOut.println();
+    return;
+  }
+
+  // power.status REQ — panel's "Request status frame" button. CH32X
+  // already pushes power.status as an EVENT every 1 s and we cache it
+  // in Last_Power_Status; just republish that cached frame on MQTT
+  // telemetry immediately so the panel's Live-telemetry tile refreshes
+  // without a CH32X round trip. Max staleness ≈ 1 s — fine for Vbat /
+  // Iout / temperature granularity.
+  if (f.cls == WUPS_CLASS_POWER && f.op == WUPS_OP_PWR_STATUS &&
+      (f.flags & WUPS_FLAG_REQ)) {
+    if (Last_Power_Status_Ms != 0) {
+      wupsPublishTelemetryStatus(f.seq, Last_Power_Status);
+    }
     return;
   }
 
