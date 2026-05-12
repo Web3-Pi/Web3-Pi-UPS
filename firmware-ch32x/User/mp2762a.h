@@ -86,6 +86,19 @@ typedef struct {
   uint8_t fault;    // Fault flags
 } mp2762a_data_t;
 
+// True iff PA6 (DC_INP_EN_SRC) is currently driving Q222 ON, which is the
+// only condition under which MP2762A has VCC. When this returns false, the
+// chip is dead — its I/O pins clamp SDA low and every bit-banged I²C read
+// returns 0x00 (silently, no ACK check). Callers must skip MP2762A reads in
+// that state to avoid polluting telemetry with bogus zeros.
+static inline uint8_t mp2762a_powered(void) {
+  return (GPIO_ReadOutputDataBit(GPIOA, GPIO_Pin_6) == Bit_SET) ? 1 : 0;
+}
+
+// Sentinel for "junction temperature unavailable" (chip unpowered). Picked
+// at the negative extreme so 0 °C remains a legitimate reading.
+#define MP2762A_TJ_NA  ((int16_t)-32768)
+
 // API
 void mp2762a_init(void);
 uint8_t mp2762a_read_reg(uint8_t reg);

@@ -322,6 +322,25 @@ void mp2762a_restart_charging(void) {
 }
 
 void mp2762a_read_all(mp2762a_data_t *data) {
+  // MP2762A is powered exclusively from PPVAR_INP_SYS (gated by PA6 driving
+  // Q222). When PA6=0 the chip has no VCC, can't ACK I²C, and the bit-banged
+  // master happily reads 0x00 from every register. We must NOT use those
+  // zeros — they look like "0 V, 0 mA, TJ=350.3 °C" downstream. The PA1
+  // hysteresis loop in TIM1_UP_IRQHandler is the source of truth for "is
+  // mains present"; ACOK is unreliable when the chip is dead.
+  if (!mp2762a_powered()) {
+    data->chg_state  = CHG_STATE_NOT_CHARGING;
+    data->power_good = 0;
+    data->vin_mv     = 0;
+    data->iin_ma     = 0;
+    data->vbat_mv    = 0;       // on-battery VBAT is sourced from PA5 ADC in main.c
+    data->ichg_ma    = 0;
+    data->vsys_mv    = 0;
+    data->tjunc_c10  = MP2762A_TJ_NA;
+    data->fault      = 0;
+    return;
+  }
+
   uint8_t status = mp2762a_read_reg(MP2762A_REG_STATUS);
   uint8_t chg_bits = status & MP2762A_CHG_STAT_MASK;
 

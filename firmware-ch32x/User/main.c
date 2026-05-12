@@ -80,6 +80,8 @@ volatile UINT32 Uptime_Sec = 0;
 static UINT16   Ms_Sub_Cnt = 0;
 volatile u16    DC_Inp_ADC_Val = 0;
 static UINT16   DC_Inp_Voltage_mV = 0;
+volatile u16    Vbat_ADC_Val = 0;
+static UINT16   Vbat_Voltage_mV = 0;
 static UINT16   Json_Timer_Ms = 0;
 static UINT16   Temp_Timer_Ms = 0;
 static UINT16   Chg_Timer_Ms = 0;
@@ -491,20 +493,28 @@ static void wups_send_power_status(uint8_t dst, uint8_t flags, uint8_t seq)
     wups_power_status_v1_t s;
     s.version        = 1;
     s.charge_state   = (uint8_t)Chg_Data.chg_state;
-    s.vbus_in_mV     = (uint16_t)Chg_Data.vin_mv;
+    /* vbus_in: always from our own PA1 ADC. Works in every state — mains
+     * present, mains absent, Q222 cut, MP2762A dead. The MP2762A's VIN
+     * reading is redundant when mains is on and unavailable on battery; we
+     * ignore it unconditionally to keep the source uniform. */
+    s.vbus_in_mV     = DC_Inp_Voltage_mV;
     /* Tps_Vread_v10 / Tps_Iread_a10 are 0.1 V / 0.1 A units — *100 → mV / mA. */
     s.vbus_out_mV    = (uint16_t)((int32_t)Tps_Vread_v10 * 100);
     s.ibus_out_mA    = (int16_t)((int32_t)Tps_Iread_a10 * 100);
-    s.vbat_mV        = (uint16_t)Chg_Data.vbat_mv;
+    /* vbat: always from our own PA5 ADC. Available whether MP2762A is alive
+     * or not. With mains on and no battery present, BATTFET leakage can
+     * leave residual voltage on PPVAR_VBAT+ caps; that's a known edge case
+     * (the panel infers "no battery" from charge state + faults). */
+    s.vbat_mV        = Vbat_Voltage_mV;
     s.ibat_mA        = (int16_t)Chg_Data.ichg_ma;
     /* Hottest of LM75B (board, near TPS55289) and MP2762A junction.
-     * "Worst-of" is the right number for thermal protection logic and OLED
-     * display — if either chip is approaching its safe limit, that's what
-     * we want surfaced. Both inputs are in deci-Celsius. */
+     * When MP2762A is unpowered, mp2762a_read_all() sets tjunc_c10 to
+     * MP2762A_TJ_NA — use LM75B alone in that case. Both inputs are in
+     * deci-Celsius. */
     {
         int16_t lm = Board_Temp_c10;
         int16_t tj = Chg_Data.tjunc_c10;
-        s.temp_dC = (tj > lm) ? tj : lm;
+        s.temp_dC = (tj == MP2762A_TJ_NA) ? lm : ((tj > lm) ? tj : lm);
     }
     /* SINK contract is 0 unless the UPS is being fed by an upstream PD
      * charger. While diagnosing the SOURCE-side power path with no upstream
@@ -1022,9 +1032,17 @@ int main(void)
         {
             Json_Timer_Ms = 0;
 
-            /* DC input voltage from cached PA1 ADC: Vin = ADC * 3300 * (27.4+5.1) / 5.1 / 4096.
-             * Computed but not yet surfaced in power.status v1 — keep cached for future use. */
+            /* DC input voltage from cached PA1 ADC: Vin = ADC * 3300 * (27.4+5.1) / 5.1 / 4096. */
             DC_Inp_Voltage_mV = (UINT16)((UINT32)DC_Inp_ADC_Val * 21029 / 4096);
+
+            /* Battery voltage from PA5 ADC: VBAT = ADC * 3300 * (100+47) / 47 / 4096
+             * ≈ ADC * 10322 / 4096. Sampled here (1 Hz) because the WUPS frame
+             * consumer is also 1 Hz; no benefit from higher rate. This is the
+             * authoritative VBAT source — MP2762A's VBAT register reads 0 when
+             * the chip is unpowered (mains absent), which is the normal "on
+             * battery" state, so we cannot rely on it. */
+            Vbat_ADC_Val = Get_ADC_Val(ADC_Channel_5);
+            Vbat_Voltage_mV = (UINT16)((UINT32)Vbat_ADC_Val * 10322u / 4096u);
 
             wups_send_power_status(WUPS_ADDR_RP2040, WUPS_FLAG_EVENT, Wups_Tx_Seq++);
         }
@@ -1174,9 +1192,11 @@ void ADC_Function_Init(void)
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    //PA5: input floating (battery ADC divider - not used, MP2762A provides VBAT)
+    //PA5: PD_SRC_VBAT — battery voltage ADC via R430/R431 divider
+    //(R433=100R since 2026-05-11; before that R433=DNP so PA5 floated).
+    //Scale: PA5 = VBAT * 47 / (100+47) ≈ 0.3197 * VBAT.
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_5;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
     ADC_DeInit(ADC1);
