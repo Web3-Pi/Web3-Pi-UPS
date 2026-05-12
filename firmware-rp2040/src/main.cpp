@@ -833,6 +833,40 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     return;
   }
 
+  // ui.beep → play a tone on the buzzer. Lets a remote operator (web
+  // panel, local CLI, …) verify the round-trip path reaches *this*
+  // device — sound is end-to-end proof the command landed on the right
+  // RP2040 and the dispatcher decoded it correctly.
+  //
+  // freq_hz == 0 or dur_ms == 0 → use sensible defaults so a minimal
+  // {"op":"beep"} request still produces an audible chirp.
+  if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_BEEP &&
+      (f.flags & WUPS_FLAG_REQ) &&
+      f.len >= sizeof(wups_ui_beep_v1_t)) {
+    wups_ui_beep_v1_t b;
+    memcpy(&b, f.payload, sizeof(b));
+    if (b.version == 1) {
+      uint16_t freq = b.freq_hz ? b.freq_hz : 1500;
+      uint16_t dur  = b.dur_ms  ? b.dur_ms  : 150;
+      // Clamp duration so a misbehaving caller can't lock the buzzer
+      // (tone() is non-blocking on this core but loop() still does a
+      // 50 ms delay, so a long active tone is mostly fine — cap at 5 s
+      // as a safety net).
+      if (dur > 5000) dur = 5000;
+      tone(BUZZER_PIN, freq, dur);
+    }
+
+    uint8_t out_port = WUPS_PORT_NONE;
+    if      (f.src == WUPS_ADDR_RPI)   out_port = WUPS_PORT_RPI;
+    else if (f.src == WUPS_ADDR_CH32X) out_port = WUPS_PORT_CH32X;
+    else if (f.src == WUPS_ADDR_ESP32) out_port = WUPS_PORT_ESP32;
+    if (out_port != WUPS_PORT_NONE) {
+      wups_send_seq(out_port, f.src, WUPS_CLASS_UI, WUPS_OP_UI_BEEP,
+                    WUPS_FLAG_RESP, f.seq, nullptr, 0);
+    }
+    return;
+  }
+
   // system.ping → respond with uptime + fw_version.
   if (f.cls == WUPS_CLASS_SYSTEM && f.op == WUPS_OP_SYS_PING &&
       (f.flags & WUPS_FLAG_REQ)) {
