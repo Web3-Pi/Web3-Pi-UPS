@@ -739,6 +739,7 @@ static void drawScreenPowerCtrl() {
 // Defined here (in main.cpp) because the body needs access to RP2040
 // firmware globals (ui, lastFrameTime, etc.). Declared in wups_router.h.
 static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t& s);
+static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq, uint8_t code);
 
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   (void)inbound_port;
@@ -905,6 +906,24 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     if (Last_Power_Status_Ms != 0) {
       wupsPublishTelemetryStatus(f.seq, Last_Power_Status);
     }
+    wupsPublishCmdResponse(f.cls, f.op, f.seq, /*code=*/0);
+    return;
+  }
+
+  // power.{enable,disable,cycle,reset} REQ — RP2040 has no local action
+  // here; the router has already forwarded the broadcast frame to CH32X
+  // over UART0 by the time we're called. CH32X executes the command but
+  // is a leaf node on UART (no MQTT path of its own), so RP2040 stands in
+  // and publishes a best-effort RESP to t/{iccid}/cmd/response. The UART
+  // link is 921600 8N1 point-to-point with HW flow control — the forward
+  // is virtually never lost, and there's no easier round-trip ack to wait
+  // for than this one.
+  if (f.cls == WUPS_CLASS_POWER && (f.flags & WUPS_FLAG_REQ) &&
+      (f.op == WUPS_OP_PWR_ENABLE  ||
+       f.op == WUPS_OP_PWR_DISABLE ||
+       f.op == WUPS_OP_PWR_CYCLE   ||
+       f.op == WUPS_OP_PWR_RESET)) {
+    wupsPublishCmdResponse(f.cls, f.op, f.seq, /*code=*/0);
     return;
   }
 
@@ -939,6 +958,7 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
       wups_send_seq(out_port, f.src, WUPS_CLASS_UI, WUPS_OP_UI_BEEP,
                     WUPS_FLAG_RESP, f.seq, nullptr, 0);
     }
+    wupsPublishCmdResponse(f.cls, f.op, f.seq, /*code=*/0);
     return;
   }
 
@@ -1034,6 +1054,21 @@ static size_t wupsBuildFrame(uint8_t* out, size_t out_cap,
   out[10 + payload_len + 2] = WUPS_END1;
   out[10 + payload_len + 3] = WUPS_END2;
   return need;
+}
+
+// Publish a one-byte cmd-response RESP back to the panel on
+// t/{iccid}/cmd/response. The panel's dispatcher matches by SEQ (resolved
+// via Redis to the originating commandId) and reads payload[0] as a
+// result code (0 = success, non-zero = failure → "code_N"). DST=RPI is
+// arbitrary — the panel only cares about SEQ + payload.
+static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq,
+                                   uint8_t code) {
+  uint8_t frame[WUPS_FRAMING_BYTES + 1];
+  size_t n = wupsBuildFrame(frame, sizeof(frame),
+                            WUPS_ADDR_RPI, WUPS_ADDR_RP2040,
+                            cls, op, WUPS_FLAG_RESP, seq, &code, 1);
+  if (n == 0) return;
+  wupsRequestPublish("cmd/response", /*qos=*/1, /*retain=*/0, frame, (uint16_t)n);
 }
 
 // Wrap a cached CH32X power.status into a WUPS frame (src=CH32X preserved
