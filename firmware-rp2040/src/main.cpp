@@ -739,6 +739,7 @@ static void drawScreenPowerCtrl() {
 // Defined here (in main.cpp) because the body needs access to RP2040
 // firmware globals (ui, lastFrameTime, etc.). Declared in wups_router.h.
 static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t& s);
+static void wupsPublishHostStatus(uint8_t seq, const wups_host_status_v1_t& s);
 static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq, uint8_t code);
 
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
@@ -982,6 +983,22 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     return;
   }
 
+  // host.status — RPi host service pushes CPU temp / mem / disk / load /
+  // uptime every few seconds (drives the OLED's host screen). Re-publish
+  // it verbatim onto the MQTT "telemetry" subtopic so the panel's
+  // wupsproto decoder sees the same bytes the bus sees. SRC=RPI is kept
+  // for the panel's audit trail. Local-consume only — do NOT retransmit
+  // onto the other MCU ports.
+  if (f.cls == WUPS_CLASS_HOST && f.op == WUPS_OP_HOST_STATUS &&
+      f.src == WUPS_ADDR_RPI &&
+      f.len >= sizeof(wups_host_status_v1_t)) {
+    wups_host_status_v1_t hs;
+    memcpy(&hs, f.payload, sizeof(hs));
+    if (hs.version != 1) return;
+    wupsPublishHostStatus(f.seq, hs);
+    return;
+  }
+
   // Other classes/ops: ignored in v1.
 }
 
@@ -1079,6 +1096,19 @@ static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t
   size_t n = wupsBuildFrame(frame, sizeof(frame),
                             WUPS_ADDR_BROADCAST, WUPS_ADDR_CH32X,
                             WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
+                            WUPS_FLAG_EVENT, seq, &s, sizeof(s));
+  if (n == 0) return;
+  wupsRequestPublish("telemetry", /*qos=*/0, /*retain=*/0, frame, (uint16_t)n);
+}
+
+// Wrap an RPi-sourced host.status into a WUPS frame (src=RPI preserved for
+// the panel's audit trail) and ship it to the ESP32 as net.publish onto
+// the "telemetry" subtopic — same path/QoS as power.status.
+static void wupsPublishHostStatus(uint8_t seq, const wups_host_status_v1_t& s) {
+  uint8_t frame[WUPS_FRAMING_BYTES + sizeof(wups_host_status_v1_t)];
+  size_t n = wupsBuildFrame(frame, sizeof(frame),
+                            WUPS_ADDR_BROADCAST, WUPS_ADDR_RPI,
+                            WUPS_CLASS_HOST, WUPS_OP_HOST_STATUS,
                             WUPS_FLAG_EVENT, seq, &s, sizeof(s));
   if (n == 0) return;
   wupsRequestPublish("telemetry", /*qos=*/0, /*retain=*/0, frame, (uint16_t)n);
