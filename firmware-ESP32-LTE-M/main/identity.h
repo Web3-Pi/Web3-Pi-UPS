@@ -6,16 +6,18 @@
 #include "esp_err.h"
 
 /*
- * Device identity helpers for ADR-0002 / ADR-0005:
- *   - ICCID = SIM serial = device identity (used as MQTT username + topic prefix).
- *   - mqtt_password = hex(HMAC-SHA256(MASTER_SECRET, ICCID))
- *
- * MASTER_SECRET is compiled in via secrets.h (`MASTER_SECRET_HEX`).
+ * Device identity helpers (ADR-0002; Track 0 / WS-10 superseded ADR-0005):
+ *   - ICCID = SIM serial = device identity (MQTT username + topic prefix).
+ *   - mqtt_password = the per-device secret read verbatim from the read-only
+ *     `prov` NVS partition (random 32 B → 64 hex chars), provisioned at
+ *     production. NOT derived from the (label-visible) ICCID and NOT a
+ *     fleet-wide secret any more.
  *
  * Two-phase init:
- *   1. identity_init() once at boot — decodes MASTER_SECRET_HEX into raw bytes.
- *   2. identity_set_iccid() after AT+CCID has succeeded — derives the MQTT
- *      password and unblocks identity_get_*() accessors.
+ *   1. identity_init() once at boot — loads + hex-encodes the per-device
+ *      secret from `prov`. Fails loudly if the unit was never provisioned.
+ *   2. identity_set_iccid() after AT+CCID has succeeded — validates/stores
+ *      the ICCID (username/topic only; no longer affects the password).
  */
 
 esp_err_t identity_init(void);

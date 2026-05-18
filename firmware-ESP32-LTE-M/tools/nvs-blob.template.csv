@@ -1,0 +1,14 @@
+# Schema of the per-device `prov` NVS partition (Track 0 / WS-10).
+# This template is committed for documentation ONLY — it has NO secret.
+# The real CSV (with the cleartext secret) is generated transiently by
+# tools/make-nvs-blob and never committed.
+#
+# Layout MUST stay in sync with:
+#   - partitions.csv          ("prov", data, nvs, size 0x4000)
+#   - main/identity.c         (PROV_NAMESPACE="w3pups", PROV_KEY_SECRET="mqtt_secret")
+#   - apps/api/src/lib/device-secret.ts (32-byte random secret)
+#
+# nvs_partition_gen.py format:
+key,type,encoding,value
+w3pups,namespace,,
+mqtt_secret,data,hex2bin,<64-hex-chars-of-the-32-byte-per-device-secret>

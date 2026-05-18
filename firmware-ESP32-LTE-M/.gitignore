@@ -32,6 +32,10 @@ docs/LilyGo-T-SIM7080G/
 # Local secrets (broker credentials etc.) — see main/secrets.h.example
 main/secrets.h
 
+# Track 0 / WS-10: per-device provisioning artifacts. The NVS blob + its
+# transient gen CSV carry the CLEARTEXT per-device secret — never commit.
+/prov-out/
+
 # Build artifacts and directories
 **/build/
 build/

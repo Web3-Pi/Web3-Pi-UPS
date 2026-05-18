@@ -1,0 +1,10 @@
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/partitions.csv","timestamp":1779107856166,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/sdkconfig.defaults","timestamp":1779107874954,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/main/identity.c","timestamp":1779107906555,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/main/identity.h","timestamp":1779107918457,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/main/mqtt.c","timestamp":1779107952322,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/main/main.c","timestamp":1779107961660,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/main/secrets.h.example","timestamp":1779107976915,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/tools/make-nvs-blob","timestamp":1779108031010,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/tools/nvs-blob.template.csv","timestamp":1779108039476,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/.gitignore","timestamp":1779108056676,"sessionId":null}

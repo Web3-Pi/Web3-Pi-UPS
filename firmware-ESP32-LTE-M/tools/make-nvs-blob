@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Track 0 / WS-10 — generate the per-device `prov` NVS partition image.
+#
+# The image carries ONE secret: the device's random 32-byte MQTT password
+# (hex), the same value the panel sealed into devices.mqtt_secret_enc and
+# pushes to EMQX. Flash it into the `prov` partition (offset/size from
+# partitions.csv) independently of the app image — the firmware binary stays
+# identical across all units; only this blob differs per unit.
+#
+# Usage:
+#   tools/make-nvs-blob --secret <64-hex> [--iccid <iccid>] [--out <file.bin>]
+#
+# Get <64-hex> from the panel provisioning artifact:
+#   - dev:  `pnpm db:seed <ICCID>` prints  "mqttSecret": "<64hex>"
+#   - prod: the `mqtt_secret` column of batch-<id>-stickers.csv
+#
+# Output defaults to  prov-out/prov-<iccid|secret-prefix>.nvs.bin  (gitignored,
+# cleartext-bearing — treat like the sticker CSV: flash it, then delete it).
+#
+# Flash it (coordinated with the serial monitor) e.g.:
+#   tools/idf -p /dev/cu.usbmodem1101 erase-flash      # first provisioning only
+#   esptool.py --port /dev/cu.usbmodem1101 write_flash 0x310000 <file.bin>
+#   (0x310000 = the `prov` offset in partitions.csv)
+
+set -eo pipefail
+
+ACTIVATE="/Users/cmd0s/.espressif/tools/activate_idf_v6.0.sh"
+PROV_SIZE="0x4000"   # MUST match the `prov` partition size in partitions.csv
+NAMESPACE="w3pups"   # MUST match PROV_NAMESPACE in main/identity.c
+KEY="mqtt_secret"    # MUST match PROV_KEY_SECRET in main/identity.c
+
+secret=""
+iccid=""
+out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --secret) secret="$2"; shift 2 ;;
+    --iccid)  iccid="$2";  shift 2 ;;
+    --out)    out="$2";    shift 2 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ ! "$secret" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  echo "ERROR: --secret must be exactly 64 hex chars (32 bytes)" >&2
+  exit 2
+fi
+if [[ ! -f "$ACTIVATE" ]]; then
+  echo "ERROR: ESP-IDF v6.0 activation script not found at: $ACTIVATE" >&2
+  exit 1
+fi
+
+IDF_ONLY_PATH=""
+SYSTEM_PATH=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    PATH)         IDF_ONLY_PATH="$value" ;;
+    SYSTEM_PATH)  SYSTEM_PATH="$value" ;;
+    IDF_TOOLS_PATH|IDF_COMPONENT_LOCAL_STORAGE_URL|IDF_PATH|\
+ESP_ROM_ELF_DIR|OPENOCD_SCRIPTS|IDF_PYTHON_ENV_PATH|ESP_IDF_VERSION)
+      export "$key=$value"
+      ;;
+  esac
+done < <(bash "$ACTIVATE" -e)
+export PATH="${IDF_PATH}/tools:${IDF_ONLY_PATH}:${SYSTEM_PATH}:${PATH}"
+
+NVS_GEN="${IDF_PATH}/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py"
+if [[ ! -f "$NVS_GEN" ]]; then
+  echo "ERROR: nvs_partition_gen.py not found at $NVS_GEN" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OUT_DIR="${SCRIPT_DIR}/../prov-out"
+mkdir -p "$OUT_DIR"
+if [[ -z "$out" ]]; then
+  tag="${iccid:-${secret:0:8}}"
+  out="${OUT_DIR}/prov-${tag}.nvs.bin"
+fi
+
+# Temp NVS-gen CSV (carries the cleartext secret) — kept in OUT_DIR so it
+# falls under the same gitignore, and shredded on exit regardless of outcome.
+tmpcsv="$(mktemp "${OUT_DIR}/.nvsgen.XXXXXX.csv")"
+cleanup() { rm -f "$tmpcsv"; }
+trap cleanup EXIT INT TERM
+
+cat > "$tmpcsv" <<EOF
+key,type,encoding,value
+${NAMESPACE},namespace,,
+${KEY},data,hex2bin,${secret}
+EOF
+
+python "$NVS_GEN" generate "$tmpcsv" "$out" "$PROV_SIZE"
+
+echo "" >&2
+echo "Wrote ${out} (${PROV_SIZE} bytes, namespace=${NAMESPACE}, key=${KEY})" >&2
+echo "SENSITIVE: contains the cleartext per-device secret. Flash it, then" >&2
+echo "securely delete prov-out/. The DB keeps only the sealed copy." >&2
