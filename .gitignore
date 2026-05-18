@@ -44,3 +44,9 @@ docs/tmp/
 
 # Local AI assistant context / scratchpads (not part of the codebase itself)
 /PROGRESS.md
+
+.claude-flow/data/pending-insights.jsonl
+.gitignore
+firmware-rp2040/src/.claude-flow/data/pending-insights.jsonl
+.gitignore
+firmware-rp2040/.claude-flow/data/pending-insights.jsonl
