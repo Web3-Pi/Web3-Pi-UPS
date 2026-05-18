@@ -1,4 +1,4 @@
-# Schema of the per-device `prov` NVS partition (Track 0 / WS-10).
+# Schema of the per-device `prov` NVS partition (Track 0 / WS-10 + WS-9).
 # This template is committed for documentation ONLY — it has NO secret.
 # The real CSV (with the cleartext secret) is generated transiently by
 # tools/make-nvs-blob and never committed.
@@ -6,9 +6,17 @@
 # Layout MUST stay in sync with:
 #   - partitions.csv          ("prov", data, nvs, size 0x4000)
 #   - main/identity.c         (PROV_NAMESPACE="w3pups", PROV_KEY_SECRET="mqtt_secret")
-#   - apps/api/src/lib/device-secret.ts (32-byte random secret)
+#   - main/cmdauth.c          (bk_op_pub / bk_root_pub / bk_epoch)
+#   - apps/api/src/lib/device-secret.ts   (32-byte random per-device secret)
+#   - apps/api/src/lib/authenvelope.ts    (ADR-0009 backend cmd signing)
+#
+# WS-9 keys are fleet-wide constants (public keys are not secret), pulled
+# from the backend via `pnpm --filter @web3pi-panel/api cmd-pubkeys`.
 #
 # nvs_partition_gen.py format:
 key,type,encoding,value
 w3pups,namespace,,
 mqtt_secret,data,hex2bin,<64-hex-chars-of-the-32-byte-per-device-secret>
+bk_op_pub,data,hex2bin,<130-hex uncompressed SEC1 backend OPERATIONAL pubkey>
+bk_root_pub,data,hex2bin,<130-hex uncompressed SEC1 backend ROOT pubkey>
+bk_epoch,data,u32,<backend operational key epoch, e.g. 1>

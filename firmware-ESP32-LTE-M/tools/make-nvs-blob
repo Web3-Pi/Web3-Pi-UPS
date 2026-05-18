@@ -32,17 +32,38 @@ KEY="mqtt_secret"    # MUST match PROV_KEY_SECRET in main/identity.c
 secret=""
 iccid=""
 out=""
+bk_op_pub=""
+bk_root_pub=""
+bk_epoch=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --secret) secret="$2"; shift 2 ;;
-    --iccid)  iccid="$2";  shift 2 ;;
-    --out)    out="$2";    shift 2 ;;
+    --secret)      secret="$2";      shift 2 ;;
+    --iccid)       iccid="$2";       shift 2 ;;
+    --out)         out="$2";         shift 2 ;;
+    --bk-op-pub)   bk_op_pub="$2";   shift 2 ;;
+    --bk-root-pub) bk_root_pub="$2"; shift 2 ;;
+    --bk-epoch)    bk_epoch="$2";    shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
+# WS-9 (ADR-0009): the backend command-signing public material. Get it from
+#   pnpm --filter @web3pi-panel/api cmd-pubkeys
+# (opPub / rootPub = 65-byte uncompressed SEC1 = 130 hex, 04-prefixed).
 if [[ ! "$secret" =~ ^[0-9a-fA-F]{64}$ ]]; then
   echo "ERROR: --secret must be exactly 64 hex chars (32 bytes)" >&2
+  exit 2
+fi
+if [[ ! "$bk_op_pub" =~ ^04[0-9a-fA-F]{128}$ ]]; then
+  echo "ERROR: --bk-op-pub must be 65-byte uncompressed SEC1 (130 hex, 04-prefixed)" >&2
+  exit 2
+fi
+if [[ ! "$bk_root_pub" =~ ^04[0-9a-fA-F]{128}$ ]]; then
+  echo "ERROR: --bk-root-pub must be 65-byte uncompressed SEC1 (130 hex, 04-prefixed)" >&2
+  exit 2
+fi
+if [[ ! "$bk_epoch" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --bk-epoch must be a positive integer" >&2
   exit 2
 fi
 if [[ ! -f "$ACTIVATE" ]]; then
@@ -88,11 +109,15 @@ cat > "$tmpcsv" <<EOF
 key,type,encoding,value
 ${NAMESPACE},namespace,,
 ${KEY},data,hex2bin,${secret}
+bk_op_pub,data,hex2bin,${bk_op_pub}
+bk_root_pub,data,hex2bin,${bk_root_pub}
+bk_epoch,data,u32,${bk_epoch}
 EOF
 
 python "$NVS_GEN" generate "$tmpcsv" "$out" "$PROV_SIZE"
 
 echo "" >&2
-echo "Wrote ${out} (${PROV_SIZE} bytes, namespace=${NAMESPACE}, key=${KEY})" >&2
+echo "Wrote ${out} (${PROV_SIZE} bytes, ns=${NAMESPACE}: ${KEY}, bk_op_pub," >&2
+echo "  bk_root_pub, bk_epoch=${bk_epoch})" >&2
 echo "SENSITIVE: contains the cleartext per-device secret. Flash it, then" >&2
 echo "securely delete prov-out/. The DB keeps only the sealed copy." >&2

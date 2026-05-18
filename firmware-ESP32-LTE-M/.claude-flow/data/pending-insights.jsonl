@@ -8,3 +8,7 @@
 {"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/tools/make-nvs-blob","timestamp":1779108031010,"sessionId":null}
 {"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/tools/nvs-blob.template.csv","timestamp":1779108039476,"sessionId":null}
 {"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/.gitignore","timestamp":1779108056676,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS-Panel/docs/adr/0009-backend-signed-commands-auth-envelope.md","timestamp":1779114527914,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS-Panel/docs/adr/README.md","timestamp":1779114535148,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/main/cmdauth.c","timestamp":1779115329111,"sessionId":null}
+{"type":"edit","file":"/Users/cmd0s/data/repos/Web3-Pi-UPS-Mono-Repo/Web3-Pi-UPS/firmware-ESP32-LTE-M/main/cmdauth.c","timestamp":1779115337461,"sessionId":null}
