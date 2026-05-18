@@ -742,6 +742,24 @@ static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t
 static void wupsPublishHostStatus(uint8_t seq, const wups_host_status_v1_t& s);
 static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq, uint8_t code);
 
+// Cellular uplink is metered: the M.2 modem runs on a ~500 MB/mo LTE data
+// plan, sized from measured packet sizes. The CH32X pushes power.status
+// every 1 s (needed locally for the OLED / alarms / SOC EMA and the
+// Last_Power_Status cache), but we only relay it to the MQTT backend every
+// TELEMETRY_UPLINK_INTERVAL_MS. Exception: a change in input-power state
+// (grid <-> battery) or in the charger fault bitmap forces an immediate
+// publish, so the cloud panel sees an outage/fault within seconds rather
+// than up to 30 s later. This throttle is cloud-visibility only — local
+// buzzer/OLED alarms and the RPi-side shutdown decision run off the 1 s
+// stream and are unaffected. The on-demand power.status REQ path (panel
+// "Request status" button) also stays immediate; it is user-triggered and
+// rare, so it does not meaningfully spend the data budget.
+static const uint32_t TELEMETRY_UPLINK_INTERVAL_MS = 30000;
+static uint32_t Last_Telemetry_Uplink_Ms = 0;
+static bool     Telemetry_Uplink_Primed  = false;  // first frame after boot?
+static bool     Last_Uplink_Pg           = false;  // input "good" at last uplink
+static uint16_t Last_Uplink_Faults       = 0;      // charger faults at last uplink
+
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   (void)inbound_port;
 
@@ -817,7 +835,32 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     // auto-prefixes relative subtopics with `t/{iccid}/`. We send the full
     // raw WUPS frame (header+payload+checksum) as the MQTT payload so the
     // panel's wupsproto.ts decoder sees byte-for-byte what the bus sees.
-    wupsPublishTelemetryStatus(f.seq, s);
+    //
+    // Throttled to TELEMETRY_UPLINK_INTERVAL_MS to stay inside the LTE data
+    // budget, with an immediate publish whenever the input-power state or
+    // the charger fault bitmap changes (see notes at the static decls).
+    {
+      const bool     pgNow     = (s.vbus_in_mV > 5000);
+      const uint16_t faultsNow = s.faults;
+      const uint32_t nowMs     = millis();
+      bool publishNow;
+      if (!Telemetry_Uplink_Primed) {
+        publishNow = true;                  // first frame: announce we're online
+      } else if (pgNow != Last_Uplink_Pg || faultsNow != Last_Uplink_Faults) {
+        publishNow = true;                  // power state / fault change
+      } else {
+        // Unsigned subtraction is millis()-rollover safe.
+        publishNow = (uint32_t)(nowMs - Last_Telemetry_Uplink_Ms)
+                         >= TELEMETRY_UPLINK_INTERVAL_MS;
+      }
+      if (publishNow) {
+        wupsPublishTelemetryStatus(f.seq, s);
+        Last_Telemetry_Uplink_Ms = nowMs;
+        Last_Uplink_Pg           = pgNow;
+        Last_Uplink_Faults       = faultsNow;
+        Telemetry_Uplink_Primed  = true;
+      }
+    }
     return;
   }
 
