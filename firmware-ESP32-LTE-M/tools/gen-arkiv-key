@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Track 2 / ADR-0011 — generate one device's secp256k1 Arkiv private key.
+#
+# Prints 64 lowercase hex (32 bytes) on stdout, nothing else, so it pipes
+# straight into:  tools/make-nvs-blob ... --ak-dev-priv "$(tools/gen-arkiv-key)"
+#
+# A uniformly random integer in [1, n-1] is a valid secp256k1 scalar — no
+# curve library needed; we just reject 0 and anything >= the group order n
+# and redraw (astronomically rare). Uses the OS CSPRNG (secrets).
+#
+# SENSITIVE: this is a device private key. Capture it only into the
+# transient prov blob; never commit or log it.
+set -eo pipefail
+
+exec python3 - <<'PY'
+import secrets, sys
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+while True:
+    k = secrets.randbits(256)
+    if 1 <= k < N:
+        sys.stdout.write(f"{k:064x}")
+        break
+PY

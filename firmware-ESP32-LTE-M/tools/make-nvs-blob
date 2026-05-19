@@ -8,11 +8,20 @@
 # identical across all units; only this blob differs per unit.
 #
 # Usage:
-#   tools/make-nvs-blob --secret <64-hex> [--iccid <iccid>] [--out <file.bin>]
+#   tools/make-nvs-blob --secret <64-hex> --bk-op-pub <130hex> \
+#       --bk-root-pub <130hex> --bk-epoch <n> \
+#       [--ak-dev-priv <64hex>] [--iccid <iccid>] [--out <file.bin>]
 #
 # Get <64-hex> from the panel provisioning artifact:
 #   - dev:  `pnpm db:seed <ICCID>` prints  "mqttSecret": "<64hex>"
 #   - prod: the `mqtt_secret` column of batch-<id>-stickers.csv
+#
+# --ak-dev-priv (Track 2 / ADR-0011, optional): the device's 32-byte
+# secp256k1 Arkiv key. Omit → unit is MQTT-only (Paranoic unavailable,
+# fail-closed). Generate one with tools/gen-arkiv-key. To add it to an
+# already-provisioned unit WITHOUT a panel round-trip, re-extract the
+# existing mqtt_secret/bk_* from the live `prov` (esptool read_flash +
+# nvs_tool -d blobs) and pass them back in unchanged alongside it.
 #
 # Output defaults to  prov-out/prov-<iccid|secret-prefix>.nvs.bin  (gitignored,
 # cleartext-bearing — treat like the sticker CSV: flash it, then delete it).
@@ -35,14 +44,16 @@ out=""
 bk_op_pub=""
 bk_root_pub=""
 bk_epoch=""
+ak_dev_priv=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --secret)      secret="$2";      shift 2 ;;
-    --iccid)       iccid="$2";       shift 2 ;;
-    --out)         out="$2";         shift 2 ;;
-    --bk-op-pub)   bk_op_pub="$2";   shift 2 ;;
-    --bk-root-pub) bk_root_pub="$2"; shift 2 ;;
-    --bk-epoch)    bk_epoch="$2";    shift 2 ;;
+    --secret)       secret="$2";      shift 2 ;;
+    --iccid)        iccid="$2";       shift 2 ;;
+    --out)          out="$2";         shift 2 ;;
+    --bk-op-pub)    bk_op_pub="$2";   shift 2 ;;
+    --bk-root-pub)  bk_root_pub="$2"; shift 2 ;;
+    --bk-epoch)     bk_epoch="$2";    shift 2 ;;
+    --ak-dev-priv)  ak_dev_priv="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -65,6 +76,27 @@ fi
 if [[ ! "$bk_epoch" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --bk-epoch must be a positive integer" >&2
   exit 2
+fi
+# Track 2 / ADR-0011 — optional Arkiv device key. Omit it and the unit is
+# simply not Arkiv-provisioned (Paranoic mode unavailable; Default/MQTT
+# unaffected, fail-closed). When present it MUST be a valid secp256k1
+# scalar: 64 hex, non-zero, < group order n. Generate with tools/gen-arkiv-key.
+if [[ -n "$ak_dev_priv" ]]; then
+  if [[ ! "$ak_dev_priv" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "ERROR: --ak-dev-priv must be exactly 64 hex chars (32 bytes)" >&2
+    exit 2
+  fi
+  ak_lc="$(printf '%s' "$ak_dev_priv" | tr 'A-F' 'a-f')"
+  n="fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141"
+  if [[ "$ak_lc" == "0000000000000000000000000000000000000000000000000000000000000000" ]]; then
+    echo "ERROR: --ak-dev-priv must be non-zero" >&2
+    exit 2
+  fi
+  # Lexicographic compare is valid here: both are fixed 64-hex lowercase.
+  if [[ "$ak_lc" > "$n" || "$ak_lc" == "$n" ]]; then
+    echo "ERROR: --ak-dev-priv must be < secp256k1 group order n" >&2
+    exit 2
+  fi
 fi
 if [[ ! -f "$ACTIVATE" ]]; then
   echo "ERROR: ESP-IDF v6.0 activation script not found at: $ACTIVATE" >&2
@@ -102,7 +134,7 @@ fi
 # Temp NVS-gen CSV (carries the cleartext secret) — kept in OUT_DIR so it
 # falls under the same gitignore, and shredded on exit regardless of outcome.
 tmpcsv="$(mktemp "${OUT_DIR}/.nvsgen.XXXXXX.csv")"
-cleanup() { rm -f "$tmpcsv"; }
+cleanup() { command -v shred >/dev/null 2>&1 && shred -u "$tmpcsv" 2>/dev/null || rm -f "$tmpcsv"; }
 trap cleanup EXIT INT TERM
 
 cat > "$tmpcsv" <<EOF
@@ -113,11 +145,16 @@ bk_op_pub,data,hex2bin,${bk_op_pub}
 bk_root_pub,data,hex2bin,${bk_root_pub}
 bk_epoch,data,u32,${bk_epoch}
 EOF
+# Track 2 / ADR-0011: append the Arkiv device key only when supplied, so
+# the schema stays backward-compatible with MQTT-only provisioning.
+if [[ -n "$ak_dev_priv" ]]; then
+  echo "ak_dev_priv,data,hex2bin,${ak_dev_priv}" >> "$tmpcsv"
+fi
 
 python "$NVS_GEN" generate "$tmpcsv" "$out" "$PROV_SIZE"
 
 echo "" >&2
 echo "Wrote ${out} (${PROV_SIZE} bytes, ns=${NAMESPACE}: ${KEY}, bk_op_pub," >&2
-echo "  bk_root_pub, bk_epoch=${bk_epoch})" >&2
-echo "SENSITIVE: contains the cleartext per-device secret. Flash it, then" >&2
-echo "securely delete prov-out/. The DB keeps only the sealed copy." >&2
+echo "  bk_root_pub, bk_epoch=${bk_epoch}$( [[ -n "$ak_dev_priv" ]] && echo ', ak_dev_priv' ))" >&2
+echo "SENSITIVE: contains the cleartext per-device secret$( [[ -n "$ak_dev_priv" ]] && echo ' + Arkiv device key' )." >&2
+echo "Flash it, then securely delete prov-out/. The DB keeps only the sealed copy." >&2

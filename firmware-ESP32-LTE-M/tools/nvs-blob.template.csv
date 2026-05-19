@@ -7,11 +7,17 @@
 #   - partitions.csv          ("prov", data, nvs, size 0x4000)
 #   - main/identity.c         (PROV_NAMESPACE="w3pups", PROV_KEY_SECRET="mqtt_secret")
 #   - main/cmdauth.c          (bk_op_pub / bk_root_pub / bk_epoch)
+#   - main/cmdauth_arkiv.c    (ak_dev_priv — Track 2 / ADR-0011, optional)
 #   - apps/api/src/lib/device-secret.ts   (32-byte random per-device secret)
 #   - apps/api/src/lib/authenvelope.ts    (ADR-0009 backend cmd signing)
 #
 # WS-9 keys are fleet-wide constants (public keys are not secret), pulled
 # from the backend via `pnpm --filter @web3pi-panel/api cmd-pubkeys`.
+#
+# ak_dev_priv (Track 2 / ADR-0011) is the device's per-unit 32-byte
+# secp256k1 Arkiv key — OPTIONAL. Absent → unit is MQTT-only (Paranoic
+# unavailable, fail-closed); present → cmdauth_arkiv derives the device
+# address/pubkey from it (§4.1). Generate with tools/gen-arkiv-key.
 #
 # nvs_partition_gen.py format:
 key,type,encoding,value
@@ -20,3 +26,4 @@ mqtt_secret,data,hex2bin,<64-hex-chars-of-the-32-byte-per-device-secret>
 bk_op_pub,data,hex2bin,<130-hex uncompressed SEC1 backend OPERATIONAL pubkey>
 bk_root_pub,data,hex2bin,<130-hex uncompressed SEC1 backend ROOT pubkey>
 bk_epoch,data,u32,<backend operational key epoch, e.g. 1>
+ak_dev_priv,data,hex2bin,<64-hex secp256k1 device key — OPTIONAL, Track 2>
