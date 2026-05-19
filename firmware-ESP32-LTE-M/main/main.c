@@ -30,6 +30,7 @@
 #include "sdkconfig.h"
 
 #include "identity.h"
+#include "cmdauth.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -83,9 +84,19 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_err);
 
-    /* Decode MASTER_SECRET_HEX → raw bytes once, before anyone tries to
-     * derive an MQTT password. Cheap, no I/O. */
+    /* Load the per-device MQTT secret from the `prov` NVS partition before
+     * anything needs the MQTT password (Track 0 / WS-10). Aborts boot if the
+     * unit was never provisioned — by design, no fleet-wide fallback. */
     ESP_ERROR_CHECK(identity_init());
+
+    /* WS-9 / ADR-0009: load backend command-signing pubkey + freshness
+     * state. NOT fatal if absent — telemetry/identify must still work; a
+     * device that isn't WS-9-provisioned simply rejects every command
+     * (fail-closed) rather than bricking. */
+    if (cmdauth_init() != ESP_OK) {
+        ESP_LOGW(TAG, "cmdauth_init failed — all downlink commands will be "
+                      "rejected until the device is WS-9 provisioned");
+    }
 
     ESP_LOGI(TAG, "boot banner printed, calling pmu_init...");
 

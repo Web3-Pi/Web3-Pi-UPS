@@ -1,0 +1,18 @@
+# ESP-IDF partition table — Web3-Pi-UPS ESP32-LTE-M (16 MB, ESP32-S3).
+#
+# Track 0 / WS-10: adds `prov`, a dedicated NVS data partition holding the
+# per-device MQTT secret (random 32 B, provisioned at production via
+# nvs_partition_gen). It is SEPARATE from `nvs` on purpose:
+#   - app/runtime state lives in `nvs`; a state wipe / factory-reset of `nvs`
+#     never destroys the provisioned device identity;
+#   - the provisioning blob is flashed independently of the app image, so the
+#     firmware binary stays identical across all 50 units (only this small
+#     partition differs per unit).
+#
+# `factory` is 3 MB (current image ~0.8 MB; headroom for WS-9 crypto).
+#
+# Name,     Type, SubType, Offset,    Size,     Flags
+nvs,        data, nvs,     0x9000,    0x6000,
+phy_init,   data, phy,     0xf000,    0x1000,
+factory,    app,  factory, 0x10000,   0x300000,
+prov,       data, nvs,     0x310000,  0x4000,

@@ -2,6 +2,7 @@
 #include "wups_proto.h"
 #include "mqtt.h"
 #include "identity.h"
+#include "cmdauth.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -371,6 +372,21 @@ static void on_mqtt_data(const char *topic, size_t topic_len,
                  (unsigned)topic_len);
         return;
     }
+
+    /* WS-9 / ADR-0009: every downlink is a backend-signed command (the ESP32
+     * only subscribes to c/{iccid}/cmd/request). Verify the WAE1 envelope and
+     * forward ONLY the inner WUPS frame — the RP2040 sees exactly what it saw
+     * before WS-9 (Decision C). Reject = drop, never forward unverified. */
+    const uint8_t *frame = NULL;
+    size_t frame_len = 0;
+    if (!cmdauth_check_and_strip((const uint8_t *)payload, payload_len,
+                                 &frame, &frame_len)) {
+        ESP_LOGW(TAG, "mqtt downlink: command auth failed — dropping");
+        return;
+    }
+    payload = frame;
+    payload_len = frame_len;
+
     size_t total = sizeof(wups_net_downlink_v1_hdr_t) + topic_len + payload_len;
     if (total > WUPS_MAX_PAYLOAD) {
         ESP_LOGW(TAG, "mqtt downlink: %u + %u + hdr exceeds %u, dropping",

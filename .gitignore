@@ -50,3 +50,4 @@ docs/tmp/
 firmware-rp2040/src/.claude-flow/data/pending-insights.jsonl
 .gitignore
 firmware-rp2040/.claude-flow/data/pending-insights.jsonl
+firmware-ESP32-LTE-M/.claude-flow/data/pending-insights.jsonl

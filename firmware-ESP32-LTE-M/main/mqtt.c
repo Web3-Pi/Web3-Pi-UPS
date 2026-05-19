@@ -174,10 +174,10 @@ esp_err_t mqtt_client_start(void)
         /* TLS via the bundled root CA list — covers Let's Encrypt. */
         .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
 
-        /* Per-device credentials (ADR-0005): username = ICCID,
-         * password = hex(HMAC-SHA256(MASTER_SECRET, ICCID)).
-         * Client ID = ICCID too so two boots of the same device cleanly
-         * displace each other on the broker. */
+        /* Per-device credentials (Track 0 / WS-10; ADR-0005 superseded):
+         * username = ICCID, password = the per-device secret read from the
+         * `prov` NVS partition (see identity.c). Client ID = ICCID too so
+         * two boots of the same device cleanly displace each other. */
         .credentials.client_id = iccid,
         .credentials.username  = iccid,
         .credentials.authentication.password = password,

@@ -16,6 +16,11 @@ CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
 # --- Flash size (board has 16 MB) ---
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 
+# --- Custom partition table (Track 0 / WS-10): adds the `prov` NVS
+#     partition for the per-device MQTT secret. See partitions.csv. ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
 # --- TLS: use the mbedTLS-bundled root CA store so esp-mqtt can verify
 #         broker.w3p.ovh's Let's Encrypt cert without us having to embed
 #         certs ourselves. ---

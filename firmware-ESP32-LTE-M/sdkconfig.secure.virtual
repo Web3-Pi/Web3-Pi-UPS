@@ -1,0 +1,16 @@
+# Track 3 — DRY-RUN ONLY overlay. Layered on top of sdkconfig.secure.
+# Emulates the eFuses in flash so the full signed-boot + flash-encryption
+# path can be rehearsed on the single desk board with ZERO irreversible
+# OTP writes. NEVER include this layer in the real-burn build.
+#
+# KEEP_IN_FLASH persists the virtual eFuse block across reboots so Secure
+# Boot v2 / FE behave across power cycles, not just within one boot.
+CONFIG_EFUSE_VIRTUAL=y
+CONFIG_EFUSE_VIRTUAL_KEEP_IN_FLASH=y
+
+# KEEP_IN_FLASH requires a dedicated `efuse` partition. Swap in the
+# dry-run partition table (canonical layout + appended efuse_em) ONLY
+# for the dry-run; the real-burn build keeps the canonical partitions.csv
+# from sdkconfig.defaults. Without this the bootloader aborts in the FE
+# pass: "[Virtual] no efuse partition in partition_table?".
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.secure-dryrun.csv"
