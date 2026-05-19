@@ -6,6 +6,7 @@
 #include <string.h>
 #include "wups_proto.h"
 #include "wups_router.h"
+#include "trust_ui.h"
 
 // --- I2C for OLED ---
 constexpr uint8_t I2C0_SDA_PIN = 8;
@@ -971,6 +972,18 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     return;
   }
 
+  // ui.trust_prompt (Track 2 / ADR-0011 §10.1/§10.4) — the ESP32 drives
+  // the Paranoic owner-binding gate. The OLED + 2 buttons are RP2040-only,
+  // so the physical confirm lives here (scoped, owner-approved Decision-C
+  // exception). We are a dumb renderer: hand it to trust_ui, which takes
+  // over the display + buttons and emits ui.trust_result. No CMD response
+  // forwarding — this is an internal ESP32↔RP2040 round-trip.
+  if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_TRUST_PROMPT &&
+      (f.flags & WUPS_FLAG_REQ)) {
+    trust_ui_on_prompt(f.payload, f.len, f.seq);
+    return;
+  }
+
   // ui.beep → play a tone on the buzzer. Lets a remote operator (web
   // panel, local CLI, …) verify the round-trip path reaches *this*
   // device — sound is end-to-end proof the command landed on the right
@@ -1315,6 +1328,18 @@ void loop() {
   // Shovel as much of the debug ring buffer as the SerialPIO HW FIFO can
   // accept, then return. Non-blocking, runs every loop iteration (~50 ms).
   dbgRing.pump(dbgSerial);
+
+  // Track 2 / ADR-0011 §10.1/§10.4 — the Paranoic owner-binding gate is a
+  // security override: while a ui.trust_prompt is active the trust UI owns
+  // the OLED and both buttons, and the normal dashboard / navigation is
+  // fully suppressed. Buttons are active-LOW with pullups (LOW = pressed).
+  if (trust_ui_active()) {
+    trust_ui_tick(oled,
+                  digitalRead(BTN_LEFT_PIN)  == LOW,
+                  digitalRead(BTN_RIGHT_PIN) == LOW);
+    delay(50);
+    return;
+  }
 
   // Read ADC values (single sample, EMA filtering handles noise)
   int rawBattVolt = analogRead(ADC_BATT_VOLT_PIN);
