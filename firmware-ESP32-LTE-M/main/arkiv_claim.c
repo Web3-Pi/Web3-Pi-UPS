@@ -114,7 +114,7 @@ static uint64_t num_attr(const cJSON *arr, const char *key)
  * entry"). Rotated on TTL expiry. */
 static uint8_t  s_boot_nonce[ARKIV_BOOT_NONCE_LEN];
 static uint8_t  s_local_cc[ARKIV_CC_BYTES];      /* canonical claim-code   */
-static char     s_cc_words[96];                  /* 6 BIP39 words for OLED */
+static char     s_cc_words[96];                  /* 4 BIP39 words for OLED */
 
 static void claim_code_regen(void)
 {

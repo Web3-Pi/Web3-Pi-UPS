@@ -49,9 +49,9 @@
  *                       the §4.3 / §10.1 authority — verified, not trusted)
  *   stringAttributes : type="w3pups-claim", device_id=<ICCID>,
  *                      owner_pub=<128 hex: owner secp256k1 X||Y, no 04>,
- *                      claim_code=<18 hex: §10.4 front-running token,
+ *                      claim_code=<12 hex: §10.4 front-running token,
  *                          bip39_pack_top_bits(keccak(device_pub||
- *                          boot_nonce), 66) — 9 bytes, low 6 bits 0>,
+ *                          boot_nonce), 44) — 6 bytes, low 4 bits 0>,
  *                      sig=<128 hex: owner secp256k1 r||s, low-S, over
  *                          the EIP-191 personal_sign of the binding
  *                          digest below — see note>
@@ -63,7 +63,7 @@
  *   bind = keccak256( "w3pups-claim\0"     (13 bytes incl. NUL)
  *            || device_id_ascii            (ICCID, no NUL)
  *            || owner_pub                  (64 bytes)
- *            || claim_code                 (9 bytes, canonical form)
+ *            || claim_code                 (6 bytes, canonical form)
  *            || epoch                      (uint32 little-endian) )
  *
  * Browser wallets cannot raw-sign an arbitrary hash, so the owner signs
@@ -88,12 +88,15 @@
 #define ARKIV_FP_WORDS          4
 #define ARKIV_FP_CHECKSUM_BITS  16
 
-/* §10.4 claim-code: top 66 bits of keccak(device_pub||boot_nonce) → 6
- * BIP39 words; canonical on-chain form is those 66 bits packed into 9
- * bytes (low 6 bits zero), see bip39_pack_top_bits(). */
-#define ARKIV_CC_WORDS          6
-#define ARKIV_CC_BITS           66
-#define ARKIV_CC_BYTES          9
+/* §10.4 claim-code: top 44 bits of keccak(device_pub||boot_nonce) → 4
+ * BIP39 words (canon allows 4–6; 4 fits the 64x32 OLED on one screen and
+ * the token's secrecy rests on physical OLED sight + gas-costed on-chain
+ * guessing in a 15-min window, not on bit length). Canonical on-chain
+ * form = those 44 bits packed into 6 bytes (low 4 bits zero), see
+ * bip39_pack_top_bits(). MUST stay byte-identical to WS-4 (claim.ts). */
+#define ARKIV_CC_WORDS          4
+#define ARKIV_CC_BITS           44
+#define ARKIV_CC_BYTES          6
 #define ARKIV_BOOT_NONCE_LEN    16
 
 /* §10.4 / §10.9-2: the claim-code is regenerated on each UNCLAIMED entry
