@@ -186,6 +186,21 @@ static void pub_to_addr(const uint8_t pub[PUB_LEN], uint8_t addr[ADDR_LEN])
     memcpy(addr, h + 12, ADDR_LEN);
 }
 
+/* EIP-191 personal_sign wrap of a 32-byte digest. Browser wallets
+ * (MetaMask/wagmi, WS-4) cannot raw-sign an arbitrary hash; the owner
+ * signs the binding digest via personal_sign, so the device must verify
+ * against keccak256("\x19Ethereum Signed Message:\n32" || digest) — the
+ * exact preimage viem's signMessage({raw}) hashes for a 32-byte message. */
+static void eip191_wrap(const uint8_t digest[32], uint8_t out[32])
+{
+    static const char PFX[] = "\x19" "Ethereum Signed Message:\n32";
+    arkiv_keccak256_ctx kx;
+    arkiv_keccak256_init(&kx);
+    arkiv_keccak256_update(&kx, (const uint8_t *)PFX, sizeof(PFX) - 1);
+    arkiv_keccak256_update(&kx, digest, 32);
+    arkiv_keccak256_finish(&kx, out);
+}
+
 /* --- claim verification + trust gate --------------------------------- */
 
 /* Verify one candidate entity and, if it checks out, run the OLED gate.
@@ -228,9 +243,10 @@ static bool try_candidate(const cJSON *e, const char *iccid)
 
     /* 3. The owner key itself must have signed the binding for THIS device
      *    (so a lying RPC that forged `writer` still can't bind anyone). */
-    uint8_t digest[32];
+    uint8_t digest[32], signed_digest[32];
     claim_binding_digest(iccid, owner_pub, s_local_cc, epoch, digest);
-    if (arkiv_secp256k1_verify(owner_pub, digest, sig) != 1) {
+    eip191_wrap(digest, signed_digest);  /* owner used personal_sign (WS-4) */
+    if (arkiv_secp256k1_verify(owner_pub, signed_digest, sig) != 1) {
         ESP_LOGW(TAG, "owner claim signature INVALID — ignoring");
         return false;
     }

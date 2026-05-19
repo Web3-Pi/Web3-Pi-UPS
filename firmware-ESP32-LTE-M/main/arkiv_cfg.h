@@ -53,17 +53,24 @@
  *                          bip39_pack_top_bits(keccak(device_pub||
  *                          boot_nonce), 66) — 9 bytes, low 6 bits 0>,
  *                      sig=<128 hex: owner secp256k1 r||s, low-S, over
- *                          the claim binding digest below>
+ *                          the EIP-191 personal_sign of the binding
+ *                          digest below — see note>
  *   numericAttributes: epoch=<key_epoch the binding starts at>
  *
  * Claim binding digest (owner proves the owner key authorised binding to
  * THIS device — defence beyond the Arkiv-reported writer):
  *
- *   keccak256( "w3pups-claim\0"            (13 bytes incl. NUL)
+ *   bind = keccak256( "w3pups-claim\0"     (13 bytes incl. NUL)
  *            || device_id_ascii            (ICCID, no NUL)
  *            || owner_pub                  (64 bytes)
  *            || claim_code                 (9 bytes, canonical form)
  *            || epoch                      (uint32 little-endian) )
+ *
+ * Browser wallets cannot raw-sign an arbitrary hash, so the owner signs
+ * `bind` via EIP-191 personal_sign and `sig` verifies against
+ *   keccak256("\x19" "Ethereum Signed Message:\n32" || bind)
+ * (exactly what viem signMessage({raw: bind}) hashes). owner_pub is
+ * recovered from that same signature browser-side (WS-4).
  *
  * Device check order (fail-closed, drop on any miss): device_id == own
  * ICCID; claim_code == locally derived (proves physical OLED sight, §10.4);
