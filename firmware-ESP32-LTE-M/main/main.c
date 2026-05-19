@@ -32,6 +32,7 @@
 #include "identity.h"
 #include "cmdauth.h"
 #include "cmdauth_arkiv.h"
+#include "arkiv_rpc.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -134,6 +135,11 @@ void app_main(void)
 
     /* Hand the UART over to the bidirectional bridge. */
     modem_at_pass_through_start();
+
+    /* Track 2 / ADR-0011: start the Arkiv command poll task. Self-gating —
+     * idles until the device is Arkiv-provisioned + owner-bound; harmless
+     * (and fail-closed) for Default/MQTT devices. */
+    arkiv_poll_start();
 
     /* Keep emitting a heartbeat so the host sees the firmware is still alive
      * even when no AT traffic is happening. */

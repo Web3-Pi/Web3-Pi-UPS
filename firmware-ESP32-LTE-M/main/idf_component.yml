@@ -9,3 +9,6 @@ dependencies:
   # esp-mqtt was moved out of the ESP-IDF tree into the component manager
   # in v6.0+. Same code, just a different home.
   espressif/mqtt: "*"
+  # cJSON for Arkiv JSON-RPC parsing (Track 2 / ADR-0011). The same
+  # official Espressif-registry component the Arkiv PoC used.
+  espressif/cjson: "^1"

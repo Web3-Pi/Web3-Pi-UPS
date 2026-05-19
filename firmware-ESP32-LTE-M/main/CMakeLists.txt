@@ -1,6 +1,6 @@
 idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "mqtt.c"
                             "wups_link.c" "identity.c" "cmdauth.c"
-                            "cmdauth_arkiv.c"
+                            "cmdauth_arkiv.c" "arkiv_rpc.c"
                        PRIV_REQUIRES spi_flash esp_timer
                                      esp_driver_i2c esp_driver_gpio
                                      esp_driver_uart
@@ -8,4 +8,5 @@ idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "mqtt.c"
                                      esp_http_client esp-tls lwip
                                      espressif__mqtt
                                      mbedtls microecc arkiv_crypto
+                                     espressif__cjson
                        INCLUDE_DIRS "")
