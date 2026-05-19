@@ -23,7 +23,8 @@
  *
  *   on-chain writer  = owner EOA (Arkiv-native; the §4.3 authority check)
  *   stringAttributes : type="w3pups-cmd", device_id=<ICCID>,
- *                      sig=<128 hex: owner secp256k1 r||s over the frame>
+ *                      sig=<128 hex: owner secp256k1 r||s over
+ *                           keccak256(canonical WUPS frame), low-S>
  *   numericAttributes: seq=<monotonic per owner|device>, epoch=<key_epoch>
  *   payload          = the canonical WUPS frame, base64 (owner-signed)
  *

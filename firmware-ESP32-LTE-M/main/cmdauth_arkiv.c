@@ -7,6 +7,7 @@
 #include "nvs_flash.h"
 
 #include "arkiv_crypto/secp256k1.h"
+#include "arkiv_crypto/keccak256.h"
 
 #define TAG "cmdauth_arkiv"
 
@@ -17,18 +18,28 @@
 
 /* writable runtime state (default `nvs`) — separate from WS-9's w3wsec. */
 #define STATE_NAMESPACE "w3arkiv"
-#define KEY_OWNER_ADDR  "owner_addr"    /* 20 B — bound at OLED confirm only */
+#define KEY_OWNER_PUB   "owner_pub"     /* 64 B X||Y — bound at OLED confirm */
 #define KEY_KEY_EPOCH   "key_epoch"     /* u32 — revocation/ratchet (§4.5)   */
 #define KEY_LAST_CTR    "last_ctr"      /* u64 — monotonic replay baseline   */
 #define KEY_CUR_BLOCK   "cur_block"     /* u64 — Braga cursor (§4.4)         */
 #define KEY_CLAIM_STATE "claim_state"   /* u8  — arkiv_claim_state_t         */
 
 #define ADDR_LEN 20
+#define PUB_LEN  64
 
 static bool                s_ready;
 static uint8_t             s_dev_addr[ADDR_LEN];
-static uint8_t             s_owner_addr[ADDR_LEN];
+static uint8_t             s_owner_pub[PUB_LEN];
+static uint8_t             s_owner_addr[ADDR_LEN]; /* derived from owner_pub */
 static bool                s_have_owner;
+
+/* Ethereum address from an uncompressed pubkey: keccak256(X||Y)[12:32]. */
+static void pub_to_addr(const uint8_t pub[PUB_LEN], uint8_t addr[ADDR_LEN])
+{
+    uint8_t h[32];
+    arkiv_keccak256(pub, PUB_LEN, h);
+    memcpy(addr, h + 12, ADDR_LEN);
+}
 static uint32_t            s_key_epoch;
 static uint64_t            s_last_ctr;
 static uint64_t            s_cur_block;
@@ -85,9 +96,10 @@ esp_err_t cmdauth_arkiv_init(void)
         ESP_LOGE(TAG, "state open failed: %s", esp_err_to_name(err));
         return err;
     }
-    size_t olen = sizeof(s_owner_addr);
-    if (nvs_get_blob(sh, KEY_OWNER_ADDR, s_owner_addr, &olen) == ESP_OK &&
-        olen == ADDR_LEN) {
+    size_t olen = sizeof(s_owner_pub);
+    if (nvs_get_blob(sh, KEY_OWNER_PUB, s_owner_pub, &olen) == ESP_OK &&
+        olen == PUB_LEN) {
+        pub_to_addr(s_owner_pub, s_owner_addr);
         s_have_owner = true;
     }
     if (nvs_get_u32(sh, KEY_KEY_EPOCH, &s_key_epoch) != ESP_OK) s_key_epoch = 0;
@@ -169,35 +181,38 @@ bool cmdauth_arkiv_check(const arkiv_cmd_t *cmd,
     }
 
     /* Defense-in-depth beyond the Arkiv-reported writer: the command frame
-     * itself must carry a valid OWNER signature, so a compromised RPC can't
-     * misreport `writer`. Verifying a sig against a stored ADDRESS needs
-     * ecrecover (recover pubkey → derive address → compare); arkiv_crypto
-     * currently exposes sign/verify but not recover. Wiring that (or
-     * pinning the owner pubkey at bind time) is P2-3. Until then this path
-     * is intentionally FAIL-CLOSED — no Arkiv command is accepted yet.
-     * TODO(P2-3): owner-signature-over-frame verification, then remove. */
-    ESP_LOGW(TAG, "owner-signature verification not yet wired (P2-3) — "
-             "rejecting (fail-closed)");
-    return false;
+     * itself MUST carry a valid OWNER signature, so a compromised RPC that
+     * lied about `writer` still cannot get a command executed. The owner
+     * signs keccak256(canonical WUPS frame) with the pinned owner key. */
+    uint8_t digest[32];
+    arkiv_keccak256(cmd->frame, cmd->frame_len, digest);
+    if (arkiv_secp256k1_verify(s_owner_pub, digest, cmd->sig) != 1) {
+        ESP_LOGW(TAG, "owner signature INVALID — dropping");
+        return false;
+    }
 
-    /* P2-3 will, on a valid owner signature, do:
-     *   s_last_ctr = cmd->counter; s_cur_block = cmd->block;
-     *   persist_progress(s_last_ctr, s_cur_block);
-     *   *frame = cmd->frame; *frame_len = cmd->frame_len; return true;
-     * (RP2040 then receives only the bare frame — Decision C.)
-     */
-    (void)frame;
-    (void)frame_len;
-    (void)persist_progress;
+    /* Accept: advance the replay baseline + block cursor, then hand the
+     * bare inner WUPS frame to the RP2040 (Decision C — it sees exactly
+     * what the Track 1 MQTT path delivers). */
+    s_last_ctr  = cmd->counter;
+    if (cmd->block > s_cur_block) s_cur_block = cmd->block;
+    if (!persist_progress(s_last_ctr, s_cur_block)) {
+        ESP_LOGW(TAG, "failed to persist progress (continuing)");
+    }
+    *frame     = cmd->frame;
+    *frame_len = cmd->frame_len;
+    ESP_LOGI(TAG, "Arkiv command verified (ctr=%llu, len=%u)",
+             (unsigned long long)cmd->counter, (unsigned)cmd->frame_len);
+    return true;
 }
 
-esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_addr[20], uint32_t epoch)
+esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_pub[64], uint32_t epoch)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
     nvs_handle_t sh;
     esp_err_t err = state_open(&sh, NVS_READWRITE);
     if (err != ESP_OK) return err;
-    err = nvs_set_blob(sh, KEY_OWNER_ADDR, owner_addr, ADDR_LEN);
+    err = nvs_set_blob(sh, KEY_OWNER_PUB, owner_pub, PUB_LEN);
     if (err == ESP_OK) err = nvs_set_u32(sh, KEY_KEY_EPOCH, epoch);
     /* Fresh counter namespace per owner (§10.6) so a previous owner's old
      * signed commands can never collide post-resale. */
@@ -207,7 +222,8 @@ esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_addr[20], uint32_t epoch)
     nvs_close(sh);
     if (err != ESP_OK) return err;
 
-    memcpy(s_owner_addr, owner_addr, ADDR_LEN);
+    memcpy(s_owner_pub, owner_pub, PUB_LEN);
+    pub_to_addr(s_owner_pub, s_owner_addr);
     s_have_owner = true;
     s_key_epoch = epoch;
     s_last_ctr = 0;
@@ -241,13 +257,14 @@ esp_err_t cmdauth_arkiv_clear(void)
     nvs_handle_t sh;
     esp_err_t err = state_open(&sh, NVS_READWRITE);
     if (err != ESP_OK) return err;
-    nvs_erase_key(sh, KEY_OWNER_ADDR);
+    nvs_erase_key(sh, KEY_OWNER_PUB);
     nvs_erase_key(sh, KEY_KEY_EPOCH);
     nvs_erase_key(sh, KEY_LAST_CTR);
     nvs_erase_key(sh, KEY_CUR_BLOCK);
     err = nvs_set_u8(sh, KEY_CLAIM_STATE, ARKIV_UNCLAIMED);
     if (err == ESP_OK) err = nvs_commit(sh);
     nvs_close(sh);
+    memset(s_owner_pub, 0, PUB_LEN);
     memset(s_owner_addr, 0, ADDR_LEN);
     s_have_owner = false;
     s_key_epoch = 0;

@@ -76,10 +76,14 @@ bool cmdauth_arkiv_check(const arkiv_cmd_t *cmd,
 /*
  * Bind / rebind the owner. MUST only be called by the OLED+2-button trust
  * gate after a physical confirm (§10.1) — never from the network path.
- * Persists owner_addr + key_epoch, resets the counter namespace (fresh
- * per-owner, §10.6), sets claim_state = ARKIV_CLAIMED.
+ * Takes the owner's uncompressed secp256k1 PUBLIC key (64 B, X||Y, no 0x04
+ * prefix): the address for the §4.3 writer check is derived from it
+ * (keccak256[12:]), and it is used to verify the owner signature over each
+ * command frame (so a lying RPC cannot forge `writer`). Persists owner_pub
+ * + key_epoch, resets the counter namespace (fresh per-owner, §10.6), sets
+ * claim_state = ARKIV_CLAIMED.
  */
-esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_addr[20], uint32_t epoch);
+esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_pub[64], uint32_t epoch);
 
 /* Accept an owner-signed epoch bump (revocation/ratchet, §4.5): monotonic
  * upward only. Caller must have verified the bump was owner-signed. */
