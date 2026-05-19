@@ -48,6 +48,15 @@
 static SemaphoreHandle_t s_tx_mutex;
 static uint8_t s_tx_seq;
 
+/* Track 2 / ADR-0011 — trust-anchor REQ/RESP correlation. The claim
+ * driver arms a nonce, sends ui.trust_prompt, then blocks on s_trust_sig;
+ * the RX path matches ui.trust_result by nonce and releases it. Only one
+ * prompt is ever in flight (single caller). */
+static SemaphoreHandle_t s_trust_sig;
+static volatile uint32_t s_trust_nonce;
+static volatile uint8_t  s_trust_result;
+static volatile bool     s_trust_armed;
+
 /* Diagnostic counters — surfaced via wups_link_log_stats(). */
 static volatile uint32_t s_frames_tx = 0;
 static volatile uint32_t s_frames_rx = 0;
@@ -154,6 +163,56 @@ void wups_link_send(uint8_t dst, uint8_t cls, uint8_t op, uint8_t flags,
                     payload, payload_len);
 }
 
+/* --- trust-anchor (Track 2 / ADR-0011 §10.1/§10.4) --------------------- */
+
+void wups_link_trust_prompt(uint8_t mode, uint8_t confirm_secs,
+                            uint32_t nonce, const char *text)
+{
+    size_t tl = text ? strlen(text) : 0;
+    const size_t cap = WUPS_MAX_PAYLOAD - sizeof(wups_ui_trust_prompt_v1_hdr_t);
+    if (tl > cap) {
+        ESP_LOGW(TAG, "trust_prompt text %u > cap %u — truncating",
+                 (unsigned)tl, (unsigned)cap);
+        tl = cap;
+    }
+
+    uint8_t buf[WUPS_MAX_PAYLOAD];
+    wups_ui_trust_prompt_v1_hdr_t hdr = {
+        .version      = 1,
+        .mode         = mode,
+        .confirm_secs = confirm_secs,
+        .text_len     = (uint8_t)tl,
+        .nonce        = nonce,
+    };
+    memcpy(buf, &hdr, sizeof(hdr));
+    if (tl) memcpy(buf + sizeof(hdr), text, tl);
+
+    /* Arm before sending so a fast RP2040 reply can't beat the wait. A
+     * display-only prompt (confirm_secs == 0) expects no result, so don't
+     * arm — keeps a stale nonce from swallowing a later real result. */
+    if (confirm_secs > 0) {
+        s_trust_nonce  = nonce;
+        s_trust_result = 1;                 /* default = timeout */
+        s_trust_armed  = true;
+        xSemaphoreTake(s_trust_sig, 0);     /* drain any stale signal */
+    }
+    wups_link_send(WUPS_ADDR_RP2040, WUPS_CLASS_UI, WUPS_OP_UI_TRUST_PROMPT,
+                   WUPS_FLAG_REQ, buf,
+                   (uint16_t)(sizeof(hdr) + tl));
+}
+
+esp_err_t wups_link_trust_wait(uint32_t nonce, uint32_t timeout_ms,
+                               uint8_t *result_out)
+{
+    if (!s_trust_armed || s_trust_nonce != nonce) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_trust_sig, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        s_trust_armed = false;
+        return ESP_ERR_TIMEOUT;
+    }
+    if (result_out) *result_out = s_trust_result;
+    return ESP_OK;
+}
+
 /* --- dispatch ---------------------------------------------------------- */
 
 static void handle_net_publish(const uint8_t *payload, uint16_t len)
@@ -254,7 +313,29 @@ static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
         /* status / downlink / time_sync are outbound from us; drop. */
         return;
     }
-    /* power / host / ui — ESP32 is a dumb pipe to MQTT (CLAUDE.md). RP2040
+    if (cls == WUPS_CLASS_UI) {
+        /* Track 2 / ADR-0011 §10.1/§10.4 — the trust-anchor RESP from the
+         * RP2040 OLED gate. This is the ONLY UI frame the ESP32 consumes;
+         * the ESP32 stays the sole authority (it never trusts the RP2040
+         * to decide ownership — only to report the physical button hold).
+         * Every other UI op is RP2040-local; the ESP32 ignores it. */
+        if (op == WUPS_OP_UI_TRUST_RESULT && (flags & WUPS_FLAG_RESP) &&
+            len >= sizeof(wups_ui_trust_result_v1_t)) {
+            wups_ui_trust_result_v1_t r;
+            memcpy(&r, payload, sizeof(r));
+            if (r.version == 1 && s_trust_armed && r.nonce == s_trust_nonce) {
+                s_trust_result = r.result;
+                s_trust_armed  = false;
+                xSemaphoreGive(s_trust_sig);
+            } else {
+                ESP_LOGW(TAG, "trust_result dropped (armed=%d nonce=%lu/%lu)",
+                         (int)s_trust_armed, (unsigned long)r.nonce,
+                         (unsigned long)s_trust_nonce);
+            }
+        }
+        return;
+    }
+    /* power / host — ESP32 is a dumb pipe to MQTT (CLAUDE.md). RP2040
      * decides what reaches the panel by issuing net.publish REQs; we don't
      * second-guess class semantics here. */
 }
@@ -436,6 +517,9 @@ esp_err_t wups_link_init(void)
 {
     s_tx_mutex = xSemaphoreCreateMutex();
     if (!s_tx_mutex) return ESP_ERR_NO_MEM;
+
+    s_trust_sig = xSemaphoreCreateBinary(); /* starts empty */
+    if (!s_trust_sig) return ESP_ERR_NO_MEM;
 
     rx_reset();
 

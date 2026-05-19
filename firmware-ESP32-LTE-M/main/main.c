@@ -33,6 +33,7 @@
 #include "cmdauth.h"
 #include "cmdauth_arkiv.h"
 #include "arkiv_rpc.h"
+#include "arkiv_claim.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -140,6 +141,11 @@ void app_main(void)
      * idles until the device is Arkiv-provisioned + owner-bound; harmless
      * (and fail-closed) for Default/MQTT devices. */
     arkiv_poll_start();
+
+    /* Track 2 / ADR-0011 §10.1/§10.4 path B: owner-binding driver. Also
+     * self-gating — only runs while Arkiv-provisioned + UNCLAIMED; shows
+     * the claim-code, polls w3pups-claim, drives the OLED trust anchor. */
+    arkiv_claim_start();
 
     /* Keep emitting a heartbeat so the host sees the firmware is still alive
      * even when no AT traffic is happening. */

@@ -59,6 +59,11 @@ arkiv_claim_state_t cmdauth_arkiv_claim_state(void);
 /* Device Ethereum address (20 bytes). Valid after a successful init. */
 const uint8_t *cmdauth_arkiv_device_addr(void);
 
+/* Device uncompressed secp256k1 public key (64 B, X||Y, no 0x04 prefix).
+ * Valid after a successful init. Used to derive the §10.4 claim-code
+ * (keccak(device_pub||boot_nonce)) — public, safe to expose. */
+const uint8_t *cmdauth_arkiv_device_pub(void);
+
 /* Highest Braga block processed (replay cursor, §4.4 fromBlock). 0 = none. */
 uint64_t cmdauth_arkiv_cursor_block(void);
 

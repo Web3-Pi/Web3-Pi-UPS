@@ -29,6 +29,7 @@
 
 static bool                s_ready;
 static uint8_t             s_dev_addr[ADDR_LEN];
+static uint8_t             s_dev_pub[PUB_LEN];
 static uint8_t             s_owner_pub[PUB_LEN];
 static uint8_t             s_owner_addr[ADDR_LEN]; /* derived from owner_pub */
 static bool                s_have_owner;
@@ -81,9 +82,10 @@ esp_err_t cmdauth_arkiv_init(void)
                  esp_err_to_name(err));
         return ESP_ERR_NOT_FOUND;
     }
-    if (arkiv_secp256k1_derive_address(dev_priv, s_dev_addr) != 0) {
+    if (arkiv_secp256k1_derive_address(dev_priv, s_dev_addr) != 0 ||
+        arkiv_secp256k1_derive_pubkey(dev_priv, s_dev_pub) != 0) {
         memset(dev_priv, 0, sizeof(dev_priv));
-        ESP_LOGE(TAG, "device address derivation failed");
+        ESP_LOGE(TAG, "device key derivation failed");
         return ESP_FAIL;
     }
     memset(dev_priv, 0, sizeof(dev_priv)); /* don't leave the key on stack */
@@ -121,6 +123,7 @@ esp_err_t cmdauth_arkiv_init(void)
 bool cmdauth_arkiv_ready(void) { return s_ready; }
 arkiv_claim_state_t cmdauth_arkiv_claim_state(void) { return s_claim_state; }
 const uint8_t *cmdauth_arkiv_device_addr(void) { return s_dev_addr; }
+const uint8_t *cmdauth_arkiv_device_pub(void) { return s_dev_pub; }
 uint64_t cmdauth_arkiv_cursor_block(void) { return s_cur_block; }
 
 static bool persist_progress(uint64_t ctr, uint64_t block)

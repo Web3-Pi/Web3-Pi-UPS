@@ -90,6 +90,20 @@ esp_err_t arkiv_eth_block_number(uint64_t *out_block)
     return rc;
 }
 
+esp_err_t arkiv_rpc_query(const char *filter, char *resp, size_t resp_cap)
+{
+    if (!filter || !resp || resp_cap == 0) return ESP_ERR_INVALID_ARG;
+    char body[640];
+    int n = snprintf(body, sizeof(body),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"arkiv_query\",\"params\":["
+        "\"%s\","
+        "{\"includeData\":{\"key\":true,\"attributes\":true,\"payload\":true,"
+        "\"contentType\":false,\"owner\":true,\"creator\":true,"
+        "\"expiration\":false},\"resultsPerPage\":\"0xa\"}]}", filter);
+    if (n <= 0 || n >= (int)sizeof(body)) return ESP_FAIL;
+    return rpc_post(body, resp, resp_cap);
+}
+
 /* --- helpers ---------------------------------------------------------- */
 
 static int hexnib(char c)

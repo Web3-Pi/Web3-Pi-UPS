@@ -45,3 +45,28 @@ void wups_link_send_seq(uint8_t dst, uint8_t cls, uint8_t op,
 /* Diagnostic — log frame and byte counts at INFO level. Useful to call
  * from a periodic heartbeat to confirm the UART2 link is actually live. */
 void wups_link_log_stats(void);
+
+/*
+ * Track 2 / ADR-0011 §10.1/§10.4 — trust-anchor round-trip with the
+ * RP2040 OLED gate (the OLED + 2 buttons are RP2040-only; scoped,
+ * owner-approved exception to Decision C, RP2040 stays a dumb renderer).
+ *
+ * Send a ui.trust_prompt REQ: the RP2040 renders `text` verbatim
+ * (mode 0 = owner fingerprint to compare, mode 1 = claim-code to
+ * transcribe) and, if confirm_secs > 0, runs the both-button hold.
+ * confirm_secs == 0 means display-only (no result expected, e.g. the
+ * claim-code screen). The claim driver is the only caller (single
+ * in-flight prompt).
+ */
+void wups_link_trust_prompt(uint8_t mode, uint8_t confirm_secs,
+                            uint32_t nonce, const char *text);
+
+/*
+ * Block up to `timeout_ms` for the ui.trust_result whose nonce matches
+ * `nonce` (set by the preceding wups_link_trust_prompt()). On a match
+ * writes the result code (0=confirmed, 1=timeout, 2=cancelled) to
+ * *result_out and returns ESP_OK; ESP_ERR_TIMEOUT if none arrived;
+ * ESP_ERR_INVALID_STATE if `nonce` isn't the armed one.
+ */
+esp_err_t wups_link_trust_wait(uint32_t nonce, uint32_t timeout_ms,
+                               uint8_t *result_out);

@@ -1,7 +1,8 @@
 idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "mqtt.c"
                             "wups_link.c" "identity.c" "cmdauth.c"
                             "cmdauth_arkiv.c" "arkiv_rpc.c"
-                       PRIV_REQUIRES spi_flash esp_timer
+                            "arkiv_claim.c" "bip39.c"
+                       PRIV_REQUIRES spi_flash esp_timer esp_hw_support
                                      esp_driver_i2c esp_driver_gpio
                                      esp_driver_uart
                                      esp_event esp_netif nvs_flash
