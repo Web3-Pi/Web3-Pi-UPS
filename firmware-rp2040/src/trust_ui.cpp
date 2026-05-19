@@ -137,11 +137,6 @@ static void draw_paged(Adafruit_SSD1306& oled)
         oled.setCursor(0, r * 8);
         oled.print(lines[li]);
     }
-    /* Bottom progress bar (multi-page only) so the user knows to wait
-     * for the rest of the text to cycle around. */
-    if (pages > 1)
-        oled.fillRect(0, 31, (int)((page + 1) * 64 / pages), 1,
-                      SSD1306_WHITE);
     oled.display();
 }
 
@@ -198,8 +193,6 @@ static void draw_claim_code(Adafruit_SSD1306& oled)
             oled.print(w);
         }
     }
-    /* 2-page progress bar (same affordance as draw_paged). */
-    oled.fillRect(0, 31, (int)((page + 1) * 64 / 2), 1, SSD1306_WHITE);
     oled.display();
 }
 
