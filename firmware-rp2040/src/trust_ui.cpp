@@ -184,11 +184,10 @@ static void draw_claim_code(Adafruit_SSD1306& oled)
             if (!*p) break;
             char w[SCR_COLS + 1];
             uint8_t c = 0;
-            w[c++] = (char)('1' + idx);
-            w[c++] = ':';
             /* Uppercase the BIP39 word — far more legible on the 64x32
              * OLED. Display-only: the contract is the word→index map, and
-             * the Panel lowercases input, so case never affects bytes. */
+             * the Panel lowercases input, so case never affects bytes.
+             * No "n:" prefix — one word per line reads cleaner. */
             while (*p && *p != ' ' && c < SCR_COLS) {
                 char ch = *p++;
                 if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
