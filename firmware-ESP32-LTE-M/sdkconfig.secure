@@ -1,0 +1,43 @@
+# Track 3 — hardware foundation build profile: Flash Encryption
+# (DEVELOPMENT mode). Layered ON TOP of sdkconfig.defaults; the normal
+# flotylla build never sees this file. Carries NO key material.
+#
+#   Dry-run  : SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.secure;sdkconfig.secure.virtual"
+#   Real burn: SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.secure"   (NO .virtual)
+#
+# The real-burn config is byte-for-byte the dry-run config minus the
+# EFUSE_VIRTUAL layer — so what we prove virtually is what we burn.
+#
+# SCOPE DECISION (owner, 2026-05-19): Track 3 on the single desk board is
+# Flash-Encryption-ONLY. Secure Boot v2 is deliberately NOT enabled here:
+# the SB-v2 signed bootloader on ESP32-S3 is ~0xb000 and overflows the
+# 0x8000 ceiling set by the partition-table offset, which would force a
+# canonical partitions.csv migration (PT offset, nvs/phy/factory shift,
+# prov 0x310000->0x320000) and re-provisioning — blast radius on the
+# Track 0 mechanism that is already verified on hardware. SB v2 + that
+# flash-map migration is captured as a deferred decision in ADR-0010
+# (better aligned with the rev2 / production line than rushed onto the
+# only working board). Flash Encryption alone closes the residual that
+# ADR-0008/0009 explicitly name: a captured powered-off unit's per-device
+# secret + freshness counter are no longer software-extractable / rewritable.
+
+# --- Flash Encryption: DEVELOPMENT mode (NEVER release on the desk board) ---
+# Development mode burns the FE key (FE is permanently ON) but KEEPS the
+# plaintext UART/USB download path and leaves SPI_BOOT_CRYPT_CNT reflash
+# budget, so `idf.py flash --encrypt` keeps working — the dev loop survives.
+# RELEASE mode would burn DIS_DOWNLOAD_MANUAL_ENCRYPT and kill the loop;
+# it is deliberately NOT selected here.
+CONFIG_SECURE_FLASH_ENC_ENABLED=y
+CONFIG_SECURE_FLASH_ENCRYPTION_MODE_DEVELOPMENT=y
+
+# --- NVS encryption keyed by Flash Encryption (NOT the HMAC scheme) ---
+# Enabling FE auto-enables NVS_ENCRYPTION; IDF then defaults to the HMAC
+# key-protection scheme, which needs a dedicated eFuse HMAC key block and
+# fails the build with key ID -1. We deliberately select the
+# flash-encryption-based scheme instead: the `nvs` and `prov` partitions
+# (per-device MQTT secret, ADR-0008; freshness counter, ADR-0009) get
+# encrypted under the FE key, and we keep the eFuse HMAC key blocks FREE
+# for the Track 3 / ADR-0010 anti-rollback decision (HMAC-peripheral vs
+# DS-peripheral) instead of spending one here implicitly.
+CONFIG_NVS_SEC_KEY_PROTECT_USING_FLASH_ENC=y
+# CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC is not set

@@ -1,0 +1,19 @@
+# DRY-RUN ONLY partition table — canonical partitions.csv + an `efuse_em`
+# emulation partition. Referenced ONLY from sdkconfig.secure.virtual.
+#
+# WHY a separate file: EFUSE_VIRTUAL_KEEP_IN_FLASH needs a dedicated
+# `efuse` partition to persist the simulated eFuse block across reboots;
+# without it the bootloader aborts in the flash-encryption pass (caught
+# on hardware 2026-05-19). The REAL burn uses real eFuses and therefore
+# the unchanged canonical partitions.csv — Track 0 offsets (nvs 0x9000,
+# factory 0x10000, prov 0x310000) are byte-identical here too, so FE
+# behaviour on the real partitions is validated faithfully; the only
+# delta is the extra emulation-backing region appended AFTER prov in
+# otherwise-free 16 MB flash. It never ships.
+#
+# Name,     Type, SubType, Offset,    Size,     Flags
+nvs,        data, nvs,     0x9000,    0x6000,
+phy_init,   data, phy,     0xf000,    0x1000,
+factory,    app,  factory, 0x10000,   0x300000,
+prov,       data, nvs,     0x310000,  0x4000,
+efuse_em,   data, efuse,   0x314000,  0x2000,

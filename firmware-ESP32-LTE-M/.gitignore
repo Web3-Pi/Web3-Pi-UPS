@@ -36,9 +36,25 @@ main/secrets.h
 # transient gen CSV carry the CLEARTEXT per-device secret — never commit.
 /prov-out/
 
+# ruflo / claude-flow runtime data — auto-generated, machine-local, not source
+.claude-flow/data/
+
+# Track 3 / hardware foundation: the Secure Boot v2 signing key + Flash
+# Encryption key are CRITICAL secrets. Losing the SB key bricks the ability
+# to reflash a fused board; committing it defeats Secure Boot entirely.
+# Owner archives these OUTSIDE the repo. Never commit. The secure build
+# profile (sdkconfig.secure) carries NO key material and IS committed.
+/secure/
+*.pem
+flash_encryption_key.bin
+secure_boot_signing_key*.pem
+
 # Build artifacts and directories
 **/build/
 build/
+# Custom ESP-IDF build dirs (build_fe, build_secure, etc.)
+build_*/
+**/build_*/
 *.o
 *.a
 *.out
