@@ -122,6 +122,15 @@ typedef enum {
     WUPS_OP_UI_SET_SCREEN     = 0x02,
     WUPS_OP_UI_BEEP           = 0x03,
     WUPS_OP_UI_DISPLAY_MSG    = 0x04,
+    /* Track 2 / ADR-0011 — Paranoic owner-binding trust-anchor gate
+       (plan §10.1/§10.4). The OLED + 2 buttons are RP2040-only, so the
+       physical confirm necessarily lives here (a scoped, documented
+       exception to the Track-1 "RP2040 unchanged" Decision C, owner-
+       approved). The RP2040 only renders text + runs the 2-button hold;
+       it never interprets the fingerprint/claim-code — the ESP32 stays
+       the sole authority and the in-board link stays the trust boundary. */
+    WUPS_OP_UI_TRUST_PROMPT   = 0x05,  /* ESP32→RP2040 REQ  */
+    WUPS_OP_UI_TRUST_RESULT   = 0x06,  /* RP2040→ESP32 RESP */
 } wups_op_ui_t;
 
 /* ---- Capability bitmap (used in system.hello) ---------------------------- */
@@ -311,6 +320,30 @@ typedef struct WUPS_PACKED {
     uint8_t  reserved;
     /* text[text_len] follows */
 } wups_ui_display_msg_v1_hdr_t;
+
+/* ui.trust_prompt — ESP32→RP2040 REQ (Track 2 / ADR-0011, §10.1/§10.4).
+ * Drives the physical trust-anchor screen. ASCII text follows the header:
+ * the human-verifiable owner fingerprint (mode 0) or the device claim-code
+ * (mode 1). The RP2040 renders it verbatim and runs a both-buttons hold of
+ * `confirm_secs`; it never parses the text. `nonce` correlates the reply. */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 1 */
+    uint8_t  mode;           /* 0 = owner-bind fingerprint, 1 = claim-code */
+    uint8_t  confirm_secs;   /* both-button hold to confirm (e.g. 5)       */
+    uint8_t  text_len;       /* bytes of ASCII following                   */
+    uint32_t nonce;          /* echoed in wups_ui_trust_result_v1_t        */
+    /* char text[text_len] follows */
+} wups_ui_trust_prompt_v1_hdr_t;
+
+/* ui.trust_result — RP2040→ESP32 RESP (SEQ echoes the prompt's). The
+ * physical confirm outcome. Only result==0 (confirmed) authorises the
+ * ESP32 to bind the owner; anything else is a no-op. */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 1 */
+    uint8_t  result;         /* 0 = confirmed, 1 = timeout, 2 = cancelled */
+    uint8_t  reserved[2];
+    uint32_t nonce;          /* echoes the prompt nonce */
+} wups_ui_trust_result_v1_t;
 
 /* ---- Fletcher-8 (UBX-compatible) ---------------------------------------- */
 
