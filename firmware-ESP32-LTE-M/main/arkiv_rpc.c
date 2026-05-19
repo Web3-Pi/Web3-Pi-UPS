@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "mbedtls/base64.h"
 #include "cJSON.h"
 
@@ -52,7 +53,13 @@ static esp_err_t rpc_post(const char *body, char *resp, size_t resp_cap)
         .timeout_ms    = ARKIV_HTTP_TIMEOUT_MS,
         .event_handler = http_evt,
         .user_data     = &ctx,
-        .crt_bundle_attach = NULL, /* TODO(P2-3): pin/attach CA bundle */
+        /* HTTPS to the public Braga RPC gateway: trust via the ESP-IDF
+         * mbedTLS cert bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y), the
+         * same anchor mqtt.c uses for mqtts. Without this the TLS
+         * handshake fails as ESP_ERR_HTTP_CONNECT even though PPP +
+         * plain HTTP + MQTTS are all up (plan §4.7: integrity-protected
+         * single gateway, availability deliberately not). */
+        .crt_bundle_attach = esp_crt_bundle_attach,
     };
     esp_http_client_handle_t cl = esp_http_client_init(&cfg);
     if (!cl) return ESP_FAIL;
