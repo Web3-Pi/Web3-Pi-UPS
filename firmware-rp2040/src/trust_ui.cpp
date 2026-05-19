@@ -145,6 +145,64 @@ static void draw_paged(Adafruit_SSD1306& oled)
     oled.display();
 }
 
+/* Claim-code screen (display-only, §10.4). The ESP32 sends exactly
+ * "ID:<iccid>\n<w1 w2 ...>". A generic word-wrap looked ragged (the long
+ * ICCID bled a stray word onto the ID page), so render two fixed pages:
+ *
+ *   page 0:  ID:                page 1:  1:<word1>
+ *            <iccid 0..9>                2:<word2>
+ *            <iccid 10..>                3:<word3>
+ *                                        4:<word4>
+ *
+ * Falls back to the generic pager if the text isn't in that shape. */
+static void draw_claim_code(Adafruit_SSD1306& oled)
+{
+    const char* nl = strchr(S.text, '\n');
+    if (!nl || strncmp(S.text, "ID:", 3) != 0) { draw_paged(oled); return; }
+
+    const char* id   = S.text + 3;          /* digits after "ID:"      */
+    size_t      idlen = (size_t)(nl - id);
+    const char* words = nl + 1;             /* space-separated words   */
+
+    uint8_t page = (uint8_t)((millis() / PAGE_MS) % 2);
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+
+    if (page == 0) {
+        oled.setCursor(0, 0);
+        oled.print(F("ID:"));
+        uint8_t row = 1;
+        for (size_t i = 0; i < idlen && row < SCR_ROWS; i += SCR_COLS, ++row) {
+            char chunk[SCR_COLS + 1];
+            size_t n = idlen - i;
+            if (n > SCR_COLS) n = SCR_COLS;
+            memcpy(chunk, id + i, n);
+            chunk[n] = '\0';
+            oled.setCursor(0, row * 8);
+            oled.print(chunk);
+        }
+    } else {
+        const char* p = words;
+        for (uint8_t idx = 0; idx < SCR_ROWS && *p; ++idx) {
+            while (*p == ' ') ++p;
+            if (!*p) break;
+            char w[SCR_COLS + 1];
+            uint8_t c = 0;
+            w[c++] = (char)('1' + idx);
+            w[c++] = ':';
+            while (*p && *p != ' ' && c < SCR_COLS) w[c++] = *p++;
+            while (*p && *p != ' ') ++p;     /* skip any overflow */
+            w[c] = '\0';
+            oled.setCursor(0, idx * 8);
+            oled.print(w);
+        }
+    }
+    /* 2-page progress bar (same affordance as draw_paged). */
+    oled.fillRect(0, 31, (int)((page + 1) * 64 / 2), 1, SSD1306_WHITE);
+    oled.display();
+}
+
 static void draw_countdown(Adafruit_SSD1306& oled, uint8_t secs_left)
 {
     oled.clearDisplay();
@@ -168,7 +226,7 @@ void trust_ui_tick(Adafruit_SSD1306& oled, bool btnLeftDown,
      * ESP32 stops refreshing it (it resends every ~60 s while UNCLAIMED). */
     if (S.confirm_secs == 0) {
         if (now - S.t0_ms > DISPLAY_TTL_MS) { S.active = false; return; }
-        draw_paged(oled);
+        draw_claim_code(oled);
         return;
     }
 
