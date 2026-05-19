@@ -31,6 +31,7 @@
 
 #include "identity.h"
 #include "cmdauth.h"
+#include "cmdauth_arkiv.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -96,6 +97,14 @@ void app_main(void)
     if (cmdauth_init() != ESP_OK) {
         ESP_LOGW(TAG, "cmdauth_init failed — all downlink commands will be "
                       "rejected until the device is WS-9 provisioned");
+    }
+
+    /* Track 2 / ADR-0011: Paranoic (Arkiv) authority. Also non-fatal — a
+     * device with no Arkiv provisioning / no owner bound just can't run
+     * Paranoic mode; Default/MQTT is unaffected. Fail-closed. */
+    if (cmdauth_arkiv_init() != ESP_OK) {
+        ESP_LOGW(TAG, "cmdauth_arkiv_init: Paranoic mode unavailable "
+                      "(device not Arkiv-provisioned)");
     }
 
     ESP_LOGI(TAG, "boot banner printed, calling pmu_init...");
