@@ -6,5 +6,5 @@ idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "mqtt.c"
                                      esp_event esp_netif nvs_flash
                                      esp_http_client esp-tls lwip
                                      espressif__mqtt
-                                     mbedtls microecc
+                                     mbedtls microecc arkiv_crypto
                        INCLUDE_DIRS "")

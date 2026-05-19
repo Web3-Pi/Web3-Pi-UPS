@@ -1,0 +1,2 @@
+Keccak-256 implementation in keccak256.c is released under CC0 1.0 Universal
+(public domain dedication). See https://creativecommons.org/publicdomain/zero/1.0/
