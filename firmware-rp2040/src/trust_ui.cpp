@@ -202,6 +202,70 @@ static void draw_claim_code(Adafruit_SSD1306& oled)
     oled.display();
 }
 
+/* Fingerprint screen (§10.1 trust-anchor confirm). The ESP32 sends text
+ * "<w1> <w2> <w3> <w4> chk:<HHHH>" (4 BIP39 words + 16-bit checksum, see
+ * arkiv_claim.c owner_fingerprint). Rendering through the generic paged
+ * wrapper looked ragged (mixed case, words split across lines, the chk
+ * suffix orphaned on the last page) — match the claim-code treatment:
+ * fixed two pages, uppercase, one word per line.
+ *
+ *   page 0:  WORD1                page 1:  CHK:
+ *            WORD2                          <hex at textSize 2>
+ *            WORD3
+ *            WORD4
+ *
+ * Falls back to the generic pager if the text isn't in the expected
+ * "<words> chk:<hex>" shape. */
+static void draw_fingerprint(Adafruit_SSD1306& oled)
+{
+    const char* chk_marker = strstr(S.text, " chk:");
+    if (!chk_marker) { draw_paged(oled); return; }
+    const char* words_end = chk_marker;
+    const char* chk       = chk_marker + 5;   /* skip " chk:" */
+
+    uint8_t page = (uint8_t)((millis() / PAGE_MS) % 2);
+    oled.clearDisplay();
+    oled.setTextColor(SSD1306_WHITE);
+    oled.setTextSize(1);
+
+    if (page == 0) {
+        const char* p = S.text;
+        for (uint8_t idx = 0; idx < SCR_ROWS && p < words_end; ++idx) {
+            while (p < words_end && *p == ' ') ++p;
+            if (p >= words_end) break;
+            char w[SCR_COLS + 1];
+            uint8_t c = 0;
+            /* Uppercase, mirroring claim-code (display-only; the contract
+             * is the word→index map, the verifying side already lowercases). */
+            while (p < words_end && *p != ' ' && c < SCR_COLS) {
+                char ch = *p++;
+                if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+                w[c++] = ch;
+            }
+            while (p < words_end && *p != ' ') ++p;   /* skip overflow */
+            w[c] = '\0';
+            oled.setCursor(0, idx * 8);
+            oled.print(w);
+        }
+    } else {
+        oled.setCursor(0, 0);
+        oled.print(F("CHK:"));
+        oled.setTextSize(2);
+        oled.setCursor(0, 12);
+        /* First 4 hex chars of the checksum, uppercase. Stop early on any
+         * unexpected separator so we don't bleed past the field. */
+        char chk4[5] = {0};
+        for (uint8_t i = 0; i < 4; ++i) {
+            char ch = chk[i];
+            if (!ch || ch == ' ' || ch == '\n') break;
+            if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+            chk4[i] = ch;
+        }
+        oled.print(chk4);
+    }
+    oled.display();
+}
+
 static void draw_countdown(Adafruit_SSD1306& oled, uint8_t secs_left)
 {
     oled.clearDisplay();
@@ -265,5 +329,8 @@ void trust_ui_tick(Adafruit_SSD1306& oled, bool btnLeftDown,
         }
         S.hold_start_ms = 0;
     }
-    draw_paged(oled);
+    /* §10.1 fingerprint mode uses a dedicated 2-page layout (uppercase
+     * words + a textSize-2 CHK page). draw_fingerprint falls back to
+     * draw_paged if the text isn't shaped "<words> chk:<hex>". */
+    draw_fingerprint(oled);
 }
