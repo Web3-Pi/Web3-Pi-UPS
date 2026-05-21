@@ -3,6 +3,10 @@
 #include "mqtt.h"
 #include "identity.h"
 #include "cmdauth.h"
+#include "cmdauth_arkiv.h"
+#include "arkiv_ack.h"
+#include "arkiv_tlm.h"
+#include "arkiv_event.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -271,6 +275,64 @@ static void handle_net_publish(const uint8_t *payload, uint16_t len)
         if (n < 0 || (size_t)n >= sizeof(topic)) {
             ESP_LOGW(TAG, "net.publish topic synthesis overflow (rel=%s)", rel);
             return;
+        }
+    }
+
+    /* Track 2 / ADR-0011 P4 §4.6 — snoop telemetry frames on the way to
+     * MQTT so the Arkiv telemetry emitter has an up-to-date snapshot per
+     * class (power.status / host.status / net.status). We pass the WHOLE
+     * frame including the WUPS header; arkiv_tlm classifies by header
+     * and copies only the inner payload. No-op in MQTT mode (the cache
+     * just stays warm; the periodic emit task is self-gated on
+     * cmdauth_arkiv_claim_state()). */
+    if (!absolute && strcmp(rel, "telemetry") == 0 &&
+        cmdauth_arkiv_claim_state() == ARKIV_CLAIMED) {
+        arkiv_tlm_observe_frame(mqtt_payload, hdr.payload_len);
+        /* fall through — the MQTT publish still happens; in arkiv mode
+         * the backend dispatcher already drops these (Slice #3 dispatcher
+         * gate), but the snoop must not interfere with the existing flow. */
+    }
+    if (!absolute && strcmp(rel, "event") == 0 &&
+        cmdauth_arkiv_claim_state() == ARKIV_CLAIMED) {
+        /* Immediate submit — events are rare + time-sensitive. The function
+         * returns quickly on non-event payloads (e.g. system.log frames are
+         * also routed through "event" today). */
+        arkiv_event_observe_frame(mqtt_payload, hdr.payload_len);
+        /* fall through to MQTT — backend dispatcher drops it in arkiv mode. */
+    }
+
+    /* Track 2 / ADR-0011 P4 §4.6 — divert cmd/response to a w3pups-ack
+     * entity when this RESP is for an Arkiv-issued command. The arkiv_rpc
+     * poll stamped (SEQ → command_id) on accept; if a pending entry exists
+     * we publish on chain instead of on the MQTT broker so the panel sees
+     * a single, on-chain ACK source for Paranoic-mode commands.
+     *
+     * Match by RELATIVE subtopic only — absolute topics are an escape
+     * hatch (e.g. early bring-up before ICCID known) and shouldn't be
+     * silently reinterpreted. The cmd RESP payload here is the full WUPS
+     * frame the panel needs to surface in `commands.result` anyway. */
+    if (!absolute && strcmp(rel, "cmd/response") == 0 &&
+        cmdauth_arkiv_claim_state() == ARKIV_CLAIMED &&
+        hdr.payload_len >= WUPS_HEADER_BYTES) {
+        uint8_t inner_seq = mqtt_payload[7]; /* SEQ offset in WUPS header */
+        if (arkiv_ack_has_pending(inner_seq)) {
+            /* Result code lives at the START of the inner payload (the
+             * Track 1 convention the MQTT dispatcher already uses). */
+            uint16_t inner_len = (uint16_t)mqtt_payload[8] | ((uint16_t)mqtt_payload[9] << 8);
+            const uint8_t *inner = mqtt_payload + WUPS_HEADER_BYTES;
+            size_t inner_avail = (size_t)hdr.payload_len - WUPS_HEADER_BYTES;
+            if (inner_len > inner_avail) inner_len = (uint16_t)inner_avail;
+            if (arkiv_ack_emit(inner_seq, inner, inner_len)) {
+                ESP_LOGI(TAG, "cmd/response diverted to w3pups-ack (seq=%u)",
+                         (unsigned)inner_seq);
+                return;
+            }
+            ESP_LOGW(TAG, "w3pups-ack emit failed (seq=%u) — fallback to MQTT",
+                     (unsigned)inner_seq);
+            /* Fall through to MQTT so the dev unit's Track 0/1 path still
+             * has a chance — backend will drop it in arkiv mode anyway
+             * (Slice #1 dispatcher gate), but we avoid losing the ACK
+             * silently on a one-off submit failure. */
         }
     }
 

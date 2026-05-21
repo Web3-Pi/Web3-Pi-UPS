@@ -15,6 +15,7 @@
 #include "cmdauth_arkiv.h"
 #include "wups_link.h"
 #include "wups_proto.h"
+#include "arkiv_ack.h"
 
 #define TAG "arkiv_rpc"
 
@@ -91,6 +92,112 @@ esp_err_t arkiv_eth_block_number(uint64_t *out_block)
     if (cJSON_IsString(r) && r->valuestring) {
         *out_block = strtoull(r->valuestring, NULL, 0); /* 0x-hex */
         rc = ESP_OK;
+    }
+    cJSON_Delete(root);
+    return rc;
+}
+
+/* --- nonce / gas / send (P4 writer plumbing) ------------------------- */
+
+/* Extract a 0x-hex uint64 from a JSON-RPC `result` field. */
+static esp_err_t parse_result_uint(const char *resp, uint64_t *out)
+{
+    cJSON *root = cJSON_Parse(resp);
+    if (!root) return ESP_FAIL;
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "result");
+    esp_err_t rc = ESP_FAIL;
+    if (cJSON_IsString(r) && r->valuestring) {
+        *out = strtoull(r->valuestring, NULL, 0);
+        rc = ESP_OK;
+    }
+    cJSON_Delete(root);
+    return rc;
+}
+
+static void addr_to_hex(const uint8_t addr[20], char out[2 + 40 + 1])
+{
+    static const char H[] = "0123456789abcdef";
+    out[0] = '0'; out[1] = 'x';
+    for (size_t i = 0; i < 20; ++i) {
+        out[2 + 2 * i]     = H[addr[i] >> 4];
+        out[2 + 2 * i + 1] = H[addr[i] & 0x0F];
+    }
+    out[42] = '\0';
+}
+
+esp_err_t arkiv_eth_get_tx_count(const uint8_t addr[20], uint64_t *out_nonce)
+{
+    if (!addr || !out_nonce) return ESP_ERR_INVALID_ARG;
+    char addr_hex[43];
+    addr_to_hex(addr, addr_hex);
+    char body[160];
+    int n = snprintf(body, sizeof(body),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getTransactionCount\","
+        "\"params\":[\"%s\",\"pending\"]}", addr_hex);
+    if (n <= 0 || n >= (int)sizeof(body)) return ESP_FAIL;
+    static char resp[256];
+    if (rpc_post(body, resp, sizeof(resp)) != ESP_OK) return ESP_FAIL;
+    return parse_result_uint(resp, out_nonce);
+}
+
+esp_err_t arkiv_eth_gas_price(uint64_t *out_wei)
+{
+    if (!out_wei) return ESP_ERR_INVALID_ARG;
+    static char resp[256];
+    const char *body =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_gasPrice\",\"params\":[]}";
+    if (rpc_post(body, resp, sizeof(resp)) != ESP_OK) return ESP_FAIL;
+    return parse_result_uint(resp, out_wei);
+}
+
+esp_err_t arkiv_eth_send_raw_tx(const uint8_t *raw, size_t raw_len,
+                                char *out_hash, size_t out_hash_cap)
+{
+    if (!raw || raw_len == 0) return ESP_ERR_INVALID_ARG;
+    if (out_hash && out_hash_cap > 0) out_hash[0] = '\0';
+
+    /* Hex-encode the raw bytes into a stack buffer. A typical CreateOp tx
+     * is well under 2 KB; keep the cap generous but bounded. */
+    static char tx_hex[4096];
+    if (2 + raw_len * 2 + 1 > sizeof(tx_hex)) return ESP_ERR_INVALID_SIZE;
+    static const char H[] = "0123456789abcdef";
+    tx_hex[0] = '0'; tx_hex[1] = 'x';
+    for (size_t i = 0; i < raw_len; ++i) {
+        tx_hex[2 + 2 * i]     = H[raw[i] >> 4];
+        tx_hex[2 + 2 * i + 1] = H[raw[i] & 0x0F];
+    }
+    tx_hex[2 + raw_len * 2] = '\0';
+
+    /* Body: minimal JSON wrapper; tx hex is the bulk. */
+    static char body[4200];
+    int n = snprintf(body, sizeof(body),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_sendRawTransaction\","
+        "\"params\":[\"%s\"]}", tx_hex);
+    if (n <= 0 || n >= (int)sizeof(body)) return ESP_FAIL;
+    static char resp[512];
+    if (rpc_post(body, resp, sizeof(resp)) != ESP_OK) return ESP_FAIL;
+    cJSON *root = cJSON_Parse(resp);
+    if (!root) return ESP_FAIL;
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "result");
+    esp_err_t rc = ESP_FAIL;
+    if (cJSON_IsString(r) && r->valuestring) {
+        if (out_hash && out_hash_cap > 0) {
+            size_t want = strlen(r->valuestring);
+            size_t copy = want < out_hash_cap - 1 ? want : out_hash_cap - 1;
+            memcpy(out_hash, r->valuestring, copy);
+            out_hash[copy] = '\0';
+        }
+        rc = ESP_OK;
+    } else {
+        /* Surface the JSON-RPC error so we can see "intrinsic gas too low",
+         * "nonce too low", "insufficient funds" etc. in the serial log. */
+        cJSON *e = cJSON_GetObjectItemCaseSensitive(root, "error");
+        cJSON *m = e ? cJSON_GetObjectItemCaseSensitive(e, "message") : NULL;
+        if (cJSON_IsString(m)) {
+            ESP_LOGW(TAG, "sendRawTransaction error: %s", m->valuestring);
+        } else {
+            ESP_LOGW(TAG, "sendRawTransaction: no result and no error");
+        }
     }
     cJSON_Delete(root);
     return rc;
@@ -327,6 +434,13 @@ static void poll_once(const char *iccid)
     if (cmdauth_arkiv_check(&cmd, &vframe, &vlen)) {
         ESP_LOGI(TAG, "Arkiv command verified (seq=%llu) → RP2040",
                  (unsigned long long)best_seq);
+        /* Track the inner WUPS SEQ → command_id mapping BEFORE forwarding,
+         * so when the RP2040's cmd/response RESP arrives (with the same
+         * SEQ echoed back) we can divert it into a w3pups-ack entity
+         * instead of MQTT (P4 §4.6 — closes the loop the panel UI watches). */
+        if (vlen >= WUPS_HEADER_BYTES) {
+            arkiv_ack_track_pending(vframe[7] /* SEQ offset */, command_id);
+        }
         forward_to_rp2040(iccid, vframe, vlen);
     }
     cJSON_Delete(root);

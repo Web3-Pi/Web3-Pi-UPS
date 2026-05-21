@@ -15,6 +15,20 @@
 /* eth_blockNumber → current Braga height (the §4.4 clock). */
 esp_err_t arkiv_eth_block_number(uint64_t *out_block);
 
+/* eth_getTransactionCount(addr, "pending") → next nonce for `addr` (20 B).
+ * "pending" so we don't collide with our own in-flight submissions. */
+esp_err_t arkiv_eth_get_tx_count(const uint8_t addr[20], uint64_t *out_nonce);
+
+/* eth_gasPrice → suggested wei. The writer applies its own floor on top. */
+esp_err_t arkiv_eth_gas_price(uint64_t *out_wei);
+
+/* eth_sendRawTransaction → submit a signed legacy tx. `raw` is the RLP
+ * bytes produced by arkiv::tx::sign_legacy_tx. On HTTP 2xx the node's
+ * "result" (a 0x-prefixed 32-byte tx hash) is copied into `out_hash` —
+ * useful for traces; pass NULL/0 to skip. */
+esp_err_t arkiv_eth_send_raw_tx(const uint8_t *raw, size_t raw_len,
+                                char *out_hash, size_t out_hash_cap);
+
 /* Run an arkiv_query with a caller-built filter expression (already in the
  * Arkiv filter syntax, with its quotes JSON-escaped as \"). Collects the
  * raw JSON-RPC response, NUL-terminated, into resp[0..resp_cap). Returns

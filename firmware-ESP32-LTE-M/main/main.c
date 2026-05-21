@@ -34,6 +34,8 @@
 #include "cmdauth_arkiv.h"
 #include "arkiv_rpc.h"
 #include "arkiv_claim.h"
+#include "arkiv_writer.h"
+#include "arkiv_tlm.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -109,6 +111,16 @@ void app_main(void)
                       "(device not Arkiv-provisioned)");
     }
 
+    /* Track 2 / ADR-0011 P4: device-side writer. Loads ak_dev_priv from
+     * prov NVS, derives + LOGS the device's Braga wallet address (the
+     * line operators need to fund the wallet with GLM gas). Independent
+     * of owner-binding state — telemetry/ACK/event paths gate themselves
+     * on owner_bound later. */
+    if (arkiv_writer_init() != ESP_OK) {
+        ESP_LOGW(TAG, "arkiv_writer_init: Paranoic writer unavailable "
+                      "(device key absent)");
+    }
+
     ESP_LOGI(TAG, "boot banner printed, calling pmu_init...");
 
     /* PMU brings up modem rails (DC3 = 3.0 V, BLDO1 = 3.3 V level shifter). */
@@ -146,6 +158,11 @@ void app_main(void)
      * self-gating — only runs while Arkiv-provisioned + UNCLAIMED; shows
      * the claim-code, polls w3pups-claim, drives the OLED trust anchor. */
     arkiv_claim_start();
+
+    /* Track 2 / ADR-0011 P4 §4.6 — periodic Paranoic telemetry emitter.
+     * Self-gating on ARKIV_CLAIMED + writer ready + at least one fresh
+     * cached status; idles silently otherwise (no gas waste). */
+    arkiv_tlm_start();
 
     /* Keep emitting a heartbeat so the host sees the firmware is still alive
      * even when no AT traffic is happening. */
