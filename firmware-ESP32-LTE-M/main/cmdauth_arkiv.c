@@ -8,6 +8,7 @@
 
 #include "arkiv_crypto/secp256k1.h"
 #include "arkiv_crypto/keccak256.h"
+#include "arkiv_cfg.h"
 
 #define TAG "cmdauth_arkiv"
 
@@ -183,13 +184,64 @@ bool cmdauth_arkiv_check(const arkiv_cmd_t *cmd,
         return false;
     }
 
-    /* Defense-in-depth beyond the Arkiv-reported writer: the command frame
-     * itself MUST carry a valid OWNER signature, so a compromised RPC that
-     * lied about `writer` still cannot get a command executed. The owner
-     * signs keccak256(canonical WUPS frame) with the pinned owner key. */
+    /* Defense-in-depth beyond the Arkiv-reported writer: the command must
+     * carry a valid OWNER signature over a digest that binds the frame to
+     * (device_id, epoch, seq, command_id). The binding is what stops a
+     * hostile gateway from re-publishing the same (frame, sig) with a
+     * swapped `seq`/`epoch` attribute and causing double execution — the
+     * device's `counter > last_ctr` check alone would otherwise let two
+     * different seq values for the same owner-signed frame both pass.
+     *
+     * Browser wallets (MetaMask/wagmi) cannot raw-sign an arbitrary hash,
+     * so the owner signs the binding digest via EIP-191 personal_sign and
+     * the device verifies against keccak256("\x19Ethereum Signed Message:\n32"
+     * || digest) — the exact preimage viem's signMessage({raw: digest})
+     * hashes for a 32-byte payload. Contract spec lives in arkiv_cfg.h. */
+    if (!cmd->device_id || !cmd->command_id) {
+        ESP_LOGW(TAG, "cmd missing device_id/command_id — dropping");
+        return false;
+    }
+    if (strlen(cmd->command_id) != ARKIV_COMMAND_ID_LEN) {
+        ESP_LOGW(TAG, "cmd command_id len=%u (want %d) — dropping",
+                 (unsigned)strlen(cmd->command_id), ARKIV_COMMAND_ID_LEN);
+        return false;
+    }
+
+    uint8_t ep[4] = {
+        (uint8_t)(cmd->epoch & 0xFF),
+        (uint8_t)((cmd->epoch >> 8) & 0xFF),
+        (uint8_t)((cmd->epoch >> 16) & 0xFF),
+        (uint8_t)((cmd->epoch >> 24) & 0xFF),
+    };
+    uint8_t sq[8];
+    for (int i = 0; i < 8; i++) sq[i] = (uint8_t)((cmd->counter >> (8 * i)) & 0xFF);
+
     uint8_t digest[32];
-    arkiv_keccak256(cmd->frame, cmd->frame_len, digest);
-    if (arkiv_secp256k1_verify(s_owner_pub, digest, cmd->sig) != 1) {
+    arkiv_keccak256_ctx kx;
+    arkiv_keccak256_init(&kx);
+    /* tag + its implicit NUL — keccak update treats the byte string as
+     * opaque, the NUL is part of the contract (see ARKIV_CMD_BIND_TAG). */
+    arkiv_keccak256_update(&kx, (const uint8_t *)ARKIV_CMD_BIND_TAG,
+                           strlen(ARKIV_CMD_BIND_TAG) + 1);
+    arkiv_keccak256_update(&kx, (const uint8_t *)cmd->device_id,
+                           strlen(cmd->device_id));
+    arkiv_keccak256_update(&kx, ep, sizeof(ep));
+    arkiv_keccak256_update(&kx, sq, sizeof(sq));
+    arkiv_keccak256_update(&kx, (const uint8_t *)cmd->command_id,
+                           ARKIV_COMMAND_ID_LEN);
+    arkiv_keccak256_update(&kx, cmd->frame, cmd->frame_len);
+    arkiv_keccak256_finish(&kx, digest);
+
+    /* EIP-191 wrap (matches arkiv_claim.c eip191_wrap; not factored out yet
+     * — rule of three, will lift to arkiv_crypto on the next consumer). */
+    static const char PFX[] = "\x19" "Ethereum Signed Message:\n32";
+    uint8_t signed_digest[32];
+    arkiv_keccak256_init(&kx);
+    arkiv_keccak256_update(&kx, (const uint8_t *)PFX, sizeof(PFX) - 1);
+    arkiv_keccak256_update(&kx, digest, sizeof(digest));
+    arkiv_keccak256_finish(&kx, signed_digest);
+
+    if (arkiv_secp256k1_verify(s_owner_pub, signed_digest, cmd->sig) != 1) {
         ESP_LOGW(TAG, "owner signature INVALID — dropping");
         return false;
     }

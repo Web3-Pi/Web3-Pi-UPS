@@ -23,19 +23,44 @@
  *
  *   on-chain writer  = owner EOA (Arkiv-native; the §4.3 authority check)
  *   stringAttributes : type="w3pups-cmd", device_id=<ICCID>,
- *                      sig=<128 hex: owner secp256k1 r||s over
- *                           keccak256(canonical WUPS frame), low-S>
- *   numericAttributes: seq=<monotonic per owner|device>, epoch=<key_epoch>
+ *                      command_id=<UUID ASCII, 36 chars, panel command row>,
+ *                      sig=<128 hex: owner secp256k1 r||s, low-S, over the
+ *                           EIP-191 personal_sign of the cmd binding
+ *                           digest below — see note>
+ *   numericAttributes: seq=<u64 monotonic per owner|device — Paranoic
+ *                           baseline, separate from the inner WUPS frame's
+ *                           u8 SEQ which is just the RP2040 REQ↔RESP nonce>,
+ *                      epoch=<key_epoch>
  *   payload          = the canonical WUPS frame, base64 (owner-signed)
  *
- * The §4.4 block clock advances via the entity's chain position; MVP uses
- * the monotonic `seq` as the strict replay baseline (cmdauth_arkiv).
+ * Command binding digest (the owner key authorised THIS specific frame
+ * under THIS specific seq+epoch — defence beyond the Arkiv-reported writer,
+ * so a hostile gateway cannot replay the same (frame, sig) with a swapped
+ * seq/epoch and get the device to execute twice):
+ *
+ *   bind = keccak256( "w3pups-cmd\0"        (11 bytes incl. NUL)
+ *            || device_id_ascii             (ICCID, no NUL)
+ *            || epoch                       (uint32 little-endian)
+ *            || seq                         (uint64 little-endian)
+ *            || command_id_ascii            (UUID, 36 ASCII bytes, no NUL)
+ *            || frame                       (canonical WUPS bytes) )
+ *
+ * Owner signs `bind` via EIP-191 personal_sign (browser wallets cannot raw-
+ * sign an arbitrary hash); the device verifies against
+ *   keccak256("\x19" "Ethereum Signed Message:\n32" || bind)
+ * (exactly what viem signMessage({raw: bind}) hashes). The §4.4 block clock
+ * advances via the entity's chain position; MVP uses the monotonic `seq`
+ * as the strict replay baseline (cmdauth_arkiv).
  */
 #define ARKIV_ATTR_TYPE         "type"
 #define ARKIV_ATTR_DEVICE_ID    "device_id"
+#define ARKIV_ATTR_COMMAND_ID   "command_id"
 #define ARKIV_ATTR_SIG          "sig"
 #define ARKIV_ATTR_SEQ          "seq"
 #define ARKIV_ATTR_EPOCH        "epoch"
+#define ARKIV_CMD_BIND_TAG      "w3pups-cmd"    /* tag + implicit NUL = 11 B */
+/* UUIDs are canonical ASCII, e.g. "550e8400-e29b-41d4-a716-446655440000". */
+#define ARKIV_COMMAND_ID_LEN    36
 
 /*
  * w3pups-claim entity contract — Track 2 / ADR-0011, plan §10.4 path B

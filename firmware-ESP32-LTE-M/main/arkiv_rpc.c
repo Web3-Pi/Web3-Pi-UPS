@@ -9,7 +9,6 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
-#include "mbedtls/base64.h"
 #include "cJSON.h"
 
 #include "identity.h"
@@ -137,6 +136,28 @@ static int hex_decode(const char *hex, uint8_t *out, size_t out_len)
     return (int)out_len;
 }
 
+/* Decode an unknown-length 0x-prefixed hex string into out[0..out_cap),
+ * writing the byte length into *out_len. Returns 0 on success, -1 on bad
+ * input. Used for the entity `value` (canonical WUPS frame, variable
+ * length) — Arkiv ships it as `"0x…"`, NOT base64. */
+static int hex_decode_var(const char *hex, uint8_t *out, size_t out_cap,
+                          size_t *out_len)
+{
+    if (!hex || !out_len) return -1;
+    if (hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex += 2;
+    size_t n = strlen(hex);
+    if ((n & 1) != 0) return -1;       /* must be byte-aligned */
+    size_t bytes = n / 2;
+    if (bytes == 0 || bytes > out_cap) return -1;
+    for (size_t i = 0; i < bytes; ++i) {
+        int hi = hexnib(hex[2 * i]), lo = hexnib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    *out_len = bytes;
+    return 0;
+}
+
 static const char *str_attr(const cJSON *arr, const char *key)
 {
     const cJSON *it;
@@ -236,35 +257,68 @@ static void poll_once(const char *iccid)
     const cJSON *writer = cJSON_GetObjectItemCaseSensitive(best, "creator");
     if (!cJSON_IsString(writer))
         writer = cJSON_GetObjectItemCaseSensitive(best, "owner");
-    const cJSON *payload = cJSON_GetObjectItemCaseSensitive(best, "payload");
-    const char *sig_hex = str_attr(sa, ARKIV_ATTR_SIG);
+    /* Entity payload comes back as the `value` field, NOT `payload` — and
+     * as a 0x-prefixed hex string, NOT base64 (Arkiv RPC contract; see
+     * RpcEntity in @arkiv-network/sdk). The earlier base64 path silently
+     * dropped every cmd because Arkiv returns no `payload` key at all. */
+    const cJSON *value     = cJSON_GetObjectItemCaseSensitive(best, "value");
+    const char *sig_hex    = str_attr(sa, ARKIV_ATTR_SIG);
+    const char *command_id = str_attr(sa, ARKIV_ATTR_COMMAND_ID);
 
     uint8_t writer_b[20], sig_b[64];
     uint8_t frame[WUPS_MAX_PAYLOAD];
     size_t frame_len = 0;
-    bool ok = cJSON_IsString(writer) && cJSON_IsString(payload) && sig_hex &&
-              hex_decode(writer->valuestring, writer_b, 20) == 20 &&
-              hex_decode(sig_hex, sig_b, 64) == 64;
-    if (ok) {
-        int rc = mbedtls_base64_decode(frame, sizeof(frame), &frame_len,
-            (const uint8_t *)payload->valuestring,
-            strlen(payload->valuestring));
-        ok = (rc == 0 && frame_len > 0);
-    }
-    if (!ok) {
-        ESP_LOGW(TAG, "cmd entity malformed (seq=%llu) — dropping",
+
+    /* Per-field validation with explicit logs — when this drops, we want
+     * to know WHICH attribute looked wrong, not just that *something* did. */
+    if (!cJSON_IsString(writer)) {
+        ESP_LOGW(TAG, "cmd seq=%llu: writer missing/non-string — dropping",
                  (unsigned long long)best_seq);
-        cJSON_Delete(root);
-        return;
+        cJSON_Delete(root); return;
+    }
+    if (!cJSON_IsString(value) || !value->valuestring) {
+        ESP_LOGW(TAG, "cmd seq=%llu: entity value missing — dropping",
+                 (unsigned long long)best_seq);
+        cJSON_Delete(root); return;
+    }
+    if (!sig_hex) {
+        ESP_LOGW(TAG, "cmd seq=%llu: sig attribute missing — dropping",
+                 (unsigned long long)best_seq);
+        cJSON_Delete(root); return;
+    }
+    if (!command_id || strlen(command_id) != ARKIV_COMMAND_ID_LEN) {
+        ESP_LOGW(TAG, "cmd seq=%llu: command_id missing or wrong length "
+                 "(got %u, want %d) — dropping", (unsigned long long)best_seq,
+                 command_id ? (unsigned)strlen(command_id) : 0,
+                 ARKIV_COMMAND_ID_LEN);
+        cJSON_Delete(root); return;
+    }
+    if (hex_decode(writer->valuestring, writer_b, 20) != 20) {
+        ESP_LOGW(TAG, "cmd seq=%llu: writer not 20-byte hex — dropping",
+                 (unsigned long long)best_seq);
+        cJSON_Delete(root); return;
+    }
+    if (hex_decode(sig_hex, sig_b, 64) != 64) {
+        ESP_LOGW(TAG, "cmd seq=%llu: sig not 64-byte hex (len=%u) — dropping",
+                 (unsigned long long)best_seq, (unsigned)strlen(sig_hex));
+        cJSON_Delete(root); return;
+    }
+    if (hex_decode_var(value->valuestring, frame, sizeof(frame), &frame_len) != 0) {
+        ESP_LOGW(TAG, "cmd seq=%llu: entity value not decodable hex (len=%u) "
+                 "— dropping", (unsigned long long)best_seq,
+                 (unsigned)strlen(value->valuestring));
+        cJSON_Delete(root); return;
     }
 
     arkiv_cmd_t cmd = {
-        .epoch     = (uint32_t)num_attr(na, ARKIV_ATTR_EPOCH),
-        .counter   = best_seq,
-        .block     = 0, /* MVP: seq is the strict baseline (§4.4 TODO) */
-        .frame     = frame,
-        .frame_len = frame_len,
-        .sig       = sig_b,
+        .epoch      = (uint32_t)num_attr(na, ARKIV_ATTR_EPOCH),
+        .counter    = best_seq,
+        .block      = 0, /* MVP: seq is the strict baseline (§4.4 TODO) */
+        .device_id  = iccid,
+        .command_id = command_id,
+        .frame      = frame,
+        .frame_len  = frame_len,
+        .sig        = sig_b,
     };
     memcpy(cmd.writer, writer_b, 20);
 

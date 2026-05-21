@@ -38,11 +38,17 @@ typedef enum {
 typedef struct {
     uint8_t        writer[20];   /* on-chain entity writer (Arkiv-reported)  */
     uint32_t       epoch;        /* key_epoch the owner signed under         */
-    uint64_t       counter;      /* monotonic per (owner,device)             */
+    uint64_t       counter;      /* monotonic per (owner,device); also the
+                                  * `seq` numeric attr from the entity        */
     uint64_t       block;        /* Braga block the entity landed in (§4.4)  */
+    const char    *device_id;    /* ICCID ASCII (no NUL counted) — bound in
+                                  * the signed digest (defence in depth      */
+    const char    *command_id;   /* UUID ASCII (36 chars) — bound in digest;
+                                  * carried as a string attribute on entity   */
     const uint8_t *frame;        /* canonical WUPS frame (owner-signed)      */
     size_t         frame_len;
-    const uint8_t *sig;          /* 64B owner secp256k1 r||s over the frame  */
+    const uint8_t *sig;          /* 64B owner secp256k1 r||s over the
+                                  * EIP-191 wrap of the cmd binding digest    */
 } arkiv_cmd_t;
 
 /* Load the device key from `prov` (derive its address) and the writable
