@@ -11,9 +11,14 @@
 
 #define ARKIV_CMD_ENTITY_TYPE   "w3pups-cmd"
 
-/* Commands are rare on Arkiv (latency + gas). 5 s poll keeps latency a few
- * seconds (poll + Braga block) per the accepted §7 trade-off. */
-#define ARKIV_POLL_INTERVAL_MS  5000
+/* Cmd channel cadence — driven by `arkiv_rpc.c poll_task`. With the WS
+ * subscriber (`arkiv_ws.c`) running this is the FALLBACK cadence used
+ * only while the WS is disconnected; in steady state the rare cadence
+ * below applies and the HTTP loop barely touches the link.
+ *  - INTERVAL_MS:          aggressive (WS down) — 5 s, original behaviour
+ *  - INTERVAL_FALLBACK_MS: rare (WS healthy)   — 5 min, belt-and-suspenders */
+#define ARKIV_POLL_INTERVAL_MS          5000
+#define ARKIV_POLL_INTERVAL_FALLBACK_MS (5 * 60 * 1000)
 #define ARKIV_HTTP_TIMEOUT_MS   8000
 #define ARKIV_RPC_RESP_CAP      8192
 

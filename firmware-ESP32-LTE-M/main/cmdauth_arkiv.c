@@ -125,6 +125,10 @@ bool cmdauth_arkiv_ready(void) { return s_ready; }
 arkiv_claim_state_t cmdauth_arkiv_claim_state(void) { return s_claim_state; }
 const uint8_t *cmdauth_arkiv_device_addr(void) { return s_dev_addr; }
 const uint8_t *cmdauth_arkiv_device_pub(void) { return s_dev_pub; }
+const uint8_t *cmdauth_arkiv_owner_addr(void)
+{
+    return s_have_owner ? s_owner_addr : NULL;
+}
 uint64_t cmdauth_arkiv_cursor_block(void) { return s_cur_block; }
 
 static bool persist_progress(uint64_t ctr, uint64_t block)

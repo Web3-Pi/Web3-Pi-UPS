@@ -70,6 +70,12 @@ const uint8_t *cmdauth_arkiv_device_addr(void);
  * (keccak(device_pub||boot_nonce)) — public, safe to expose. */
 const uint8_t *cmdauth_arkiv_device_pub(void);
 
+/* Registered owner address (20 bytes), derived from the bound owner_pub.
+ * Returns NULL until the device is ARKIV_CLAIMED. Used by the WS
+ * subscriber to filter incoming events to this owner only (topic[2] in
+ * the eth_subscribe(logs) filter — see arkiv_ws.c). */
+const uint8_t *cmdauth_arkiv_owner_addr(void);
+
 /* Highest Braga block processed (replay cursor, §4.4 fromBlock). 0 = none. */
 uint64_t cmdauth_arkiv_cursor_block(void);
 

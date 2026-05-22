@@ -16,6 +16,7 @@
 #include "wups_link.h"
 #include "wups_proto.h"
 #include "arkiv_ack.h"
+#include "arkiv_ws.h"
 
 #define TAG "arkiv_rpc"
 
@@ -446,16 +447,41 @@ static void poll_once(const char *iccid)
     cJSON_Delete(root);
 }
 
+void arkiv_rpc_poll_once(void)
+{
+    if (!cmdauth_arkiv_ready()) return;
+    if (cmdauth_arkiv_claim_state() != ARKIV_CLAIMED) return;
+    const char *iccid = identity_iccid();
+    if (!iccid || iccid[0] == '\0') return;
+    poll_once(iccid);
+}
+
+void arkiv_rpc_fetch_and_verify_by_key(const char *entity_key)
+{
+    /* v1: ignore the specific key and run the standard freshest-by-seq
+     * sweep. That's intentional — it's the same body the legacy poll
+     * uses, well-tested, and a single WS event almost always corresponds
+     * to the freshest entity. A future precision lookup by key can
+     * skip the scan but it's not worth the extra path until we see a
+     * scenario where the WS event arrives before the entity is queryable. */
+    (void)entity_key;
+    arkiv_rpc_poll_once();
+}
+
 static void poll_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(ARKIV_POLL_INTERVAL_MS));
-        if (!cmdauth_arkiv_ready()) continue;
-        if (cmdauth_arkiv_claim_state() != ARKIV_CLAIMED) continue;
-        const char *iccid = identity_iccid();
-        if (!iccid || iccid[0] == '\0') continue;
-        poll_once(iccid);
+        /* Dynamic interval: while the WS subscriber is healthy, this loop
+         * is just a belt-and-suspenders sweep every 5 minutes; when the
+         * WS drops we fall back to the original 5-second cadence so a
+         * prolonged WS outage doesn't strand commands. The decision is
+         * re-evaluated at the top of each loop iteration. */
+        uint32_t delay_ms = arkiv_ws_subscribed()
+                              ? ARKIV_POLL_INTERVAL_FALLBACK_MS
+                              : ARKIV_POLL_INTERVAL_MS;
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        arkiv_rpc_poll_once();
     }
 }
 
@@ -466,6 +492,7 @@ void arkiv_poll_start(void)
     started = true;
     /* 6 KB stack: TLS + cJSON over a few-KB response. */
     xTaskCreate(poll_task, "arkiv_poll", 6144, NULL, 4, NULL);
-    ESP_LOGI(TAG, "Arkiv poll task started (interval=%dms)",
-             ARKIV_POLL_INTERVAL_MS);
+    ESP_LOGI(TAG, "Arkiv poll task started (interval %d ms aggressive / "
+                  "%d ms fallback while WS subscribed)",
+             ARKIV_POLL_INTERVAL_MS, ARKIV_POLL_INTERVAL_FALLBACK_MS);
 }

@@ -40,5 +40,27 @@ esp_err_t arkiv_rpc_query(const char *filter, char *resp, size_t resp_cap);
 
 /* Start the background poll task. Self-gating: it only queries when the
  * device is Arkiv-provisioned AND owner-bound (ARKIV_CLAIMED) AND has an
- * ICCID; otherwise it idles. Safe to call unconditionally at boot. */
+ * ICCID; otherwise it idles. Safe to call unconditionally at boot.
+ *
+ * Interval is dynamic: aggressive (ARKIV_POLL_INTERVAL_MS, 5 s) while the
+ * WS subscriber is down, rare (ARKIV_POLL_INTERVAL_FALLBACK_MS, 5 min)
+ * while WS is healthy. That keeps cmd latency snappy on WS outage and
+ * collapses HTTP overhead to a belt-and-suspenders cadence in steady
+ * state — see web3pi_scope/notes/ARKIV-data-usage.md §E for the LTE-M math. */
 void arkiv_poll_start(void);
+
+/* One-shot poll (same body the background task uses). Public so the WS
+ * worker can run it as a catch-up sweep after each (re)connect, and as
+ * the fallback path on observed entity events. Self-gating like poll_task. */
+void arkiv_rpc_poll_once(void);
+
+/* Fetch a specific entity by `entityKey` (0x-prefixed 32-byte hex), verify
+ * and forward to RP2040 if it checks out. Used by the WS subscriber when
+ * an ArkivEntityCreated notification arrives for our owner.
+ *
+ * v1: this currently delegates to `arkiv_rpc_poll_once` (the entityKey
+ * acts as a wake-up signal; the regular poll finds the freshest unseen
+ * cmd by seq, which is what we'd otherwise do anyway). A future
+ * optimisation can switch to a real `key = "0x…"` filter to skip the
+ * scan; right now the simpler path keeps surface area small. */
+void arkiv_rpc_fetch_and_verify_by_key(const char *entity_key);

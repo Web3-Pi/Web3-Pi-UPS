@@ -12,3 +12,8 @@ dependencies:
   # cJSON for Arkiv JSON-RPC parsing (Track 2 / ADR-0011). The same
   # official Espressif-registry component the Arkiv PoC used.
   espressif/cjson: "^1"
+  # WebSocket client for Arkiv `eth_subscribe(logs)` over WSS — replaces
+  # the 5 s HTTP cmd-poll loop (Track 2 / ADR-0011 §4.4 transport
+  # optimization; see ARKIV-data-usage.md sec. E for the ~1000× LTE-M
+  # transfer reduction this enables).
+  espressif/esp_websocket_client: "*"

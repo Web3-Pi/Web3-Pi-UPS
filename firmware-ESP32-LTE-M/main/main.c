@@ -36,6 +36,7 @@
 #include "arkiv_claim.h"
 #include "arkiv_writer.h"
 #include "arkiv_tlm.h"
+#include "arkiv_ws.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -164,10 +165,28 @@ void app_main(void)
      * cached status; idles silently otherwise (no gas waste). */
     arkiv_tlm_start();
 
+    /* Track 2 / ADR-0011 — Arkiv WS subscriber (cmd channel). We can't
+     * start it before the owner is bound (we need the owner address as
+     * the eth_subscribe topic filter), and we can't start before PPP+TLS
+     * are up either. The simplest correct gate is to attempt the start
+     * lazily from the heartbeat loop: arkiv_ws_start is idempotent, and
+     * the WS client's own auto-reconnect handles transient network drops
+     * once it's running. Replaces the 5 s HTTP cmd-poll path; the legacy
+     * `arkiv_poll` task stays alive at a 5-minute fallback cadence (see
+     * `arkiv_rpc.c poll_task` and web3pi_scope/notes/ARKIV-data-usage.md §E). */
+    bool ws_armed = false;
+
     /* Keep emitting a heartbeat so the host sees the firmware is still alive
      * even when no AT traffic is happening. */
     uint32_t tick = 0;
     while (true) {
+        if (!ws_armed && cmdauth_arkiv_ready() &&
+            cmdauth_arkiv_claim_state() == ARKIV_CLAIMED) {
+            const uint8_t *owner = cmdauth_arkiv_owner_addr();
+            if (owner && arkiv_ws_start(owner) == ESP_OK) {
+                ws_armed = true;
+            }
+        }
         int64_t uptime_us = esp_timer_get_time();
         uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
         uint32_t free_heap = (uint32_t)esp_get_free_heap_size();
