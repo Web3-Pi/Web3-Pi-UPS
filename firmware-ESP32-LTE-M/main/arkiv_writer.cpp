@@ -13,6 +13,7 @@ extern "C" {
 #include "arkiv_rpc.h"
 #include "arkiv_cfg.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -62,6 +63,19 @@ static uint8_t           s_dev_priv[PRIV_LEN];
 static uint8_t           s_dev_addr[ADDR_LEN];
 static uint64_t          s_out_seq;        /* monotonic, persisted */
 static SemaphoreHandle_t s_seq_lock;
+
+/* Chain-health tracking — lets us tell "submit OK but nothing is being
+ * included" apart from "submit OK and the chain is moving". Updated on
+ * every submit cycle (one extra eth_blockNumber RPC per cycle).
+ *
+ * Stall is reported as ESP_LOGW after 1 cycle without head progress and
+ * escalated to ESP_LOGE after 2, with the pending-tx backlog included so
+ * an operator can see at a glance "Braga RPC is happy, but my last N tx
+ * are sitting in mempool because no new blocks are being produced". */
+static uint64_t s_health_last_head            = 0;
+static int64_t  s_health_last_head_change_us  = 0;
+static uint64_t s_health_baseline_nonce       = 0;
+static uint32_t s_health_consec_stalled       = 0;
 
 /* --- Async submit pipeline: queue + dedicated worker task --------------- */
 
@@ -177,6 +191,10 @@ extern "C" esp_err_t arkiv_writer_init(void)
     ESP_LOGI(TAG, "Paranoic device wallet: 0x%s (fund this on Braga for P4 writes)",
              hex);
 
+    /* Anchor the health timer at boot so a fresh device doesn't report a
+     * multi-year "stall" on its first submit. */
+    s_health_last_head_change_us = esp_timer_get_time();
+
     s_ready = true;
 
     /* Spin up the async writer pipeline if it isn't already running.
@@ -228,6 +246,68 @@ static esp_err_t submit_create(arkiv::CreateOp &create, uint8_t out_tx_hash[32])
         ESP_LOGW(TAG, "eth_getTransactionCount failed");
         goto out;
     }
+
+    /* Chain-health probe: one extra RPC, but it's how we detect
+     * "submit acks but chain isn't producing blocks" — exactly the
+     * case where eth_sendRawTransaction keeps returning a hash but the
+     * tx never gets mined. Failure is non-fatal: we still attempt the
+     * submit, just without a health update for this cycle. */
+    {
+        uint64_t head = 0;
+        if (arkiv_eth_block_number(&head) == ESP_OK) {
+            int64_t now_us = esp_timer_get_time();
+            if (head != s_health_last_head) {
+                if (s_health_last_head == 0) {
+                    ESP_LOGI(TAG,
+                             "arkiv_health: initial head=%llu pending_nonce=%llu",
+                             (unsigned long long)head,
+                             (unsigned long long)nonce);
+                } else {
+                    int64_t since_us = now_us - s_health_last_head_change_us;
+                    ESP_LOGI(TAG,
+                             "arkiv_health: head=%llu (+%llu after %lld s) "
+                             "pending_nonce=%llu",
+                             (unsigned long long)head,
+                             (unsigned long long)(head - s_health_last_head),
+                             (long long)(since_us / 1000000),
+                             (unsigned long long)nonce);
+                }
+                s_health_last_head           = head;
+                s_health_last_head_change_us = now_us;
+                s_health_baseline_nonce      = nonce;
+                s_health_consec_stalled      = 0;
+            } else {
+                s_health_consec_stalled++;
+                int64_t stall_s =
+                    (now_us - s_health_last_head_change_us) / 1000000;
+                uint64_t unincluded = (nonce >= s_health_baseline_nonce)
+                    ? (nonce - s_health_baseline_nonce)
+                    : 0;
+                if (s_health_consec_stalled >= 2) {
+                    ESP_LOGE(TAG,
+                             "arkiv_health: CHAIN STALLED — head=%llu "
+                             "unchanged for %lld s, ~%llu tx from this "
+                             "device unincluded (pending_nonce=%llu); "
+                             "Braga RPC still acks but no blocks are being "
+                             "produced",
+                             (unsigned long long)head,
+                             (long long)stall_s,
+                             (unsigned long long)unincluded,
+                             (unsigned long long)nonce);
+                } else {
+                    ESP_LOGW(TAG,
+                             "arkiv_health: head=%llu stagnant for %lld s "
+                             "(1 cycle), ~%llu tx unincluded",
+                             (unsigned long long)head,
+                             (long long)stall_s,
+                             (unsigned long long)unincluded);
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "eth_blockNumber failed — health check skipped");
+        }
+    }
+
     uint64_t gas_price;
     if (arkiv_eth_gas_price(&gas_price) != ESP_OK) {
         ESP_LOGW(TAG, "eth_gasPrice failed");
