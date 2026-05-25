@@ -1,0 +1,357 @@
+/*
+ * ADR-0012 — OLED system menu state machine.
+ *
+ * See oled_menu.h for the design. This file holds:
+ *   - the current screen / cursor state,
+ *   - text generation for each screen (sent via ui.trust_prompt mode=2),
+ *   - dispatch of button events and exit gestures,
+ *   - hook points into backend_mode (request_switch / factory_reset).
+ */
+
+#include "oled_menu.h"
+
+#include <inttypes.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "../../common/protocol.h"
+#include "backend_mode.h"
+#include "cmdauth_arkiv.h"
+#include "esp_system.h"
+#include "wups_link.h"
+
+#define TAG "oled_menu"
+
+/* Exit gesture — hold LEFT (single button) for this long. Matches the
+ * activation gesture (hold RIGHT 2s in main.cpp) for symmetry: 2 s in,
+ * 2 s out. Falls between the fingerprint-confirm 5 s used by the claim
+ * flow and the home-screen auto-return 15 s. */
+#define EXIT_HOLD_SECS  2u
+
+/* Idle timeout — if no button event arrives for this long, the menu
+ * closes itself. Prevents the device staying on a menu page after the
+ * user wanders off. */
+#define IDLE_TIMEOUT_MS 60000u
+
+typedef enum {
+    /* Root menu: shows distinct categories so the user can see at a
+     * glance that this isn't "just a mode selector". Drill from here.
+     *
+     * Cursor opens on `Debug` (item 0): a deliberately non-destructive
+     * default so a stray RIGHT press right after activation can't flip
+     * the backend mode. Hold LEFT 2s closes the menu without picking
+     * anything. */
+    SCR_ROOT = 0,
+    SCR_MODE,             /* MQTT / ARKIV / HTTP */
+    SCR_FACTORY_RESET,    /* confirm screen      */
+    SCR_REGEN_ARKIV,      /* confirm screen — re-roll device Arkiv wallet */
+} menu_screen_t;
+
+static struct {
+    bool          active;
+    menu_screen_t screen;
+    uint8_t       cursor;       /* highlighted row, 0-based */
+    uint32_t      nonce;        /* binds our trust_prompt to its result */
+    uint32_t      last_button_ms;
+} S;
+
+/* Items per screen. The 64x32 OLED fits 4 rows at default font size. */
+static uint8_t screen_item_count(menu_screen_t s)
+{
+    switch (s) {
+        case SCR_ROOT:          return 5;  /* Debug / Mode / Reset / RegenWallet / Back */
+        case SCR_MODE:          return 4;  /* MQTT / ARKIV / HTTP / Back  */
+        case SCR_FACTORY_RESET: return 2;  /* Back / Wipe                 */
+        case SCR_REGEN_ARKIV:   return 2;  /* Back / Regen                */
+        default:                return 0;
+    }
+}
+
+/* Render the current screen into `out` (NUL-terminated). The text goes
+ * to the RP2040 verbatim — keep each line ≤ 10 chars (64 / 6 px) and
+ * keep total under ~200 B to fit the trust_prompt payload cap. */
+static void render_screen(char *out, size_t cap)
+{
+    const wups_backend_mode_t cur = backend_mode_get();
+    switch (S.screen) {
+        case SCR_ROOT: {
+            /* 5 items on a 4-row OLED → scroll. We show 4 rows centered
+             * around the cursor: keep the highlighted item visible. */
+            const char *labels[5] = {
+                "Debug",
+                "Mode",
+                "Reset",
+                "Wallet",   /* short for "Regen Arkiv Wallet" */
+                "Back",
+            };
+            uint8_t first = (S.cursor >= 3) ? (uint8_t)(S.cursor - 2) : 0;
+            if (first > 1) first = 1;   /* never scroll past last full window */
+            int written = 0;
+            for (int row = 0; row < 4 && first + row < 5; ++row) {
+                int idx = first + row;
+                written += snprintf(out + written,
+                                    written < (int)cap ? cap - (size_t)written : 0,
+                                    "%c%s%s",
+                                    idx == S.cursor ? '>' : ' ',
+                                    labels[idx],
+                                    row == 3 ? "" : "\n");
+            }
+            break;
+        }
+        case SCR_MODE:
+            /* `*` = active mode, `NA` = not implemented yet (HTTP) — the
+             * firmware HTTP client lands with plan HTTP-2. Cursor 0 is
+             * intentionally MQTT (not Back) because the user came in
+             * here specifically to flip the mode, not to retreat. */
+            snprintf(out, cap,
+                     "%cMQTT  %c\n"
+                     "%cARKIV %c\n"
+                     "%cHTTP  %s\n"
+                     "%cBack",
+                     S.cursor == 0 ? '>' : ' ',
+                     cur == WUPS_BACKEND_MODE_MQTT  ? '*' : ' ',
+                     S.cursor == 1 ? '>' : ' ',
+                     cur == WUPS_BACKEND_MODE_ARKIV ? '*' : ' ',
+                     S.cursor == 2 ? '>' : ' ',
+                     cur == WUPS_BACKEND_MODE_HTTP  ? "*" : "NA",
+                     S.cursor == 3 ? '>' : ' ');
+            break;
+        case SCR_FACTORY_RESET:
+            /* Cursor opens on Back (item 0) so a confirm screen drilled
+             * into by accident doesn't wipe the device with one further
+             * press. Wipe is item 1 — needs a deliberate LEFT + RIGHT. */
+            snprintf(out, cap,
+                     "FACTORY\n"
+                     "RESET ALL?\n"
+                     "%cBack\n"
+                     "%cWipe",
+                     S.cursor == 0 ? '>' : ' ',
+                     S.cursor == 1 ? '>' : ' ');
+            break;
+        case SCR_REGEN_ARKIV:
+            /* Same Back-first safety as Factory Reset — regen invalidates
+             * the existing on-chain identity (nonce, claim binding). */
+            snprintf(out, cap,
+                     "NEW WALLET\n"
+                     "ARKIV ADDR?\n"
+                     "%cBack\n"
+                     "%cRegen",
+                     S.cursor == 0 ? '>' : ' ',
+                     S.cursor == 1 ? '>' : ' ');
+            break;
+    }
+}
+
+/* Push the current screen to the RP2040. The trust_ui on the other end
+ * replaces any in-progress prompt with this one, so re-sending is the
+ * documented way to update what's on screen. */
+static void push_screen(void)
+{
+    if (!S.active) return;
+    char text[200];
+    render_screen(text, sizeof text);
+    /* `confirm_secs = EXIT_HOLD_SECS` tells the RP2040 the both-button
+     * hold length needed to exit (mode=2 menu reinterprets the existing
+     * countdown timer as the back/exit gesture). */
+    wups_link_trust_prompt(WUPS_TRUST_PROMPT_MODE_MENU,
+                           EXIT_HOLD_SECS,
+                           S.nonce,
+                           text);
+    S.last_button_ms = (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* Send a ui.set_screen REQ to the RP2040 so the dashboard switches
+ * away from the home screen to one of the developer pages. Used by the
+ * Debug item — the RP2040 trust_ui side relinquishes the OLED in its
+ * set_screen handler, so we don't have to coordinate a teardown frame. */
+static void send_set_screen(uint8_t screen_idx)
+{
+    wups_ui_set_screen_v1_t s = { .version = 1, .screen = screen_idx };
+    wups_link_send(WUPS_ADDR_RP2040, WUPS_CLASS_UI, WUPS_OP_UI_SET_SCREEN,
+                   WUPS_FLAG_REQ, &s, sizeof(s));
+}
+
+/* Perform the action bound to the highlighted item. Returns true if
+ * the menu should close after this action (the action itself usually
+ * reboots so the close is mostly cosmetic). */
+static bool activate_current(void)
+{
+    switch (S.screen) {
+        case SCR_ROOT:
+            switch (S.cursor) {
+                case 0:  /* Debug — jump RP2040 to the Power screen and
+                          *         close the menu so LEFT/RIGHT shorts
+                          *         cycle the dashboard pages again. */
+                    ESP_LOGI(TAG, "menu → debug screens");
+                    send_set_screen(1);  /* SCREEN_POWER on RP2040 */
+                    oled_menu_close();
+                    break;
+                case 1:  /* Mode submenu */
+                    S.screen = SCR_MODE;
+                    S.cursor = 0;
+                    push_screen();
+                    break;
+                case 2:  /* Reset → confirm screen */
+                    S.screen = SCR_FACTORY_RESET;
+                    S.cursor = 0;
+                    push_screen();
+                    break;
+                case 3:  /* Wallet → regen Arkiv confirm screen */
+                    S.screen = SCR_REGEN_ARKIV;
+                    S.cursor = 0;
+                    push_screen();
+                    break;
+                case 4:  /* Back / exit menu */
+                    ESP_LOGI(TAG, "menu → back (exit)");
+                    /* Tell the RP2040 to drop back to the home dashboard
+                     * and release the OLED. The trust_ui session is
+                     * dismissed by set_screen on that side. */
+                    send_set_screen(0);
+                    oled_menu_close();
+                    break;
+            }
+            return false;
+        case SCR_MODE: {
+            switch (S.cursor) {
+                case 0:  /* MQTT  */
+                case 1:  /* ARKIV */
+                {
+                    const wups_backend_mode_t target =
+                        S.cursor == 0 ? WUPS_BACKEND_MODE_MQTT
+                                      : WUPS_BACKEND_MODE_ARKIV;
+                    ESP_LOGI(TAG, "menu → switch to %s",
+                             backend_mode_name(target));
+                    backend_mode_request_switch(target);
+                    break;
+                }
+                case 2:  /* HTTP — not implemented (plan HTTP-2) */
+                    ESP_LOGW(TAG, "menu → HTTP selected, but firmware HTTP "
+                                   "client not implemented (plan HTTP-2)");
+                    break;
+                case 3:  /* Back → root */
+                    S.screen = SCR_ROOT;
+                    S.cursor = 1;  /* land back on "Mode" so re-entry is easy */
+                    push_screen();
+                    break;
+            }
+            return false;
+        }
+        case SCR_FACTORY_RESET:
+            if (S.cursor == 0) {
+                /* Back → root */
+                S.screen = SCR_ROOT;
+                S.cursor = 2;  /* land on "Reset" so retry is easy */
+                push_screen();
+            } else {
+                ESP_LOGW(TAG, "menu → factory reset confirmed");
+                backend_mode_factory_reset();  /* reboots */
+            }
+            return false;
+        case SCR_REGEN_ARKIV:
+            if (S.cursor == 0) {
+                /* Back → root */
+                S.screen = SCR_ROOT;
+                S.cursor = 3;  /* land on "Wallet" so retry is easy */
+                push_screen();
+            } else {
+                ESP_LOGW(TAG, "menu → regenerate Arkiv wallet confirmed");
+                esp_err_t err = cmdauth_arkiv_regenerate_wallet();
+                if (err == ESP_OK) {
+                    ESP_LOGW(TAG, "wallet regenerated — rebooting to load new key");
+                    vTaskDelay(pdMS_TO_TICKS(200));  /* flush logs */
+                    esp_restart();
+                } else {
+                    ESP_LOGE(TAG, "wallet regen failed: %s — staying in menu",
+                             esp_err_to_name(err));
+                    /* Stay on the confirm screen; user can try again. */
+                }
+            }
+            return false;
+    }
+    return false;
+}
+
+/* --- public API ----------------------------------------------------------- */
+
+bool oled_menu_active(void)
+{
+    return S.active;
+}
+
+void oled_menu_open(void)
+{
+    if (S.active) return;
+    /* Random nonce so a late trust_result for a previous menu session
+     * (or anything else) doesn't accidentally match ours. */
+    S.nonce = esp_random();
+    S.active = true;
+    S.screen = SCR_ROOT;
+    S.cursor = 0;
+    ESP_LOGI(TAG, "menu opened (nonce=%" PRIu32 ")", S.nonce);
+    push_screen();
+}
+
+void oled_menu_close(void)
+{
+    if (!S.active) return;
+    S.active = false;
+    ESP_LOGI(TAG, "menu closed");
+}
+
+void oled_menu_on_button_event(uint8_t button, uint8_t action)
+{
+    /* Activation gesture (button=0xFF, action=long): the RP2040 sends
+     * exactly one of these when the user holds LEFT on the home screen
+     * for the activation duration. If a previous menu session was left
+     * dangling (e.g. on the RP2040 side after a backend-mode reboot the
+     * panel's HELLO handler missed), force-close and reopen — the user
+     * is asking for a fresh menu and we shouldn't make them retry. */
+    if (button == 0xFF && action == 2u) {
+        if (S.active) oled_menu_close();
+        oled_menu_open();
+        return;
+    }
+
+    if (!S.active) return;
+
+    /* Only act on "press" (action=0) for short presses. action=1
+     * (release) is informational; action=2 (long) is reserved for the
+     * RP2040's exit-gesture path (which arrives as trust_result). */
+    if (action != 0u) return;
+
+    const uint8_t n = screen_item_count(S.screen);
+    if (n == 0) return;
+
+    if (button == 0u) {
+        /* LEFT = move cursor up (with wrap). */
+        S.cursor = (uint8_t)((S.cursor + n - 1u) % n);
+        push_screen();
+    } else if (button == 1u) {
+        /* RIGHT = select. The current item either drills down, runs an
+         * action, or no-ops. Selection vs scrolling is RIGHT because
+         * navigation here is a single-axis list — pairing LEFT=up,
+         * RIGHT=select feels more natural than the alternative on the
+         * 2-button hardware and matches how the home screen treats
+         * RIGHT (the action button on Power Control). */
+        activate_current();
+    }
+    /* Unknown button code: ignore. */
+}
+
+void oled_menu_on_trust_result(uint32_t nonce, uint8_t result)
+{
+    if (!S.active) return;
+    if (nonce != S.nonce) return;
+    /* Both CONFIRMED (exit hold succeeded) and TIMEOUT close the menu —
+     * the user either deliberately backed out or stopped interacting.
+     * CANCELLED isn't currently emitted by the RP2040 in mode=2 but is
+     * the obvious "anything else" close. */
+    (void)result;
+    oled_menu_close();
+}

@@ -7,6 +7,7 @@
 #include "arkiv_ack.h"
 #include "arkiv_tlm.h"
 #include "arkiv_event.h"
+#include "oled_menu.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -193,8 +194,16 @@ void wups_link_trust_prompt(uint8_t mode, uint8_t confirm_secs,
 
     /* Arm before sending so a fast RP2040 reply can't beat the wait. A
      * display-only prompt (confirm_secs == 0) expects no result, so don't
-     * arm — keeps a stale nonce from swallowing a later real result. */
-    if (confirm_secs > 0) {
+     * arm — keeps a stale nonce from swallowing a later real result.
+     *
+     * ADR-0012 — also don't arm for menu prompts (mode == 2): the menu
+     * state machine has its own (lighter) result handler in
+     * oled_menu_on_trust_result(), and the RX dispatch in
+     * deliver_local_frame() already hands the result over there when
+     * `s_trust_armed` is false. Arming here would swallow the exit
+     * gesture into the claim-flow path, leaving `oled_menu.S.active`
+     * stuck true and blocking the next menu open. */
+    if (confirm_secs > 0 && mode != WUPS_TRUST_PROMPT_MODE_MENU) {
         s_trust_nonce  = nonce;
         s_trust_result = 1;                 /* default = timeout */
         s_trust_armed  = true;
@@ -376,24 +385,42 @@ static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
         return;
     }
     if (cls == WUPS_CLASS_UI) {
-        /* Track 2 / ADR-0011 §10.1/§10.4 — the trust-anchor RESP from the
-         * RP2040 OLED gate. This is the ONLY UI frame the ESP32 consumes;
-         * the ESP32 stays the sole authority (it never trusts the RP2040
-         * to decide ownership — only to report the physical button hold).
-         * Every other UI op is RP2040-local; the ESP32 ignores it. */
+        /* Track 2 / ADR-0011 §10.1/§10.4 — trust-anchor RESPs from the
+         * RP2040 OLED gate. Two consumers share this op:
+         *   (a) cmdauth_arkiv's owner-binding flow (matches nonce via
+         *       wups_link_trust_wait — semaphore-based blocking wait);
+         *   (b) ADR-0012 oled_menu (mode=2 menu sessions match by nonce
+         *       too, but use polling — the menu state machine pushes
+         *       fresh prompts on each navigation and only needs the
+         *       exit-gesture result asynchronously).
+         * Try (a) first; if its nonce doesn't match, hand to (b). */
         if (op == WUPS_OP_UI_TRUST_RESULT && (flags & WUPS_FLAG_RESP) &&
             len >= sizeof(wups_ui_trust_result_v1_t)) {
             wups_ui_trust_result_v1_t r;
             memcpy(&r, payload, sizeof(r));
-            if (r.version == 1 && s_trust_armed && r.nonce == s_trust_nonce) {
+            if (r.version != 1) return;
+            if (s_trust_armed && r.nonce == s_trust_nonce) {
                 s_trust_result = r.result;
                 s_trust_armed  = false;
                 xSemaphoreGive(s_trust_sig);
             } else {
-                ESP_LOGW(TAG, "trust_result dropped (armed=%d nonce=%lu/%lu)",
-                         (int)s_trust_armed, (unsigned long)r.nonce,
-                         (unsigned long)s_trust_nonce);
+                /* Hand to the menu — it'll no-op if the nonce isn't its own. */
+                oled_menu_on_trust_result(r.nonce, r.result);
             }
+            return;
+        }
+        /* ADR-0012 — button events from the RP2040. The RP2040 only
+         * broadcasts these while in menu mode (otherwise buttons are
+         * its own local nav/power UI); the activation gesture
+         * (button=0xFF, action=long) opens the menu. */
+        if (op == WUPS_OP_UI_BUTTON_EVENT && (flags & WUPS_FLAG_EVENT) &&
+            len >= sizeof(wups_ui_button_event_v1_t)) {
+            wups_ui_button_event_v1_t e;
+            memcpy(&e, payload, sizeof(e));
+            if (e.version == 1) {
+                oled_menu_on_button_event(e.button, e.action);
+            }
+            return;
         }
         return;
     }
@@ -585,23 +612,33 @@ esp_err_t wups_link_init(void)
 
     rx_reset();
 
+    /* ADR-0012 / 2026-05-25: HW flow control disabled. The CTS/RTS handshake
+     * misbehaved across ESP32-only reboots — RP2040 saw a stuck or pulsing
+     * CTS from the booting ESP32 and either paused sends or sent into a
+     * non-listening RX, leaving the deframer permanently desynced (resync
+     * counter climbed every frame, telemetry only worked after a full
+     * power-cycle). Without HW flow control we rely on the 4 KB RX FIFO
+     * + per-frame Fletcher-8 checksum + deframer resync — the existing
+     * defense-in-depth was already carrying the load, so dropping CTS/RTS
+     * trades a soft "stop sending" hint for a more robust cold-start. */
     uart_config_t cfg = {
         .baud_rate           = WUPS_UART_BAUD,
         .data_bits           = UART_DATA_8_BITS,
         .parity              = UART_PARITY_DISABLE,
         .stop_bits           = UART_STOP_BITS_1,
-        .flow_ctrl           = UART_HW_FLOWCTRL_CTS_RTS,
-        /* Deassert RTS when the RX FIFO has 122 / 128 bytes — leaves a
-         * small margin for in-flight bytes after we tell the peer to stop. */
-        .rx_flow_ctrl_thresh = 122,
+        .flow_ctrl           = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
         .source_clk          = UART_SCLK_DEFAULT,
     };
 
     esp_err_t err = uart_param_config(WUPS_UART_NUM, &cfg);
     if (err != ESP_OK) return err;
 
+    /* TX + RX only; pass UART_PIN_NO_CHANGE for RTS/CTS so the pins stay
+     * driven by their previous configuration (typically inputs with
+     * pullups) and don't try to negotiate a phantom handshake. */
     err = uart_set_pin(WUPS_UART_NUM, WUPS_UART_TX_PIN, WUPS_UART_RX_PIN,
-                       WUPS_UART_RTS_PIN, WUPS_UART_CTS_PIN);
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) return err;
 
     err = uart_driver_install(WUPS_UART_NUM, WUPS_UART_RX_BUFSIZE,
@@ -617,9 +654,8 @@ esp_err_t wups_link_init(void)
      * has connected and starts receiving messages. */
     mqtt_set_data_handler(on_mqtt_data);
 
-    ESP_LOGI(TAG, "UART2 up: TX=GPIO%d RX=GPIO%d CTS=GPIO%d RTS=GPIO%d @ %d, HW flow ctrl",
-             WUPS_UART_TX_PIN, WUPS_UART_RX_PIN, WUPS_UART_CTS_PIN,
-             WUPS_UART_RTS_PIN, WUPS_UART_BAUD);
+    ESP_LOGI(TAG, "UART2 up: TX=GPIO%d RX=GPIO%d @ %d, NO HW flow ctrl",
+             WUPS_UART_TX_PIN, WUPS_UART_RX_PIN, WUPS_UART_BAUD);
 
     /* Announce ourselves to anyone listening on the bus (RP2040 hub will
      * receive immediately; RPi sees it after USB-CDC enumerates on its end). */

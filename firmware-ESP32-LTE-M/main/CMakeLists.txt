@@ -4,6 +4,8 @@ idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "mqtt.c"
                             "arkiv_claim.c" "arkiv_writer.cpp"
                             "arkiv_ack.c" "arkiv_tlm.c"
                             "arkiv_event.c" "arkiv_ws.c"
+                            "backend_mode.c"
+                            "oled_menu.c"
                             "bip39.c"
                        PRIV_REQUIRES spi_flash esp_timer esp_hw_support
                                      esp_driver_i2c esp_driver_gpio

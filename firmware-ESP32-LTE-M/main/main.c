@@ -37,6 +37,7 @@
 #include "arkiv_writer.h"
 #include "arkiv_tlm.h"
 #include "arkiv_ws.h"
+#include "backend_mode.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -89,6 +90,13 @@ void app_main(void)
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
+
+    /* ADR-0012 — read the persisted backend mode BEFORE any mode-specific
+     * subsystem decides to start. Stays stable for the lifetime of the
+     * boot; changes require a reboot via backend_mode_request_switch(). */
+    (void)backend_mode_init();
+    const wups_backend_mode_t active_mode = backend_mode_get();
+    ESP_LOGI(TAG, "active backend mode: %s", backend_mode_name(active_mode));
 
     /* Load the per-device MQTT secret from the `prov` NVS partition before
      * anything needs the MQTT password (Track 0 / WS-10). Aborts boot if the
@@ -150,20 +158,22 @@ void app_main(void)
     /* Hand the UART over to the bidirectional bridge. */
     modem_at_pass_through_start();
 
-    /* Track 2 / ADR-0011: start the Arkiv command poll task. Self-gating —
-     * idles until the device is Arkiv-provisioned + owner-bound; harmless
-     * (and fail-closed) for Default/MQTT devices. */
-    arkiv_poll_start();
-
-    /* Track 2 / ADR-0011 §10.1/§10.4 path B: owner-binding driver. Also
-     * self-gating — only runs while Arkiv-provisioned + UNCLAIMED; shows
-     * the claim-code, polls w3pups-claim, drives the OLED trust anchor. */
-    arkiv_claim_start();
-
-    /* Track 2 / ADR-0011 P4 §4.6 — periodic Paranoic telemetry emitter.
-     * Self-gating on ARKIV_CLAIMED + writer ready + at least one fresh
-     * cached status; idles silently otherwise (no gas waste). */
-    arkiv_tlm_start();
+    /* ADR-0012 — Arkiv subsystems only when we're actually in Arkiv mode.
+     * Before this gate they ran in every mode (fail-closed when not
+     * Arkiv-provisioned) but that wasted heap + a constant poll-task wake
+     * loop on every device. Switching modes is a reboot, so this gate
+     * stays accurate for the lifetime of the boot. */
+    if (active_mode == WUPS_BACKEND_MODE_ARKIV) {
+        /* Track 2 / ADR-0011 — Arkiv command poll task. */
+        arkiv_poll_start();
+        /* Owner-binding driver — shows claim-code, polls w3pups-claim,
+         * drives the OLED trust anchor (§10.1/§10.4 path B). */
+        arkiv_claim_start();
+        /* Periodic Paranoic telemetry emitter (P4 §4.6). */
+        arkiv_tlm_start();
+    } else {
+        ESP_LOGI(TAG, "Arkiv subsystems skipped — not in Arkiv mode");
+    }
 
     /* Track 2 / ADR-0011 — Arkiv WS subscriber (cmd channel). We can't
      * start it before the owner is bound (we need the owner address as
@@ -175,17 +185,37 @@ void app_main(void)
      * `arkiv_poll` task stays alive at a 5-minute fallback cadence (see
      * `arkiv_rpc.c poll_task` and web3pi_scope/notes/ARKIV-data-usage.md §E). */
     bool ws_armed = false;
+    /* `mode_confirm_armed` flips false on the first successful post-switch
+     * confirm emit. emit_post_switch_confirm is idempotent (reads NVS,
+     * only does work if prev_mode is set, clears it after success), so
+     * calling it repeatedly while the channel comes up is safe. */
+    bool mode_confirm_armed = true;
 
     /* Keep emitting a heartbeat so the host sees the firmware is still alive
      * even when no AT traffic is happening. */
     uint32_t tick = 0;
     while (true) {
-        if (!ws_armed && cmdauth_arkiv_ready() &&
+        if (active_mode == WUPS_BACKEND_MODE_ARKIV && !ws_armed &&
+            cmdauth_arkiv_ready() &&
             cmdauth_arkiv_claim_state() == ARKIV_CLAIMED) {
             const uint8_t *owner = cmdauth_arkiv_owner_addr();
             if (owner && arkiv_ws_start(owner) == ESP_OK) {
                 ws_armed = true;
             }
+        }
+
+        /* ADR-0012 — post-switch confirm. emit_post_switch_confirm is a
+         * no-op if NVS prev_mode isn't set (i.e. this isn't a post-switch
+         * boot). When it IS set, the helper publishes once via the now-up
+         * channel and clears the NVS marker; subsequent calls become
+         * no-ops. We keep trying on every heartbeat tick until success. */
+        if (mode_confirm_armed) {
+            backend_mode_emit_post_switch_confirm();
+            /* The helper is idempotent: if prev_mode is unset (or cleared
+             * by the successful publish above) further calls do nothing.
+             * Disarm to avoid the NVS open on every tick once we're past
+             * the first ~minute of boot. */
+            if (tick > 12) mode_confirm_armed = false;
         }
         int64_t uptime_us = esp_timer_get_time();
         uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);

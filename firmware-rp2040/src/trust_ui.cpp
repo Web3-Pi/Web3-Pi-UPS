@@ -26,18 +26,33 @@ static constexpr uint8_t  RES_TIMEOUT   = 1;
 
 static struct {
     bool     active;
-    uint8_t  mode;          /* 0 = fingerprint confirm, 1 = claim-code   */
+    uint8_t  mode;          /* 0 = fingerprint confirm, 1 = claim-code,
+                               2 = system menu (ADR-0012)                */
     uint8_t  confirm_secs;  /* 0 = display-only (no result expected)     */
     uint32_t nonce;
     uint8_t  req_seq;
     uint32_t t0_ms;         /* when this prompt became active            */
     uint32_t hold_start_ms; /* 0 = not currently holding both buttons    */
     uint8_t  release_miss;  /* consecutive non-both samples (debounce)   */
+    /* ADR-0012 — edge-detect state for mode=2. Initialised on the first
+     * mode=2 tick with the live button levels so a button still held
+     * from the activation gesture doesn't fire a phantom "press" event
+     * the moment menu opens. */
+    bool     menu_btn_initialized;
+    bool     menu_prev_left;
+    bool     menu_prev_right;
     uint16_t text_len;
     char     text[241];
 } S;
 
 bool trust_ui_active(void) { return S.active; }
+
+void trust_ui_force_close(void)
+{
+    S.active = false;
+    S.hold_start_ms = 0;
+    S.release_miss  = 0;
+}
 
 static void send_result(uint8_t result)
 {
@@ -74,6 +89,10 @@ void trust_ui_on_prompt(const uint8_t* payload, uint16_t len, uint8_t req_seq)
     S.t0_ms          = millis();
     S.hold_start_ms  = 0;
     S.release_miss   = 0;
+    /* Mode=2 (menu) re-syncs prev-button state on the next tick so the
+     * fingers still on the activation key don't generate phantom edges.
+     * Other modes don't read prev-state, so the flag is harmless there. */
+    S.menu_btn_initialized = false;
     S.active         = true;
 }
 
@@ -279,11 +298,89 @@ static void draw_countdown(Adafruit_SSD1306& oled, uint8_t secs_left)
     oled.display();
 }
 
+/* ADR-0012 menu rendering — verbatim text, no countdown, no '\n' magic
+ * (the ESP32 already formats short lines that fit the 64x32 OLED). */
+static void draw_menu(Adafruit_SSD1306& oled)
+{
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    uint8_t row = 0;
+    uint8_t col = 0;
+    for (const char* p = S.text; *p && row < SCR_ROWS; ++p) {
+        if (*p == '\n') {
+            row++; col = 0;
+            continue;
+        }
+        if (col >= SCR_COLS) continue;   /* clip; ESP32 keeps lines short */
+        oled.setCursor(col * 6, row * 8);
+        oled.write((uint8_t)*p);
+        col++;
+    }
+    oled.display();
+}
+
+/* ADR-0012 — broadcast a ui.button_event so the ESP32 menu state
+ * machine can react. button: 0=left, 1=right; action: 0=press, 1=release,
+ * 2=long. Sent BROADCAST so the (otherwise dumb) protocol stays
+ * symmetric with the existing event family. */
+static void send_button_event(uint8_t button, uint8_t action)
+{
+    wups_ui_button_event_v1_t e;
+    e.version  = 1;
+    e.button   = button;
+    e.action   = action;
+    e.reserved = 0;
+    wups_send(WUPS_PORT_ESP32, WUPS_ADDR_BROADCAST,
+              WUPS_CLASS_UI, WUPS_OP_UI_BUTTON_EVENT,
+              WUPS_FLAG_EVENT, &e, sizeof(e));
+}
+
 void trust_ui_tick(Adafruit_SSD1306& oled, bool btnLeftDown,
                     bool btnRightDown)
 {
     if (!S.active) return;
     uint32_t now = millis();
+
+    /* ADR-0012 — menu mode. The ESP32 owns navigation state; we just
+     * render the latest text, forward short button presses as
+     * ui.button_event broadcasts, and treat a hold-LEFT (or hold-both
+     * as a fallback) of `confirm_secs` as the exit gesture (sent back
+     * as trust_result CONFIRMED so the ESP32 closes its menu state).
+     * Exit was originally hold-both-3s, but the user reported the
+     * two-button press is awkward — hold-LEFT (single button) is the
+     * primary gesture now. */
+    if (S.mode == 2) {
+        if (now - S.t0_ms > CONFIRM_TIMEOUT_MS) {
+            send_result(RES_TIMEOUT);
+            S.active = false;
+            return;
+        }
+
+        /* First tick of a new menu prompt — sync prev-button levels
+         * with reality so the activation key still being held doesn't
+         * fire a phantom edge. */
+        if (!S.menu_btn_initialized) {
+            S.menu_prev_left       = btnLeftDown;
+            S.menu_prev_right      = btnRightDown;
+            S.menu_btn_initialized = true;
+            draw_menu(oled);
+            return;
+        }
+
+        /* Edge-detect short presses and forward as nav events. There's
+         * no hold gesture in menu mode any more — exit is the "Back"
+         * item, a normal short-press selection. We only emit the press
+         * edge (action=0); release (action=1) would be redundant and
+         * the menu state machine only acts on action=0 anyway. */
+        if (btnLeftDown && !S.menu_prev_left)   send_button_event(0, 0);
+        if (btnRightDown && !S.menu_prev_right) send_button_event(1, 0);
+        S.menu_prev_left  = btnLeftDown;
+        S.menu_prev_right = btnRightDown;
+
+        draw_menu(oled);
+        return;
+    }
 
     /* Display-only (claim-code, §10.4): no result, auto-dismiss when the
      * ESP32 stops refreshing it (it resends every ~60 s while UNCLAIMED). */

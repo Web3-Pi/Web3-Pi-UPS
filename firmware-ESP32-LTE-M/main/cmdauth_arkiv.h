@@ -109,3 +109,16 @@ esp_err_t cmdauth_arkiv_set_epoch(uint32_t epoch);
 /* Factory-reset the Arkiv binding (§10.6): clears owner/epoch/counter,
  * state → UNCLAIMED. Physical-reset path only. */
 esp_err_t cmdauth_arkiv_clear(void);
+
+/* Re-roll the device's Arkiv private key (ak_dev_priv in the `prov`
+ * partition) and wipe the owner binding state (so the new address has
+ * a fresh epoch/counter and no claimed owner). The new private key is
+ * a 32 B uniformly random scalar in [1, n-1] — rejected and redrawn
+ * on the astronomically rare invalid draw. On success, logs the new
+ * device address and returns ESP_OK; caller is expected to esp_restart()
+ * so the firmware re-reads the new key from prov NVS on next boot.
+ *
+ * This is the recovery path when an existing wallet's nonce stream has
+ * gone bad on Braga (pending tx pileup after an outage) — owner re-funds
+ * the new address out-of-band and re-claims the device. */
+esp_err_t cmdauth_arkiv_regenerate_wallet(void);

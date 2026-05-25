@@ -1,6 +1,8 @@
 #include "modem.h"
 #include "mqtt.h"
 #include "identity.h"
+#include "backend_mode.h"
+#include "../../common/protocol.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -435,7 +437,16 @@ static void ppp_supervisor_task(void *arg)
                      * through lwIP → PPP → modem → 1nce → internet. */
                     run_http_get_test();
 
-                    if (!s_iccid_known) {
+                    /* ADR-0012 — only start the EMQX client when this
+                     * device is actually in MQTT mode. In Arkiv/HTTP mode
+                     * the chain/user-endpoint is the only uplink and an
+                     * extra MQTT client would just burn LTE data. */
+                    const wups_backend_mode_t mode = backend_mode_get();
+                    if (mode != WUPS_BACKEND_MODE_MQTT) {
+                        ESP_LOGI(MODEM_TAG,
+                                 "skipping MQTT client start — backend mode is %s",
+                                 backend_mode_name(mode));
+                    } else if (!s_iccid_known) {
                         ESP_LOGE(MODEM_TAG,
                                  "ICCID unknown — refusing to start MQTT. "
                                  "Check SIM card / AT+CCID handling.");

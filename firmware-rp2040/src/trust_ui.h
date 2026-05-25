@@ -40,4 +40,10 @@ bool trust_ui_active(void);
 void trust_ui_tick(Adafruit_SSD1306& oled, bool btnLeftDown,
                     bool btnRightDown);
 
+/* ADR-0012 — explicitly relinquish the OLED + buttons. Called by the
+ * ui.set_screen handler when the ESP32 wants to put us on a specific
+ * dashboard screen (the system menu's "Debug" entry). No-op if not
+ * currently active. */
+void trust_ui_force_close(void);
+
 #endif /* TRUST_UI_H */

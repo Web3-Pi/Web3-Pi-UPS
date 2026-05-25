@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_random.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -332,4 +333,95 @@ esp_err_t cmdauth_arkiv_clear(void)
     s_claim_state = ARKIV_UNCLAIMED;
     ESP_LOGI(TAG, "Arkiv binding cleared — UNCLAIMED");
     return err;
+}
+
+/* secp256k1 group order n. A valid private key is a uniformly random
+ * integer in [1, n-1]; we reject 0 and any draw >= n and redraw. */
+static const uint8_t SECP256K1_N_BE[32] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+    0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+};
+
+/* Big-endian unsigned compare. Returns -1, 0, +1. */
+static int be_cmp32(const uint8_t a[32], const uint8_t b[32])
+{
+    for (int i = 0; i < 32; ++i) {
+        if (a[i] < b[i]) return -1;
+        if (a[i] > b[i]) return  1;
+    }
+    return 0;
+}
+
+static bool is_zero32(const uint8_t a[32])
+{
+    for (int i = 0; i < 32; ++i) if (a[i]) return false;
+    return true;
+}
+
+esp_err_t cmdauth_arkiv_regenerate_wallet(void)
+{
+    /* (1) Draw a fresh private key. esp_random() is the on-chip CSPRNG
+     * (TRNG + AES-DRBG when RF is on). 32 bytes → secp256k1 scalar; reject
+     * 0 or >= n. */
+    uint8_t new_priv[32];
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        esp_fill_random(new_priv, sizeof new_priv);
+        if (!is_zero32(new_priv) && be_cmp32(new_priv, SECP256K1_N_BE) < 0) {
+            break;
+        }
+        if (attempt == 15) {
+            ESP_LOGE(TAG, "regen_wallet: failed to find a valid scalar in 16 attempts");
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+    }
+
+    /* (2) Derive the new address so we can log it BEFORE writing — gives
+     * the operator a stable line in the serial log even if NVS write
+     * fails partway. */
+    uint8_t new_pub[PUB_LEN];
+    uint8_t new_addr[ADDR_LEN];
+    if (arkiv_secp256k1_derive_pubkey(new_priv, new_pub) != 0 ||
+        arkiv_secp256k1_derive_address(new_priv, new_addr) != 0) {
+        ESP_LOGE(TAG, "regen_wallet: secp256k1 derive failed");
+        return ESP_FAIL;
+    }
+    (void)new_pub;
+    ESP_LOGW(TAG, "regen_wallet: new device wallet "
+                  "0x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x"
+                  "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x — "
+                  "FUND THIS ADDRESS on Braga before re-claiming",
+             new_addr[0], new_addr[1], new_addr[2], new_addr[3], new_addr[4],
+             new_addr[5], new_addr[6], new_addr[7], new_addr[8], new_addr[9],
+             new_addr[10], new_addr[11], new_addr[12], new_addr[13], new_addr[14],
+             new_addr[15], new_addr[16], new_addr[17], new_addr[18], new_addr[19]);
+
+    /* (3) Persist to the `prov` partition. `prov` is type=data, subtype=nvs
+     * — read-only by convention (provisioning blob) but writable through
+     * the NVS API. We update ONE key (ak_dev_priv); other keys
+     * (mqtt_secret, bk_op_pub, bk_root_pub, bk_epoch) stay untouched. */
+    nvs_handle_t ph;
+    esp_err_t err = nvs_open_from_partition(PROV_PARTITION, PROV_NAMESPACE,
+                                            NVS_READWRITE, &ph);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "regen_wallet: nvs_open(prov RW) failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+    err = nvs_set_blob(ph, KEY_DEV_PRIV, new_priv, sizeof new_priv);
+    if (err == ESP_OK) err = nvs_commit(ph);
+    nvs_close(ph);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "regen_wallet: nvs_set/commit failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    /* (4) Wipe the binding state — new key, fresh epoch/counter, no
+     * owner. Caller will reboot, the new boot will load the new key
+     * from prov, derive the new wallet, and start in UNCLAIMED. */
+    (void)cmdauth_arkiv_clear();
+
+    return ESP_OK;
 }

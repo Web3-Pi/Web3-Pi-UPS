@@ -87,7 +87,25 @@ typedef enum {
     WUPS_OP_SYS_HELLO        = 0x02,
     WUPS_OP_SYS_STATUS_QUERY = 0x03,
     WUPS_OP_SYS_LOG          = 0x04,
+    /* ADR-0012 — emitted by ESP32 when the OLED menu (or a future
+       panel-side flow) initiates a backend-mode switch. Payload:
+         u8 version=1
+         u8 from   (1=mqtt, 2=arkiv, 3=http; 0=unknown / first boot)
+         u8 to     (1=mqtt, 2=arkiv, 3=http)
+         u8 flags  (bit 0 = pending pre-switch hint, sent on OLD channel) */
+    WUPS_OP_SYS_MODE_CHANGED = 0x10,
 } wups_op_system_t;
+
+/* ADR-0012 backend-mode codes. Wire-equal between firmware and backend
+   (`apps/api/src/lib/wupsproto.ts WupsBackendMode`); keep in sync. */
+typedef enum {
+    WUPS_BACKEND_MODE_UNKNOWN = 0x00,
+    WUPS_BACKEND_MODE_MQTT    = 0x01,
+    WUPS_BACKEND_MODE_ARKIV   = 0x02,
+    WUPS_BACKEND_MODE_HTTP    = 0x03,
+} wups_backend_mode_t;
+
+#define WUPS_MODE_CHANGED_FLAG_PENDING 0x01u
 
 /* Class 0x02 POWER (CH32X) */
 typedef enum {
@@ -323,17 +341,38 @@ typedef struct WUPS_PACKED {
 
 /* ui.trust_prompt — ESP32→RP2040 REQ (Track 2 / ADR-0011, §10.1/§10.4).
  * Drives the physical trust-anchor screen. ASCII text follows the header:
- * the human-verifiable owner fingerprint (mode 0) or the device claim-code
- * (mode 1). The RP2040 renders it verbatim and runs a both-buttons hold of
- * `confirm_secs`; it never parses the text. `nonce` correlates the reply. */
+ * the human-verifiable owner fingerprint (mode 0), the device claim-code
+ * (mode 1), or a system menu page (mode 2, ADR-0012). The RP2040 renders
+ * it verbatim and never parses the text. `nonce` correlates the reply.
+ *
+ * confirm_secs semantics:
+ *   - mode 0 (fingerprint): both-button hold of `confirm_secs` confirms.
+ *   - mode 1 (claim-code):  display-only, confirm_secs must be 0.
+ *   - mode 2 (menu):        confirm_secs = hold length to EXIT the menu
+ *                            (back/cancel). Short presses are forwarded
+ *                            to the ESP32 as `ui.button_event` broadcasts;
+ *                            the ESP32 owns the menu state machine and
+ *                            updates the screen by issuing a fresh
+ *                            ui.trust_prompt mode=2 with the new text. */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */
-    uint8_t  mode;           /* 0 = owner-bind fingerprint, 1 = claim-code */
-    uint8_t  confirm_secs;   /* both-button hold to confirm (e.g. 5)       */
+    uint8_t  mode;           /* 0=fingerprint, 1=claim-code, 2=menu (ADR-0012) */
+    uint8_t  confirm_secs;   /* both-button hold to confirm/exit (e.g. 5)  */
     uint8_t  text_len;       /* bytes of ASCII following                   */
     uint32_t nonce;          /* echoed in wups_ui_trust_result_v1_t        */
     /* char text[text_len] follows */
 } wups_ui_trust_prompt_v1_hdr_t;
+
+/* trust_prompt.mode codes — symbolic constants so the firmware doesn't
+ * scatter magic numbers across files. */
+#define WUPS_TRUST_PROMPT_MODE_FINGERPRINT 0u
+#define WUPS_TRUST_PROMPT_MODE_CLAIM_CODE  1u
+#define WUPS_TRUST_PROMPT_MODE_MENU        2u
+
+/* trust_result.result codes (extended for mode=2 menu exits). */
+#define WUPS_TRUST_RESULT_CONFIRMED 0u  /* mode 0 confirmed / mode 2 exit  */
+#define WUPS_TRUST_RESULT_TIMEOUT   1u
+#define WUPS_TRUST_RESULT_CANCELLED 2u
 
 /* ui.trust_result — RP2040→ESP32 RESP (SEQ echoes the prompt's). The
  * physical confirm outcome. Only result==0 (confirmed) authorises the

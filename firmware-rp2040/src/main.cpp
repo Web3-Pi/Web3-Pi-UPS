@@ -984,6 +984,43 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     return;
   }
 
+  // ADR-0012 — system.hello from the ESP32 means the ESP32 just (re)booted.
+  // Any in-progress trust_ui session (claim flow, system menu) is now
+  // orphaned — its state machine lives on the ESP32, which has just lost
+  // it. Force the OLED back to the home dashboard so the user sees the
+  // device respond. Also resets currentScreen so debug screens don't
+  // linger after a backend-mode-switch reboot.
+  if (f.cls == WUPS_CLASS_SYSTEM && f.op == WUPS_OP_SYS_HELLO &&
+      f.src == WUPS_ADDR_ESP32) {
+    if (trust_ui_active()) trust_ui_force_close();
+    currentScreen = 0;
+    lastInteractionTime = millis();
+    return;
+  }
+
+  // ADR-0012 — ui.set_screen forces a particular dashboard screen.
+  // Used by the system menu's "Debug" entry: it puts the RP2040 on one
+  // of the developer screens (1=Power, 2=Battery, 3=PD, 4=Power Ctrl)
+  // and the user can navigate them with the normal LEFT/RIGHT shorts
+  // (which only run when currentScreen != 0). Auto-return to home (15s
+  // idle) brings the user back to the dashboard / menu activation
+  // gesture window.
+  if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_SET_SCREEN &&
+      f.len >= sizeof(wups_ui_set_screen_v1_t)) {
+    wups_ui_set_screen_v1_t s;
+    memcpy(&s, f.payload, sizeof(s));
+    if (s.version == 1 && s.screen < SCREEN_COUNT) {
+      currentScreen = s.screen;
+      lastInteractionTime = millis();
+      // The system menu was just closed by the ESP32 — make sure the
+      // RP2040 trust_ui side doesn't keep ownership of the OLED.
+      // trust_ui's own per-prompt session timeout would also handle
+      // this, but explicitly relinquishing avoids a ~3 s overlap.
+      trust_ui_force_close();
+    }
+    return;
+  }
+
   // ui.beep → play a tone on the buzzer. Lets a remote operator (web
   // panel, local CLI, …) verify the round-trip path reaches *this*
   // device — sound is end-to-end proof the command landed on the right
@@ -1271,16 +1308,22 @@ void setup() {
   *gpio16_pads = (*gpio16_pads & ~0x31u) | 0x31u;
   dbgOut.println(F("UART0 bidir on GPIO17/16 @ 921600, GPIO16 drive=12mA"));
 
-  // UART1 to M.2 ESP32 — hardware Serial2 with CTS/RTS flow control. setCTS
-  // and setRTS must be called before begin(); arduino-pico enables HW flow
-  // control automatically when both pins are configured.
+  // UART1 to M.2 ESP32. HW flow control (CTS/RTS) was disabled 2026-05-25
+  // — the handshake misbehaved across ESP32-only reboots and left the
+  // RP2040↔ESP32 link permanently desynced (resync counter climbed every
+  // frame, telemetry only worked after a full power-cycle). Pin
+  // assignments for CTS/RTS retained as INPUT/OUTPUT pullups in case we
+  // want to re-enable later, but setCTS/setRTS aren't called so
+  // arduino-pico runs Serial2 without HW handshake.
   Serial2.setTX(UART1_TX_PIN);
   Serial2.setRX(UART1_RX_PIN);
-  Serial2.setCTS(UART1_CTS_PIN);
-  Serial2.setRTS(UART1_RTS_PIN);
   Serial2.setFIFOSize(256);
   Serial2.begin(UART1_BAUD);
-  dbgOut.println(F("UART1 bidir on GPIO20(TX)/21(RX) + CTS22/RTS23 @ 921600"));
+  // Park the previous CTS/RTS pins as inputs with pullups so they don't
+  // float and accidentally drive anything on the ESP32 side.
+  pinMode(UART1_CTS_PIN, INPUT_PULLUP);
+  pinMode(UART1_RTS_PIN, INPUT_PULLUP);
+  dbgOut.println(F("UART1 bidir on GPIO20(TX)/21(RX) @ 921600 (no HW flow ctrl)"));
 
   // Wire the binary router up to all three streams. Bytes arriving on any
   // of these now feed wups_router_drain() in loop() and dispatch via
@@ -1341,6 +1384,43 @@ void loop() {
     return;
   }
 
+  // ADR-0012 — system-menu activation gesture: hold LEFT for
+  // MENU_ACTIVATION_HOLD_MS on the home screen. One-button gesture
+  // (ergonomically easiest). Sends a single ui.button_event{
+  // button=0xFF, action=long} broadcast which the ESP32 interprets as
+  // "open system menu". Exit isn't a hold — once the menu is open the
+  // user selects "Back" (short press, just like any other nav).
+  // Gesture is one-shot per hold episode; latch clears on LEFT release.
+  {
+    static uint32_t s_left_start_ms = 0;
+    static bool     s_menu_fired    = false;
+    constexpr uint32_t MENU_ACTIVATION_HOLD_MS = 2000;
+    bool left_down = digitalRead(BTN_LEFT_PIN) == LOW;
+    if (left_down && currentScreen == 0) {
+      uint32_t now_ms = millis();
+      if (s_left_start_ms == 0) s_left_start_ms = now_ms;
+      if (!s_menu_fired &&
+          (now_ms - s_left_start_ms) >= MENU_ACTIVATION_HOLD_MS) {
+        wups_ui_button_event_v1_t e;
+        e.version  = 1;
+        e.button   = 0xFF;    // activation gesture sentinel (ADR-0012)
+        e.action   = 2;       // long
+        e.reserved = 0;
+        wups_send(WUPS_PORT_ESP32, WUPS_ADDR_BROADCAST,
+                  WUPS_CLASS_UI, WUPS_OP_UI_BUTTON_EVENT,
+                  WUPS_FLAG_EVENT, &e, sizeof(e));
+        tone(BUZZER_PIN, 1200, 80);
+        s_menu_fired = true;
+        // Control hands over to trust_ui as soon as the ESP32 sends
+        // back the first menu prompt — the trust_ui_active() branch
+        // at the top of loop() takes over then.
+      }
+    } else {
+      s_left_start_ms = 0;
+      s_menu_fired = false;
+    }
+  }
+
   // Read ADC values (single sample, EMA filtering handles noise)
   int rawBattVolt = analogRead(ADC_BATT_VOLT_PIN);
   int rawVbusOut  = analogRead(ADC_VBUS_OUT_PIN);
@@ -1363,10 +1443,18 @@ void loop() {
   // back, the router can grow a per-port "stray byte sink".
 
   // --- Button handling ---
-  // On the Power Control screen the buttons trigger ups.power.* commands.
-  // On every other screen they navigate left/right.
+  // ADR-0012 — on the home screen (screen 0) short button presses are
+  // intentionally NO-OPs. The home screen is the dashboard; the only
+  // valid interaction here is hold-RIGHT-2s to open the system menu
+  // (handled above). Short presses are reserved for the menu itself
+  // (LEFT=cursor up, RIGHT=select) once it's active, and trust_ui owns
+  // the buttons while the menu / claim flow is up.
+  //
+  // On non-home screens (currently unreachable until "MENU > Debug"
+  // wiring lands) the original LEFT/RIGHT nav + SCREEN_POWER_CTRL
+  // power buttons still apply, so the code path is preserved.
   int8_t btnAction = checkButtons();
-  if (btnAction != 0) {
+  if (btnAction != 0 && currentScreen != 0) {
     lastInteractionTime = millis();
 
     if (currentScreen == SCREEN_POWER_CTRL) {
