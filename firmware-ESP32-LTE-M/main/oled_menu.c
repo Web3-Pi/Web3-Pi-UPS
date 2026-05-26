@@ -360,8 +360,10 @@ void oled_menu_on_button_event(uint8_t button, uint8_t action)
     if (n == 0) return;
 
     if (button == 0u) {
-        /* LEFT = move cursor up (with wrap). */
-        S.cursor = (uint8_t)((S.cursor + n - 1u) % n);
+        /* LEFT = move cursor DOWN (with wrap). Down feels more natural
+         * than up — items are listed top-to-bottom so "advance through
+         * the list" reads as moving downward. */
+        S.cursor = (uint8_t)((S.cursor + 1u) % n);
         push_screen();
     } else if (button == 1u) {
         /* RIGHT = select. The current item either drills down, runs an
