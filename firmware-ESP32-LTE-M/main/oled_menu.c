@@ -177,6 +177,22 @@ static void send_set_screen(uint8_t screen_idx)
                    WUPS_FLAG_REQ, &s, sizeof(s));
 }
 
+/* Push an in-flight "we're doing something, please wait" screen via
+ * another ui.trust_prompt mode=2 with the same nonce. Without it the
+ * OLED freezes on the last menu page during the ~10 s mode-switch /
+ * factory-reset reboot, which looks like a hang. The 200 ms delay
+ * gives the RP2040 time to deframe + render the new prompt before
+ * the network stack goes away under us. */
+static void push_transition_screen(const char *text)
+{
+    if (!S.active) return;
+    wups_link_trust_prompt(WUPS_TRUST_PROMPT_MODE_MENU,
+                           EXIT_HOLD_SECS,
+                           S.nonce,
+                           text);
+    vTaskDelay(pdMS_TO_TICKS(200));
+}
+
 /* Perform the action bound to the highlighted item. Returns true if
  * the menu should close after this action (the action itself usually
  * reboots so the close is mostly cosmetic). */
@@ -225,6 +241,16 @@ static bool activate_current(void)
                     const wups_backend_mode_t target =
                         S.cursor == 0 ? WUPS_BACKEND_MODE_MQTT
                                       : WUPS_BACKEND_MODE_ARKIV;
+                    /* Show "switching" feedback so the user doesn't see
+                     * the menu page frozen during the ~10 s reboot.
+                     * 10-char-per-line cap (64 px / 6 px default font);
+                     * "MODE: ARKIV" overflowed by one — split across
+                     * lines instead. */
+                    char wait_text[64];
+                    snprintf(wait_text, sizeof wait_text,
+                             "SWITCHING\nTO %s\nPlease\nwait...",
+                             S.cursor == 0 ? "MQTT" : "ARKIV");
+                    push_transition_screen(wait_text);
                     ESP_LOGI(TAG, "menu → switch to %s",
                              backend_mode_name(target));
                     backend_mode_request_switch(target);
@@ -250,6 +276,7 @@ static bool activate_current(void)
                 push_screen();
             } else {
                 ESP_LOGW(TAG, "menu → factory reset confirmed");
+                push_transition_screen("FACTORY\nRESET\nPlease\nwait...");
                 backend_mode_factory_reset();  /* reboots */
             }
             return false;
@@ -261,6 +288,7 @@ static bool activate_current(void)
                 push_screen();
             } else {
                 ESP_LOGW(TAG, "menu → regenerate Arkiv wallet confirmed");
+                push_transition_screen("REGEN\nWALLET\nPlease\nwait...");
                 esp_err_t err = cmdauth_arkiv_regenerate_wallet();
                 if (err == ESP_OK) {
                     ESP_LOGW(TAG, "wallet regenerated — rebooting to load new key");
@@ -269,7 +297,10 @@ static bool activate_current(void)
                 } else {
                     ESP_LOGE(TAG, "wallet regen failed: %s — staying in menu",
                              esp_err_to_name(err));
-                    /* Stay on the confirm screen; user can try again. */
+                    /* Push a brief error screen and let the user retry. */
+                    push_transition_screen("REGEN\nFAILED\nRetry?");
+                    vTaskDelay(pdMS_TO_TICKS(1500));
+                    push_screen();   /* back to the confirm screen */
                 }
             }
             return false;
