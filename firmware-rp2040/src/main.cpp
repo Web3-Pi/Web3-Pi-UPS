@@ -257,6 +257,20 @@ bool startupComplete = false;
 constexpr unsigned long STARTUP_STABILIZE_MS = 3000;
 unsigned long startupEndTime = 0;
 
+// --- System-menu activation feedback (ADR-0012) ---
+// The gesture broadcasts a ui.button_event to the ESP32, which then drives
+// the menu via trust_ui. The M.2 module (ESP32+modem) is optional in the
+// product, so we may have no peer to answer. When the ESP32 doesn't
+// respond within MENU_RESPONSE_TIMEOUT_MS we fall back to opening the
+// debug screens directly — that's the only menu entry that is purely
+// RP2040-local (the ESP32 menu's Debug item does nothing more than
+// ui.set_screen back to us). Mode/Reset/RegenWallet require ESP32 state
+// and stay gated. menu_pending_deadline_ms = 0 means no gesture in
+// flight; non-zero means we're waiting for the ESP32's trust_prompt and
+// will time out at that absolute millis().
+static uint32_t menu_pending_deadline_ms = 0;
+constexpr uint32_t MENU_RESPONSE_TIMEOUT_MS = 1500;
+
 // Convert battery voltage (2S pack, mV) to SOC percentage
 // Based on Panasonic CGR18650CH 2250mAh discharge curve
 // Uses linear interpolation between known points
@@ -1413,11 +1427,31 @@ void loop() {
         s_menu_fired = true;
         // Control hands over to trust_ui as soon as the ESP32 sends
         // back the first menu prompt — the trust_ui_active() branch
-        // at the top of loop() takes over then.
+        // at the top of loop() takes over then. If no prompt arrives
+        // within MENU_RESPONSE_TIMEOUT_MS we surface "NO ESP32" so the
+        // user doesn't think the device hung — handles both the
+        // M.2-module-absent case and a stuck ESP32 the same way.
+        menu_pending_deadline_ms = now_ms + MENU_RESPONSE_TIMEOUT_MS;
       }
     } else {
       s_left_start_ms = 0;
       s_menu_fired = false;
+    }
+  }
+
+  // ESP32 timeout for the activation gesture above. If trust_ui took over,
+  // the ESP32 responded — clear the pending state silently. Otherwise jump
+  // directly to the debug screens (Power=1 is the first one in the strip
+  // 1→2→3→PD_DIAG→POWER_PATH→POWER_CTRL); a second short beep flags the
+  // fallback so the user can tell the menu didn't open.
+  if (menu_pending_deadline_ms != 0) {
+    if (trust_ui_active()) {
+      menu_pending_deadline_ms = 0;
+    } else if ((int32_t)(millis() - menu_pending_deadline_ms) >= 0) {
+      menu_pending_deadline_ms = 0;
+      tone(BUZZER_PIN, 1500, 80);
+      currentScreen = 1;
+      lastInteractionTime = millis();
     }
   }
 
