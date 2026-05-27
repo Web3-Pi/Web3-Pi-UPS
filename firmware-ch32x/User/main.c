@@ -516,23 +516,16 @@ static void wups_send_power_status(uint8_t dst, uint8_t flags, uint8_t seq)
         int16_t tj = Chg_Data.tjunc_c10;
         s.temp_dC = (tj == MP2762A_TJ_NA) ? lm : ((tj > lm) ? tj : lm);
     }
-    /* SINK contract is 0 unless the UPS is being fed by an upstream PD
-     * charger. While diagnosing the SOURCE-side power path with no upstream
-     * PD, repurpose `pd_contract_mV` as VSYS (mV) and `pd_contract_mA` as
-     * IIN (mA from MP2762A) — both are critical to diagnose TPS55289 UVLO
-     * trips that don't show up in STATUS register. Once the SINK side is
-     * also exercised this aliasing has to go (real fix: protocol v2 with
-     * dedicated diag fields). */
-    if (PD_Get_Snk_Voltage_100mV() != 0)
-    {
-        s.pd_contract_mV = (uint16_t)((uint32_t)PD_Get_Snk_Voltage_100mV() * 100u);
-        s.pd_contract_mA = (uint16_t)((uint32_t)PD_Get_Snk_Current_100mA() * 100u);
-    }
-    else
-    {
-        s.pd_contract_mV = (uint16_t)Chg_Data.vsys_mv;
-        s.pd_contract_mA = (uint16_t)Chg_Data.iin_ma;
-    }
+    /* v3 is source-only — the upstream USB-C PD negotiation is handled
+     * entirely by HUSB238 (U150), CH32X never acts as a sink. There is
+     * no SINK contract to report. Repurpose `pd_contract_mV` as VSYS
+     * (mV) and `pd_contract_mA` as IIN (mA from MP2762A) — both are
+     * critical to diagnose TPS55289 UVLO trips that don't show up in
+     * the STATUS register. This aliasing is a known protocol-v1 hack
+     * (see common/protocol_desc.md §7); the real fix is protocol v2
+     * with dedicated diag fields. */
+    s.pd_contract_mV = (uint16_t)Chg_Data.vsys_mv;
+    s.pd_contract_mA = (uint16_t)Chg_Data.iin_ma;
     /* Pack TPS55289 STATUS bits into the high byte of `faults` so the
      * MP2762A fault byte (low byte) is preserved. The host can see what
      * tripped the converter without bumping the protocol version:

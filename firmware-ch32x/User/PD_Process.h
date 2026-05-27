@@ -28,11 +28,11 @@
 
 /******************************************************************************/
 /* Variable extents */
-extern UINT8  Tmr_Ms_Cnt_Last;
-extern UINT8  Tmr_Ms_Dlt;
+extern __IO UINT8  Tmr_Ms_Cnt_Last;
+extern __IO UINT8  Tmr_Ms_Dlt;
 extern volatile UINT8  Tim_Ms_Cnt;
 
-extern UINT8  PDO_Len;
+extern __IO UINT8  PDO_Len;
 extern PD_CONTROL PD_Ctl;
 
 extern UINT8 send_data[ ];
@@ -56,16 +56,6 @@ extern UINT8 PD_Send_Handle( UINT8 *pbuf, UINT8 len );
 extern void PD_Phy_SendPack( UINT8 mode, UINT8 *pbuf, UINT8 len, UINT8 sop );
 extern void PD_Main_Proc( void );
 extern void PD_Request_Analyse( UINT8 pdo_idx, UINT8 *srccap, UINT16 *current );
-extern void PD_PDO_Analyse( UINT8 pdo_idx, UINT8 *srccap, UINT16 *current, UINT16 *voltage );
-
-//Merged Source+Sink PD process
-void PD_Role_Manager_Tick(void);
-UINT8 PD_ProfileAccepted_Get(void);
-UINT8 PD_ProfileAccepted_Consume(void);
-UINT8 PD_Get_Role(void);
-UINT8 PD_Get_SinkReqPDOIndex(void);
-UINT16 PD_Get_Snk_Voltage_100mV(void);
-UINT16 PD_Get_Snk_Current_100mA(void);
 
 #ifdef __cplusplus
 }
