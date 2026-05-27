@@ -1193,17 +1193,23 @@ void PD_Det_Proc( void )
                     if( status == 1 ) USBPD->CONFIG &= ~CC_SEL;
                     else              USBPD->CONFIG |= CC_SEL;
 
-                    if( (USBPD->PORT_CC1 & CC_PD) || (USBPD->PORT_CC2 & CC_PD) )
-                    {
-                    PD_Ctl.PD_State = STA_SRC_CONNECT;
-                    printf("CC%d SRC Connect\r\n",status);
-                    }
-                    else
-                    {
+                    /* v3 hardware: CH32X is source-only (HUSB238 U150 owns
+                     * USB-C INPUT PD). Both CC outcomes need to converge on
+                     * the source-advertise path: STA_SINK_CONNECT is the
+                     * misleadingly named "ready to TX SRC_CAP" pre-state in
+                     * this firmware's WCH state machine. VBUS_set_5V() is
+                     * mandatory before SRC_CAP so vSafe5V (+ PA7 high, +
+                     * TPS REF=5V) are on the bus before negotiation starts.
+                     * The previous STA_SRC_CONNECT branch (a leftover
+                     * dual-role "wait for incoming SRC_CAP" sink-style
+                     * state) skipped VBUS_set_5V entirely when Pi5 was
+                     * already attached at cold-boot — TPS REF stayed
+                     * uninitialized, PA7 stayed low, output stayed dead. */
                     PD_Ctl.PD_State = STA_SINK_CONNECT;
-                    printf("CC%d SINK Connect\r\n",status);
+                    printf("CC%d Connect (CC_PD=%lu)\r\n", status,
+                           (unsigned long)(((USBPD->PORT_CC1 & CC_PD) ||
+                                            (USBPD->PORT_CC2 & CC_PD)) ? 1 : 0));
                     VBUS_set_5V();
-                    }
 
                     PD_Ctl.PD_Comm_Timer = 0;
                 }

@@ -861,10 +861,13 @@ int main(void)
         //Tmr_Ms_Dlt = 1;
         TIM_ITConfig( TIM1, TIM_IT_Update , ENABLE );
 
-#ifndef DIAG_FORCE_5V_5A_NO_PD
-		/* role manager tick: uses Tmr_Ms_Dlt */
-        PD_Role_Manager_Tick();
-#endif
+        /* Dual-role manager (PB11 host-detect + PB3 CC mux + SINK retry FSM)
+         * is gone on v3 — HUSB238 (U150) owns USB-C INPUT PD negotiation
+         * entirely, the SRC_TPx pins on the CH32X are NC test points, and
+         * PD_Role_Manager_Tick() reading floating PB11 was triggering false
+         * SINK switches that corrupted TPS REF on cold-boot with PD-on-input
+         * + Pi5-already-attached. Source PD FSM (PD_Det_Proc + PD_Main_Proc)
+         * is still called below — it handles Pi5 on the OUTPUT correctly. */
 
         /* Drain UART RX ring and dispatch any complete command frames. */
         Cmd_Rx_Drain();
@@ -909,20 +912,41 @@ int main(void)
             Tps_Status_Latched |= tps55289_read_status();
 
 #ifdef DIAG_FORCE_5V_5A_NO_PD
-            /* Re-apply the full config every 2 s as a watchdog. Catches:
-             *  - INTFB / REF leftover from a previous firmware build (TPS
-             *    is not power-cycled when CH32X is reflashed, so its
-             *    registers persist across firmware loads).
-             *  - Autonomous TPS resets that might wipe REF back to default
-             *    while leaving INTFB on a stale value.
-             * Reading the registers at the top of this branch already
-             * surfaced the current state into telemetry; the reapply
-             * happens after the read so the screen briefly shows the
-             * stale value before snapping to the intended one. */
+            /* DIAG mode: skip PD nego entirely, hardcode 5V/5A. */
             tps55289_set_cdc_compensation(CDC_COMP_0V7);
             tps55289_set_current_limit(5.0);
             tps55289_set_voltage(5.0);
             tps55289_enable_output(1);
+#else
+            /* Watchdog: every 2 s re-apply whatever VBUS_set_5V or the PD
+             * source FSM last asked for. Cached setpoints (g_*_set_*10)
+             * are populated by tps55289_set_voltage/set_current_limit and
+             * cleared on VBUS_disable, so v_set==0 means "rail intentionally
+             * off — do nothing". Catches:
+             *  - Cold-boot with USB-C-on-input AND Pi5-already-attached:
+             *    TPS comes up post-UVLO with REF reset to default and
+             *    INTFB retained from prior firmware run → wrong VOUT.
+             *    First VBUS_set_5V() in PD_Det_Proc happens during TPS
+             *    warmup and the write can land in an I2C window where
+             *    the chip NACKs or misses the byte; this watchdog fixes
+             *    the next tick.
+             *  - Autonomous TPS resets after SCP/OCP hiccup that wipe REF
+             *    while leaving INTFB on a stale value.
+             *  - Mid-negotiation I2C glitch from PD BMC noise.
+             * Idempotent: if state is already correct, the writes are
+             * no-ops at the chip level. ~3–4 I2C transactions @ ~100 kHz
+             * bit-bang ≈ 1 ms total, well under the 2 s window. */
+            {
+                int16_t v_set = tps55289_get_voltage_set_v10();
+                int16_t i_set = tps55289_get_current_set_a10();
+                if (v_set > 0 && i_set > 0)
+                {
+                    tps55289_set_cdc_compensation(CDC_COMP_0V7);
+                    tps55289_set_current_limit((float)i_set / 10.0f);
+                    tps55289_set_voltage((float)v_set / 10.0f);
+                    tps55289_enable_output(1);
+                }
+            }
 #endif
         }
 
