@@ -8,6 +8,9 @@
 #include "arkiv_tlm.h"
 #include "arkiv_event.h"
 #include "oled_menu.h"
+#include "backend_mode.h"
+#include "http_backend.h"
+#include "http_cfg.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -301,6 +304,15 @@ static void handle_net_publish(const uint8_t *payload, uint16_t len)
          * the backend dispatcher already drops these (Slice #3 dispatcher
          * gate), but the snoop must not interfere with the existing flow. */
     }
+    /* HTTP-2 (§4.18a) — in HTTP control mode, snoop the telemetry frame on
+     * its way past so the periodic POST carries a fresh power/host/net
+     * snapshot. There is no MQTT broker in this mode, so the publish below
+     * just no-ops (mqtt_publish_raw returns -1); the cache is the real sink. */
+    if (!absolute && strcmp(rel, "telemetry") == 0 &&
+        backend_mode_get() == WUPS_BACKEND_MODE_HTTP) {
+        http_backend_observe_telemetry_frame(mqtt_payload, hdr.payload_len);
+    }
+
     if (!absolute && strcmp(rel, "event") == 0 &&
         cmdauth_arkiv_claim_state() == ARKIV_CLAIMED) {
         /* Immediate submit — events are rare + time-sensitive. The function
@@ -355,6 +367,63 @@ static void handle_net_publish(const uint8_t *payload, uint16_t len)
     }
 }
 
+/* HTTP-2 (§4.18a) — net.config REQ from the RPi host. Persists the HTTP
+ * control-mode endpoint (or device_id override) in NVS so a fielded unit can
+ * be re-pointed without re-flashing. Replies with a net.config RESP carrying
+ * a 1-byte result. Applies in any backend mode; takes effect when the device
+ * is (re)booted into HTTP mode. */
+static void handle_net_config(uint8_t src, uint8_t seq,
+                              const uint8_t *payload, uint16_t len)
+{
+    wups_net_config_result_v1_t resp = { .version = 1, .item = 0, .result = 1, .reserved = 0 };
+
+    if (len < sizeof(wups_net_config_v1_hdr_t)) {
+        ESP_LOGW(TAG, "net.config too short: %u", (unsigned)len);
+        goto reply;
+    }
+    wups_net_config_v1_hdr_t hdr;
+    memcpy(&hdr, payload, sizeof(hdr));
+    resp.item = hdr.item;
+    if (hdr.version != 1) {
+        ESP_LOGW(TAG, "net.config version=%u (expected 1)", hdr.version);
+        goto reply;
+    }
+    if ((size_t)sizeof(hdr) + hdr.value_len > len) {
+        ESP_LOGW(TAG, "net.config length mismatch (value_len=%u)", hdr.value_len);
+        goto reply;
+    }
+
+    char value[HTTP_CFG_URL_MAX + 1];
+    if (hdr.value_len > HTTP_CFG_URL_MAX) {
+        ESP_LOGW(TAG, "net.config value too long: %u", hdr.value_len);
+        goto reply;
+    }
+    memcpy(value, payload + sizeof(hdr), hdr.value_len);
+    value[hdr.value_len] = '\0';
+
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    switch (hdr.item) {
+        case WUPS_NET_CONFIG_HTTP_URL:
+            err = http_cfg_set_url(value);
+            ESP_LOGI(TAG, "net.config HTTP_URL -> '%s' (%s)",
+                     value, esp_err_to_name(err));
+            break;
+        case WUPS_NET_CONFIG_DEVICE_ID:
+            err = http_cfg_set_device_id(value);
+            ESP_LOGI(TAG, "net.config DEVICE_ID -> '%s' (%s)",
+                     value, esp_err_to_name(err));
+            break;
+        default:
+            ESP_LOGW(TAG, "net.config unknown item %u", hdr.item);
+            break;
+    }
+    resp.result = (err == ESP_OK) ? 0 : 1;
+
+reply:
+    wups_link_send_seq(src, WUPS_CLASS_NET, WUPS_OP_NET_CONFIG,
+                       WUPS_FLAG_RESP, seq, &resp, sizeof(resp));
+}
+
 static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
                            uint8_t flags, uint8_t seq,
                            const uint8_t *payload, uint16_t len,
@@ -379,6 +448,10 @@ static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
     if (cls == WUPS_CLASS_NET) {
         if (op == WUPS_OP_NET_PUBLISH && (flags & WUPS_FLAG_REQ)) {
             handle_net_publish(payload, len);
+            return;
+        }
+        if (op == WUPS_OP_NET_CONFIG && (flags & WUPS_FLAG_REQ)) {
+            handle_net_config(src, seq, payload, len);
             return;
         }
         /* status / downlink / time_sync are outbound from us; drop. */

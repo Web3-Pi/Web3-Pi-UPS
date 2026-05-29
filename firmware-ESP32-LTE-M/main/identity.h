@@ -32,6 +32,16 @@ esp_err_t identity_set_iccid(const char *iccid);
 const char *identity_iccid(void);
 const char *identity_mqtt_password_hex(void);
 
+/*
+ * Raw per-device secret (the 32 bytes whose hex form is the MQTT password).
+ * Copies the secret into out[32]. Returns ESP_OK only if identity_init()
+ * loaded it; ESP_ERR_INVALID_STATE otherwise (out is left untouched).
+ *
+ * Used as the HMAC-SHA256 key for the HTTP control-mode request signature
+ * (HTTP-2 / §4.18a). Never log the result.
+ */
+esp_err_t identity_secret_raw(uint8_t out[32]);
+
 /* Stash the modem's IMEI here (read via esp_modem_get_imei) so the MQTT
  * identify publisher can include it. Optional — empty string if unset. */
 void identity_set_imei(const char *imei);

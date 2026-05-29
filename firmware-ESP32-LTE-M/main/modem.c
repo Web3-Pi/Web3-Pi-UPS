@@ -2,6 +2,7 @@
 #include "mqtt.h"
 #include "identity.h"
 #include "backend_mode.h"
+#include "http_backend.h"
 #include "../../common/protocol.h"
 
 #include <ctype.h>
@@ -442,7 +443,13 @@ static void ppp_supervisor_task(void *arg)
                      * the chain/user-endpoint is the only uplink and an
                      * extra MQTT client would just burn LTE data. */
                     const wups_backend_mode_t mode = backend_mode_get();
-                    if (mode != WUPS_BACKEND_MODE_MQTT) {
+                    if (mode == WUPS_BACKEND_MODE_HTTP) {
+                        /* HTTP-2 (§4.18a) — start the HTTP control-mode task.
+                         * It self-paces POSTs to the user-hosted endpoint and
+                         * needs no broker. Idempotent across PPP reconnects. */
+                        ESP_LOGI(MODEM_TAG, "starting HTTP control-mode backend...");
+                        http_backend_start();
+                    } else if (mode != WUPS_BACKEND_MODE_MQTT) {
                         ESP_LOGI(MODEM_TAG,
                                  "skipping MQTT client start — backend mode is %s",
                                  backend_mode_name(mode));

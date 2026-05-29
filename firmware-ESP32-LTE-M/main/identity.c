@@ -31,6 +31,7 @@
 static bool s_secret_ready;
 static char s_iccid[24] = {0};
 static char s_mqtt_password_hex[MQTT_PASSWORD_HEX_LEN + 1] = {0};
+static uint8_t s_secret_raw[MQTT_SECRET_BYTES] = {0};
 static char s_imei[24] = {0};
 
 static bool iccid_shape_ok(const char *s)
@@ -92,6 +93,9 @@ static esp_err_t load_mqtt_secret(void)
         sprintf(s_mqtt_password_hex + i * 2, "%02x", raw[i]);
     }
     s_mqtt_password_hex[MQTT_PASSWORD_HEX_LEN] = '\0';
+    /* Keep the raw bytes too — the HTTP control-mode backend uses them as
+     * the HMAC-SHA256 signing key (HTTP-2 / §4.18a). */
+    memcpy(s_secret_raw, raw, MQTT_SECRET_BYTES);
     return ESP_OK;
 }
 
@@ -131,6 +135,13 @@ esp_err_t identity_set_iccid(const char *iccid)
 
 const char *identity_iccid(void)             { return s_iccid; }
 const char *identity_mqtt_password_hex(void) { return s_mqtt_password_hex; }
+
+esp_err_t identity_secret_raw(uint8_t out[32])
+{
+    if (!s_secret_ready) return ESP_ERR_INVALID_STATE;
+    memcpy(out, s_secret_raw, MQTT_SECRET_BYTES);
+    return ESP_OK;
+}
 
 void identity_set_imei(const char *imei)
 {

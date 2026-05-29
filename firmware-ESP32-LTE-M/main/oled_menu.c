@@ -24,6 +24,7 @@
 #include "backend_mode.h"
 #include "cmdauth_arkiv.h"
 #include "esp_system.h"
+#include "http_cfg.h"
 #include "wups_link.h"
 
 #define TAG "oled_menu"
@@ -51,6 +52,8 @@ typedef enum {
     SCR_MODE,             /* MQTT / ARKIV / HTTP */
     SCR_FACTORY_RESET,    /* confirm screen      */
     SCR_REGEN_ARKIV,      /* confirm screen — re-roll device Arkiv wallet */
+    SCR_HTTP_KEY,         /* show HTTP-mode secret + Back/New                */
+    SCR_HTTP_REGEN,       /* confirm screen — re-roll HTTP-mode secret       */
 } menu_screen_t;
 
 static struct {
@@ -65,10 +68,12 @@ static struct {
 static uint8_t screen_item_count(menu_screen_t s)
 {
     switch (s) {
-        case SCR_ROOT:          return 5;  /* Debug / Mode / Reset / RegenWallet / Back */
+        case SCR_ROOT:          return 6;  /* Debug / Mode / HTTP Key / Reset / Wallet / Back */
         case SCR_MODE:          return 4;  /* MQTT / ARKIV / HTTP / Back  */
         case SCR_FACTORY_RESET: return 2;  /* Back / Wipe                 */
         case SCR_REGEN_ARKIV:   return 2;  /* Back / Regen                */
+        case SCR_HTTP_KEY:      return 2;  /* Back / New key              */
+        case SCR_HTTP_REGEN:    return 2;  /* Back / Regen                */
         default:                return 0;
     }
 }
@@ -81,19 +86,23 @@ static void render_screen(char *out, size_t cap)
     const wups_backend_mode_t cur = backend_mode_get();
     switch (S.screen) {
         case SCR_ROOT: {
-            /* 5 items on a 4-row OLED → scroll. We show 4 rows centered
-             * around the cursor: keep the highlighted item visible. */
-            const char *labels[5] = {
+            /* 6 items on a 4-row OLED → scroll a 4-row window that keeps the
+             * highlighted item visible with a little context above it. */
+            const char *labels[6] = {
                 "Debug",
                 "Mode",
+                "HTTP Key",
                 "Reset",
                 "Wallet",   /* short for "Regen Arkiv Wallet" */
                 "Back",
             };
-            uint8_t first = (S.cursor >= 3) ? (uint8_t)(S.cursor - 2) : 0;
-            if (first > 1) first = 1;   /* never scroll past last full window */
+            const int n = 6;
+            int first = 0;
+            if (S.cursor >= 3) first = (int)S.cursor - 2;
+            if (first > n - 4) first = n - 4;   /* don't scroll past the end */
+            if (first < 0) first = 0;
             int written = 0;
-            for (int row = 0; row < 4 && first + row < 5; ++row) {
+            for (int row = 0; row < 4 && first + row < n; ++row) {
                 int idx = first + row;
                 written += snprintf(out + written,
                                     written < (int)cap ? cap - (size_t)written : 0,
@@ -105,22 +114,49 @@ static void render_screen(char *out, size_t cap)
             break;
         }
         case SCR_MODE:
-            /* `*` = active mode, `NA` = not implemented yet (HTTP) — the
-             * firmware HTTP client lands with plan HTTP-2. Cursor 0 is
-             * intentionally MQTT (not Back) because the user came in
-             * here specifically to flip the mode, not to retreat. */
+            /* `*` = active mode. Cursor 0 is intentionally MQTT (not Back)
+             * because the user came in here specifically to flip the mode. */
             snprintf(out, cap,
                      "%cMQTT  %c\n"
                      "%cARKIV %c\n"
-                     "%cHTTP  %s\n"
+                     "%cHTTP  %c\n"
                      "%cBack",
                      S.cursor == 0 ? '>' : ' ',
                      cur == WUPS_BACKEND_MODE_MQTT  ? '*' : ' ',
                      S.cursor == 1 ? '>' : ' ',
                      cur == WUPS_BACKEND_MODE_ARKIV ? '*' : ' ',
                      S.cursor == 2 ? '>' : ' ',
-                     cur == WUPS_BACKEND_MODE_HTTP  ? "*" : "NA",
+                     cur == WUPS_BACKEND_MODE_HTTP  ? '*' : ' ',
                      S.cursor == 3 ? '>' : ' ');
+            break;
+        case SCR_HTTP_KEY: {
+            /* Show the HTTP-mode shared secret so the operator can type it
+             * into their server. Two groups of 8 (with a mid-space) fit the
+             * 64-px width. http_cfg generates one on first read. */
+            char code[HTTP_CFG_SECRET_CHARS + 1];
+            if (http_cfg_get_secret(code, sizeof code) != ESP_OK) {
+                snprintf(out, cap, "HTTP KEY\nERROR\n%cBack", '>');
+                break;
+            }
+            snprintf(out, cap,
+                     "%.4s %.4s\n"
+                     "%.4s %.4s\n"
+                     "%cBack\n"
+                     "%cNew key",
+                     code, code + 4, code + 8, code + 12,
+                     S.cursor == 0 ? '>' : ' ',
+                     S.cursor == 1 ? '>' : ' ');
+            break;
+        }
+        case SCR_HTTP_REGEN:
+            /* Back-first safety: regen invalidates the code the operator
+             * already configured on their server. */
+            snprintf(out, cap,
+                     "NEW HTTP\nKEY?\n"
+                     "%cBack\n"
+                     "%cRegen",
+                     S.cursor == 0 ? '>' : ' ',
+                     S.cursor == 1 ? '>' : ' ');
             break;
         case SCR_FACTORY_RESET:
             /* Cursor opens on Back (item 0) so a confirm screen drilled
@@ -213,17 +249,22 @@ static bool activate_current(void)
                     S.cursor = 0;
                     push_screen();
                     break;
-                case 2:  /* Reset → confirm screen */
+                case 2:  /* HTTP Key → show/regenerate the HTTP-mode secret */
+                    S.screen = SCR_HTTP_KEY;
+                    S.cursor = 0;
+                    push_screen();
+                    break;
+                case 3:  /* Reset → confirm screen */
                     S.screen = SCR_FACTORY_RESET;
                     S.cursor = 0;
                     push_screen();
                     break;
-                case 3:  /* Wallet → regen Arkiv confirm screen */
+                case 4:  /* Wallet → regen Arkiv confirm screen */
                     S.screen = SCR_REGEN_ARKIV;
                     S.cursor = 0;
                     push_screen();
                     break;
-                case 4:  /* Back / exit menu */
+                case 5:  /* Back / exit menu */
                     ESP_LOGI(TAG, "menu → back (exit)");
                     /* Tell the RP2040 to drop back to the home dashboard
                      * and release the OLED. The trust_ui session is
@@ -256,10 +297,13 @@ static bool activate_current(void)
                     backend_mode_request_switch(target);
                     break;
                 }
-                case 2:  /* HTTP — not implemented (plan HTTP-2) */
-                    ESP_LOGW(TAG, "menu → HTTP selected, but firmware HTTP "
-                                   "client not implemented (plan HTTP-2)");
+                case 2:  /* HTTP control mode (plan HTTP-2) */
+                {
+                    push_transition_screen("SWITCHING\nTO HTTP\nPlease\nwait...");
+                    ESP_LOGI(TAG, "menu → switch to http");
+                    backend_mode_request_switch(WUPS_BACKEND_MODE_HTTP);
                     break;
+                }
                 case 3:  /* Back → root */
                     S.screen = SCR_ROOT;
                     S.cursor = 1;  /* land back on "Mode" so re-entry is easy */
@@ -302,6 +346,38 @@ static bool activate_current(void)
                     vTaskDelay(pdMS_TO_TICKS(1500));
                     push_screen();   /* back to the confirm screen */
                 }
+            }
+            return false;
+        case SCR_HTTP_KEY:
+            if (S.cursor == 0) {
+                /* Back → root, land on "HTTP Key" */
+                S.screen = SCR_ROOT;
+                S.cursor = 2;
+                push_screen();
+            } else {
+                /* New key → confirm screen */
+                S.screen = SCR_HTTP_REGEN;
+                S.cursor = 0;
+                push_screen();
+            }
+            return false;
+        case SCR_HTTP_REGEN:
+            if (S.cursor == 0) {
+                /* Back → show the (unchanged) key again */
+                S.screen = SCR_HTTP_KEY;
+                S.cursor = 0;
+                push_screen();
+            } else {
+                ESP_LOGW(TAG, "menu → regenerate HTTP secret confirmed");
+                esp_err_t err = http_cfg_regenerate_secret();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "HTTP secret regen failed: %s",
+                             esp_err_to_name(err));
+                }
+                /* No reboot needed — the next POST reads the new key. Show it. */
+                S.screen = SCR_HTTP_KEY;
+                S.cursor = 0;
+                push_screen();
             }
             return false;
     }

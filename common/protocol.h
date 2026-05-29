@@ -123,7 +123,21 @@ typedef enum {
     WUPS_OP_NET_PUBLISH       = 0x02,
     WUPS_OP_NET_DOWNLINK      = 0x10,
     WUPS_OP_NET_TIME_SYNC     = 0x20,
+    /* HTTP-2 (§4.18a) — runtime config of the ESP32's HTTP control-mode
+       backend, set from the RPi host so a fielded unit can be pointed at a
+       user-hosted endpoint without re-flashing (the production board exposes
+       only a JST programming header, not USB-C). REQ → ESP32 persists the
+       item in writable NVS; ESP32 replies with a RESP carrying a 1-byte
+       result (0 = ok). RP2040 routes RPi→ESP32 frames unchanged, so this
+       needs no RP2040 firmware change. Payload: wups_net_config_v1_hdr_t. */
+    WUPS_OP_NET_CONFIG        = 0x21,
 } wups_op_net_t;
+
+/* net.config items (the `item` field of wups_net_config_v1_hdr_t). */
+typedef enum {
+    WUPS_NET_CONFIG_HTTP_URL   = 0x01,  /* base URL, e.g. "https://ups.example.com" */
+    WUPS_NET_CONFIG_DEVICE_ID  = 0x02,  /* optional device_id override (default = ICCID) */
+} wups_net_config_item_t;
 
 /* Class 0x04 HOST (RPi) */
 typedef enum {
@@ -268,6 +282,25 @@ typedef struct WUPS_PACKED {
     uint16_t ms_frac;        /* milliseconds part of the second */
     uint32_t unix_s;
 } wups_net_time_sync_v1_t;
+
+/* net.config REQ (RPi -> ESP32). Header followed by `value_len` ASCII bytes
+ * (no NUL). See WUPS_OP_NET_CONFIG. The RESP echoes the SEQ and carries a
+ * single result byte (wups_net_config_result_v1_t). */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 1 */
+    uint8_t  item;           /* wups_net_config_item_t */
+    uint8_t  value_len;      /* bytes of ASCII value following (up to 200) */
+    uint8_t  reserved;
+    /* char value[value_len] follows */
+} wups_net_config_v1_hdr_t;
+
+/* net.config RESP (ESP32 -> RPi). */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 1 */
+    uint8_t  item;           /* echoes the REQ item */
+    uint8_t  result;         /* 0 = ok, non-zero = error */
+    uint8_t  reserved;
+} wups_net_config_result_v1_t;
 
 /* host.status — RPi -> RP2040 */
 typedef struct WUPS_PACKED {
