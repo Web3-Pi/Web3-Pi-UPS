@@ -12,6 +12,7 @@ desktop.ini
 
 # Firmware build artifacts
 build/
+build*/
 *.o
 *.elf
 *.hex
@@ -44,10 +45,4 @@ docs/tmp/
 
 # Local AI assistant context / scratchpads (not part of the codebase itself)
 /PROGRESS.md
-
-.claude-flow/data/pending-insights.jsonl
-.gitignore
-firmware-rp2040/src/.claude-flow/data/pending-insights.jsonl
-.gitignore
-firmware-rp2040/.claude-flow/data/pending-insights.jsonl
-firmware-ESP32-LTE-M/.claude-flow/data/pending-insights.jsonl
+.claude-flow/
