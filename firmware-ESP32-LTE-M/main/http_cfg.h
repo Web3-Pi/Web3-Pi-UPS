@@ -6,8 +6,8 @@
  * The base URL of the user-hosted endpoint is NOT compiled in: a fielded unit
  * is pointed at the operator's server at runtime, written from the RPi host
  * over the WUPS link (net.config, see wups_link.c) and persisted in the
- * writable `nvs` partition. This avoids re-flashing the ESP32 — the production
- * board exposes only a JST programming header, not USB-C.
+ * writable `nvs` partition. This avoids re-flashing a fielded ESP32 (whose USB
+ * may not be accessible in the enclosure).
  *
  * A compile-time default (HTTP_ENDPOINT_BASE in secrets.h) is used only as a
  * fallback when NVS has no value yet, which keeps bench/dev bring-up simple.

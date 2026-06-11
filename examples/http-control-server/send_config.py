@@ -3,8 +3,8 @@
 Set the UPS's HTTP control-mode endpoint from the Raspberry Pi host
 (HTTP-2 / plan §4.18a, config option "A").
 
-The production board has no USB-C — you don't re-flash the ESP32 to point it
-at your server. Instead the RPi sends a `net.config` WUPS frame down the
+You don't re-flash a fielded ESP32 to point it at your server (its USB may not
+be accessible in the enclosure). Instead the RPi sends a `net.config` WUPS frame down the
 existing serial link; the RP2040 routes it to the ESP32 (no RP2040 change),
 which persists the value in NVS. It takes effect when the device is in HTTP
 backend mode.

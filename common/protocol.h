@@ -125,8 +125,8 @@ typedef enum {
     WUPS_OP_NET_TIME_SYNC     = 0x20,
     /* HTTP-2 (§4.18a) — runtime config of the ESP32's HTTP control-mode
        backend, set from the RPi host so a fielded unit can be pointed at a
-       user-hosted endpoint without re-flashing (the production board exposes
-       only a JST programming header, not USB-C). REQ → ESP32 persists the
+       user-hosted endpoint without re-flashing (the ESP32's USB may not be
+       accessible in the enclosure). REQ → ESP32 persists the
        item in writable NVS; ESP32 replies with a RESP carrying a 1-byte
        result (0 = ok). RP2040 routes RPi→ESP32 frames unchanged, so this
        needs no RP2040 firmware change. Payload: wups_net_config_v1_hdr_t. */

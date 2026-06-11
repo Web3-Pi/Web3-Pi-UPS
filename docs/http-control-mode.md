@@ -191,8 +191,9 @@ worked example.
 
 ## 6. Configuring the endpoint (no re-flash)
 
-The production board has no USB-C — you do **not** re-flash the ESP32 to point
-it at your server. The endpoint is set at runtime from the **Raspberry Pi
+You do **not** re-flash the ESP32 to point a fielded unit at your server (the
+ESP32's USB may not even be accessible in the enclosure). The endpoint is set
+at runtime from the **Raspberry Pi
 host**, which sends a `net.config` frame (NET op `0x21`, see `protocol.h`) down
 the existing serial link. The RP2040 routes RPi→ESP32 frames unchanged (no
 RP2040 firmware change), and the ESP32 persists the value in its writable `nvs`

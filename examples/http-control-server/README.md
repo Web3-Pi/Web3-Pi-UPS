@@ -61,7 +61,7 @@ want privacy (see below).
 | File | What it is |
 |---|---|
 | [`server.py`](server.py) | The reference server. Verifies signatures, prints telemetry, lets you enqueue commands from the terminal, returns + clears them via acks. |
-| [`send_config.py`](send_config.py) | Run on the **RPi host**: points a fielded device at your server by sending a `net.config` frame over the serial link (no re-flash, no USB-C). Needs pyserial (`sudo apt install -y python3-serial`). |
+| [`send_config.py`](send_config.py) | Run on the **RPi host**: points a fielded device at your server by sending a `net.config` frame over the serial link (no ESP32 re-flash). Needs pyserial (`sudo apt install -y python3-serial`). |
 | [`test_client.py`](test_client.py) | Simulates a device POST (correct signature) so you can smoke-test the server — or a public TLS deployment — without hardware. |
 
 ## Quick start (no hardware)
