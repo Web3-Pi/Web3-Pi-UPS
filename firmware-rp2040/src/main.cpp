@@ -1444,14 +1444,25 @@ void loop() {
   // directly to the debug screens (Power=1 is the first one in the strip
   // 1→2→3→PD_DIAG→POWER_PATH→POWER_CTRL); a second short beep flags the
   // fallback so the user can tell the menu didn't open.
+  //
+  // TEMPORARY (2026-06-09): debug-screen fallback disabled. With no ESP32
+  // module the long-LEFT gesture used to drop into the RP2040-local debug
+  // screens and short presses then navigated them — we don't want that UX
+  // right now. We still emit the "NO ESP32" beep so the gesture is
+  // acknowledged, but stay on the home dashboard (currentScreen stays 0, so
+  // the short-press nav below is a no-op). Flip this back to true to restore
+  // the old behaviour.
+  constexpr bool ENABLE_DEBUG_SCREEN_FALLBACK = false;
   if (menu_pending_deadline_ms != 0) {
     if (trust_ui_active()) {
       menu_pending_deadline_ms = 0;
     } else if ((int32_t)(millis() - menu_pending_deadline_ms) >= 0) {
       menu_pending_deadline_ms = 0;
       tone(BUZZER_PIN, 1500, 80);
-      currentScreen = 1;
-      lastInteractionTime = millis();
+      if (ENABLE_DEBUG_SCREEN_FALLBACK) {
+        currentScreen = 1;
+        lastInteractionTime = millis();
+      }
     }
   }
 
