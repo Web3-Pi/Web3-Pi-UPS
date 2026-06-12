@@ -586,9 +586,9 @@ static void wups_send_hello_bcast(void)
                     &h, sizeof(h));
 }
 
-/* power.event broadcast helper. Not yet wired into a detector — kept
- * here so the event taxonomy is callable when we add edge detection. */
-__attribute__((unused))
+/* power.event broadcast helper. Fired by wups_power_event_tick() below;
+ * RP2040 wraps the frame into net.publish("event") for the panel's
+ * event log (and the RPi sees the broadcast directly). */
 static void wups_send_power_event(uint8_t event)
 {
     wups_power_event_v1_t e;
@@ -597,6 +597,100 @@ static void wups_send_power_event(uint8_t event)
     wups_send_frame(WUPS_ADDR_BROADCAST, WUPS_CLASS_POWER,
                     WUPS_OP_PWR_EVENT, WUPS_FLAG_EVENT, Wups_Tx_Seq++,
                     &e, sizeof(e));
+}
+
+/* --- power.event edge detector ------------------------------------------
+ *
+ * Samples the same globals the 1 Hz power.status frame is composed from
+ * and emits alert-class events on TRANSITIONS only. Must run BEFORE
+ * wups_send_power_status() in the 1 Hz block: the status send clears
+ * Tps_Status_Latched after packing, and the charger poll clears
+ * Chg_Data.fault on recovery — this detector wants to see those bits too.
+ *
+ * Mains presence uses the same source the panel derives "Mains" from
+ * (DC_Inp_Voltage_mV, PA1 ADC) with a ±500 mV hysteresis band around the
+ * panel's 5 V threshold so a brownout hovering at the threshold doesn't
+ * flap events. First tick primes silently — booting on battery is a
+ * state, not an event.
+ */
+#define PWR_EVT_MAINS_ON_MV     5500u  /* rising  edge: declare "present"   */
+#define PWR_EVT_MAINS_OFF_MV    4500u  /* falling edge: declare "lost"      */
+#define PWR_EVT_VBAT_LOW_MV     6900u  /* 2S pack ~3.45 V/cell ≈ low charge */
+#define PWR_EVT_VBAT_REARM_MV   7300u  /* hysteresis re-arm for CHARGE_LOW  */
+#define PWR_EVT_FAULT_HOLD_S    30u    /* min spacing between FAULT events  */
+
+static void wups_power_event_tick(void)
+{
+    static uint8_t  Evt_Primed       = 0;
+    static uint8_t  Evt_Mains        = 0;   /* 1 = mains present            */
+    static uint16_t Evt_Prev_Faults  = 0;
+    static uint8_t  Evt_Prev_Cs      = 0;
+    static uint8_t  Evt_Batt_Low     = 0;   /* CHARGE_LOW armed/fired latch */
+    static UINT32   Evt_Last_Fault_S = 0;
+
+    /* Mains with hysteresis. */
+    uint8_t mains = Evt_Mains ? (DC_Inp_Voltage_mV > PWR_EVT_MAINS_OFF_MV)
+                              : (DC_Inp_Voltage_mV > PWR_EVT_MAINS_ON_MV);
+
+    /* Fault bitmap composed exactly like power.status (MP2762A low byte +
+     * TPS55289 latched bits in the high byte). Latch is NOT cleared here —
+     * the status send right after us does that. */
+    uint16_t tps_flags = 0;
+    if (Tps_Status_Latched & STATUS_SCP_BIT) tps_flags |= (1u << 8);
+    if (Tps_Status_Latched & STATUS_OCP_BIT) tps_flags |= (1u << 9);
+    if (Tps_Status_Latched & STATUS_OVP_BIT) tps_flags |= (1u << 10);
+    uint16_t faults = (uint16_t)(Chg_Data.fault | tps_flags);
+
+    uint8_t cs = (uint8_t)Chg_Data.chg_state;
+
+    if (!Evt_Primed)
+    {
+        Evt_Primed      = 1;
+        Evt_Mains       = mains;
+        Evt_Prev_Faults = faults;
+        Evt_Prev_Cs     = cs;
+        return;
+    }
+
+    if (mains != Evt_Mains)
+    {
+        Evt_Mains = mains;
+        wups_send_power_event(mains ? WUPS_PWR_EVT_MAINS_RESTORED
+                                    : WUPS_PWR_EVT_MAINS_LOST);
+        if (mains) Evt_Batt_Low = 0;   /* charger will refill — re-arm low */
+    }
+
+    /* FAULT: any NEW fault bit. Chg_Data.fault pulses (recovery clears it)
+     * and the TPS latch resets every second, so rate-limit to one event
+     * per PWR_EVT_FAULT_HOLD_S even if the same fault keeps re-tripping. */
+    if ((uint16_t)(faults & (uint16_t)~Evt_Prev_Faults) != 0 &&
+        (UINT32)(Uptime_Sec - Evt_Last_Fault_S) >= PWR_EVT_FAULT_HOLD_S)
+    {
+        Evt_Last_Fault_S = Uptime_Sec;
+        wups_send_power_event(WUPS_PWR_EVT_FAULT);
+    }
+    Evt_Prev_Faults = faults;
+
+    /* CHARGE_FULL: charger entered termination (cs=3) — only meaningful
+     * with mains present (cs is garbage when the MP2762A is unpowered). */
+    if (mains && cs == 3 && Evt_Prev_Cs != 3)
+    {
+        wups_send_power_event(WUPS_PWR_EVT_CHARGE_FULL);
+    }
+    Evt_Prev_Cs = cs;
+
+    /* CHARGE_LOW: discharging below the low-water mark. One-shot, re-armed
+     * by recovery above PWR_EVT_VBAT_REARM_MV or by mains coming back. */
+    if (!mains && !Evt_Batt_Low && Vbat_Voltage_mV < PWR_EVT_VBAT_LOW_MV &&
+        Vbat_Voltage_mV > 1000u /* sanity: ignore no-battery readings */)
+    {
+        Evt_Batt_Low = 1;
+        wups_send_power_event(WUPS_PWR_EVT_CHARGE_LOW);
+    }
+    else if (Evt_Batt_Low && Vbat_Voltage_mV > PWR_EVT_VBAT_REARM_MV)
+    {
+        Evt_Batt_Low = 0;
+    }
 }
 
 /* Inbound dispatch — invoked when the deframer has a complete frame. */
@@ -1061,6 +1155,9 @@ int main(void)
             Vbat_ADC_Val = Get_ADC_Val(ADC_Channel_5);
             Vbat_Voltage_mV = (UINT16)((UINT32)Vbat_ADC_Val * 10322u / 4096u);
 
+            /* Edge detector first — it reads the same fault latch the
+             * status send below clears after packing. */
+            wups_power_event_tick();
             wups_send_power_status(WUPS_ADDR_RP2040, WUPS_FLAG_EVENT, Wups_Tx_Seq++);
         }
     }
