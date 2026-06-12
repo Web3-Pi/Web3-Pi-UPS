@@ -756,6 +756,7 @@ static void drawScreenPowerCtrl() {
 static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t& s);
 static void wupsPublishHostStatus(uint8_t seq, const wups_host_status_v1_t& s);
 static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq, uint8_t code);
+static void wupsPublishEventFrame(const WupsFrame& f);
 
 // Cellular uplink is metered: the M.2 modem runs on a ~500 MB/mo LTE data
 // plan, sized from measured packet sizes. The CH32X pushes power.status
@@ -776,7 +777,20 @@ static bool     Last_Uplink_Pg           = false;  // input "good" at last uplin
 static uint16_t Last_Uplink_Faults       = 0;      // charger faults at last uplink
 
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
-  (void)inbound_port;
+  // power.event / host.event (op 0x10, EVENT) — alert-class state changes
+  // (mains lost/restored, charger fault, host shutdown-imminent, …). The
+  // ESP32 uplinks ONLY net.publish-wrapped payloads, so the raw broadcast
+  // the router already forwarded to its port dies there — this wrap is the
+  // only path an event has to the panel's event log. Re-encoded verbatim
+  // (SRC preserved) onto the "event" subtopic. inbound_port guard: a frame
+  // that arrived FROM the ESP32 (net.downlink re-injection) must not bounce
+  // straight back out as a fresh uplink.
+  if ((f.flags & WUPS_FLAG_EVENT) && inbound_port != WUPS_PORT_ESP32 &&
+      ((f.cls == WUPS_CLASS_POWER && f.op == WUPS_OP_PWR_EVENT) ||
+       (f.cls == WUPS_CLASS_HOST  && f.op == WUPS_OP_HOST_EVENT))) {
+    wupsPublishEventFrame(f);
+    return;
+  }
 
   // CH32X power.status — cache and project into the `ui` snapshot so the
   // OLED / alarm code keeps working unchanged. PD detail and snk_* are not
@@ -1219,6 +1233,21 @@ static void wupsPublishHostStatus(uint8_t seq, const wups_host_status_v1_t& s) {
                             WUPS_FLAG_EVENT, seq, &s, sizeof(s));
   if (n == 0) return;
   wupsRequestPublish("telemetry", /*qos=*/0, /*retain=*/0, frame, (uint16_t)n);
+}
+
+// Wrap an alert-class event frame (power.event / host.event) verbatim and
+// ship it onto the "event" subtopic. SRC is preserved so the panel's
+// dispatcher attributes the event to the MCU that raised it. QoS 1 —
+// these are rare state-transition frames; losing one leaves a hole in the
+// event log, unlike the periodic telemetry stream where the next sample
+// heals any gap.
+static void wupsPublishEventFrame(const WupsFrame& f) {
+  uint8_t frame[WUPS_FRAMING_BYTES + 64];
+  size_t n = wupsBuildFrame(frame, sizeof(frame),
+                            f.dst, f.src, f.cls, f.op,
+                            f.flags, f.seq, f.payload, f.len);
+  if (n == 0) return;
+  wupsRequestPublish("event", /*qos=*/1, /*retain=*/0, frame, (uint16_t)n);
 }
 
 // Send `system.hello` broadcast on boot so other nodes can discover us.
