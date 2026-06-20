@@ -37,6 +37,7 @@
 #include "tps55289.h"
 #include "lm75b.h"
 #include "mp2762a.h"
+#include "husb238.h"
 #include "wups_proto.h"
 
 /* ADC WWDG Mode Definition*/
@@ -91,6 +92,22 @@ static UINT16   Diag_Log_Timer_Ms = 0;
 #define DIAG_LOG_INTERVAL_MS 5000
 static int16_t  Board_Temp_c10 = 0;
 static mp2762a_data_t Chg_Data = {0};
+/* HUSB238 INPUT-side PD sink contract (rev.3). CH32X is a passive reader;
+ * see User/husb238.h. Refreshed in the 2 s charger-poll block, surfaced in
+ * the 5 s diagnostic system.log. NOT yet in the power.status wire struct —
+ * v1 is full (20 B) and the strict RPi-host parser requires exact len +
+ * version==1, so structured exposure is a coordinated protocol-v2 follow-up. */
+static husb238_data_t Husb_Data = {0};
+/* Auto input-PD negotiation (rev.3). The HUSB238 VSET/ISET straps pick the
+ * highest source PDO meeting a fixed current floor, which on most chargers
+ * yields a weak low-V contract (RPi 27W -> 5V/3.25A). Once per attach the
+ * CH32X overrides via I2C (priority over the straps) and applies the
+ * selection policy in husb238.h (satisfice >=45W at the most efficient
+ * voltage; 9-20 V; <=5 A). */
+static husb238_src_caps_t Husb_Caps = {0};
+static uint8_t  Husb_Pd_Optimized = 0;   /* one-shot latch, re-armed on detach */
+static uint8_t  Husb_Pick_Sel = 0;       /* HUSB238_SEL_* chosen for diag log */
+static uint8_t  Diag_Toggle = 0;         /* alternates MP2762A / HUSBcaps diag lines */
 static int16_t  Tps_Vread_v10 = 0;
 static int16_t  Tps_Iread_a10 = 0;
 /* TPS55289 STATUS register bits — accumulated across polls. SCP/OCP/OVP
@@ -919,6 +936,7 @@ int main(void)
     Delay_Ms(10);  // Wait for TPS55289 to stabilize after PDS_EN=1
     tps55289_init();
     mp2762a_init();
+    husb238_init();   /* INPUT PD sink (rev.3) — passive I2C reader */
 
     EXTI_INIT();
     TIM1_Init( 999, 48-1);
@@ -1044,6 +1062,46 @@ int main(void)
             Chg_Timer_Ms = 0;
             mp2762a_read_all(&Chg_Data);
             mp2762a_kick_watchdog();
+            /* HUSB238 negotiates a default INPUT PD contract autonomously
+             * (from its VSET/ISET straps); read back what's in effect.
+             * Shares the slow bit-bang bus with the charger poll — 2 s is
+             * plenty since the contract only changes on attach/renegotiation. */
+            husb238_read_all(&Husb_Data);
+
+            /* (Re)negotiate off the HUSB238 PD-attach state, which is
+             * USB-C-specific (the HUSB238's VIN is the USB-C VBUS only).
+             * Do NOT use the PA1 input-voltage ADC for this: PA1 sits after
+             * the ideal-diode OR of USB-C and the barrel jack, so it can't
+             * tell a USB-C unplug from barrel power still being present.
+             * `attached` is hardened in husb238_read_all to reject the
+             * 0x00/0xFF an unpowered chip leaves on the shared bus, so a
+             * USB-C unplug reliably reads detached -> re-arm -> the next plug
+             * (or a swapped charger) renegotiates. */
+            if (Husb_Data.attached) {
+                if (!Husb_Pd_Optimized) {
+                    husb238_read_src_caps(&Husb_Caps);
+                    if (Husb_Caps.detected_mask == 0) {
+                        /* Caps not latched yet — nudge the source and retry
+                         * next poll (leave the one-shot un-armed). */
+                        husb238_write_reg(HUSB238_REG_GO_COMMAND, HUSB238_CMD_GET_SRC_CAP);
+                    } else {
+                        Husb_Pick_Sel = husb238_pick_best_pdo(&Husb_Caps);
+                        if (Husb_Pick_Sel != HUSB238_SEL_NONE) {
+                            if (husb238_sel_to_mV(Husb_Pick_Sel) != Husb_Data.voltage_mV) {
+                                husb238_select_pdo(Husb_Pick_Sel);  /* renegotiate */
+                            }
+                            /* Latch only on a real pick — if caps came back
+                             * garbled (mask set but all 0 mA), leave un-armed
+                             * so the next poll re-reads and self-heals. */
+                            Husb_Pd_Optimized = 1;
+                        }
+                    }
+                }
+            } else {
+                Husb_Pd_Optimized = 0;
+                Husb_Pick_Sel = HUSB238_SEL_NONE;
+                Husb_Caps.detected_mask = 0;
+            }
         }
 
         /* Check battery insertion/removal every 500ms */
@@ -1072,6 +1130,13 @@ int main(void)
         if (Diag_Log_Timer_Ms >= DIAG_LOG_INTERVAL_MS)
         {
             Diag_Log_Timer_Ms = 0;
+            /* Alternate the heavy lines so each 5 s burst is <= 2 system.log
+             * frames — RP2040's debug forwarder drops a 3rd back-to-back
+             * frame. The HUSB238 contract goes out every cycle; the MP2762A
+             * dump and HUSBcaps take turns (each every 10 s). */
+            Diag_Toggle ^= 1;
+
+            if (!Diag_Toggle) {
             uint8_t r00 = mp2762a_read_reg(MP2762A_REG_INPUT_ILIM);
             uint8_t r0F = mp2762a_read_reg(MP2762A_REG_INPUT_ILIM2);
             uint8_t r02 = mp2762a_read_reg(MP2762A_REG_CHG_CURR);
@@ -1135,6 +1200,64 @@ int main(void)
             #undef EMIT_HEX
             buf[p] = 0;
             wups_send_log(2 /* info */, buf);
+            } /* end MP2762A dump (alternate cycle) */
+
+            /* HUSB238 INPUT PD sink contract (rev.3) — emitted EVERY cycle as
+             * the primary input-PD signal (until power.status gains dedicated
+             * fields, a protocol-v2 follow-up). Hand-rolled formatter (no
+             * newlib printf): decimal mV/mA + raw nibble codes for debugging. */
+            {
+                char hbuf[72];
+                const char hhex[] = "0123456789ABCDEF";
+                int hp = 0;
+                #define HEMIT_STR(s_) do { const char *__s = (s_); while (*__s) hbuf[hp++] = *__s++; } while(0)
+                #define HEMIT_U16(v_) do { \
+                    uint16_t __v = (v_); char __t[5]; int __n = 0; \
+                    if (__v == 0) { hbuf[hp++] = '0'; } \
+                    else { while (__v) { __t[__n++] = (char)('0' + __v % 10); __v /= 10; } \
+                           while (__n) hbuf[hp++] = __t[--__n]; } \
+                } while(0)
+                HEMIT_STR("HUSB att="); hbuf[hp++] = Husb_Data.attached ? '1' : '0';
+                HEMIT_STR(" Vin=");  HEMIT_U16(Husb_Data.voltage_mV); HEMIT_STR("mV");
+                HEMIT_STR(" Iin=");  HEMIT_U16(Husb_Data.current_mA); HEMIT_STR("mA");
+                HEMIT_STR(" v=");    hbuf[hp++] = hhex[Husb_Data.v_code & 0xF];
+                HEMIT_STR(" i=");    hbuf[hp++] = hhex[Husb_Data.i_code & 0xF];
+                HEMIT_STR(" resp="); hbuf[hp++] = hhex[Husb_Data.last_response & 0xF];
+                #undef HEMIT_STR
+                #undef HEMIT_U16
+                hbuf[hp] = 0;
+                wups_send_log(2 /* info */, hbuf);
+            }
+
+            /* HUSB238 source capabilities (advertised mA per voltage, '-' =
+             * not offered) + the PDO the auto-negotiator picked — alternate
+             * cycles (every 10 s), so the selection policy is visible on HW. */
+            if (Diag_Toggle) {
+                static const char *const HLBL[HUSB238_PDO_COUNT] =
+                    { "5", "9", "12", "15", "18", "20" };
+                char cbuf[96];
+                int cp = 0;
+                #define CEMIT_STR(s_) do { const char *__s = (s_); while (*__s) cbuf[cp++] = *__s++; } while(0)
+                #define CEMIT_U16(v_) do { \
+                    uint16_t __v = (v_); char __t[5]; int __n = 0; \
+                    if (__v == 0) { cbuf[cp++] = '0'; } \
+                    else { while (__v) { __t[__n++] = (char)('0' + __v % 10); __v /= 10; } \
+                           while (__n) cbuf[cp++] = __t[--__n]; } \
+                } while(0)
+                CEMIT_STR("HUSBcaps");
+                for (int i = 0; i < HUSB238_PDO_COUNT; i++) {
+                    cbuf[cp++] = ' ';
+                    CEMIT_STR(HLBL[i]);
+                    cbuf[cp++] = '=';
+                    if (Husb_Caps.detected_mask & (1u << i)) CEMIT_U16(Husb_Caps.current_mA[i]);
+                    else cbuf[cp++] = '-';
+                }
+                CEMIT_STR(" pick="); CEMIT_U16(husb238_sel_to_mV(Husb_Pick_Sel));
+                #undef CEMIT_STR
+                #undef CEMIT_U16
+                cbuf[cp] = 0;
+                wups_send_log(2 /* info */, cbuf);
+            }
         }
 
         /* Periodic power.status push to RP2040 (1 Hz, EVENT flag). */
