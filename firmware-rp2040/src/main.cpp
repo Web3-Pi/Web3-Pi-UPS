@@ -174,11 +174,15 @@ constexpr uint8_t BTN_RIGHT_PIN = 14;  // GPIO14 - right button (active LOW)
 constexpr unsigned long DEBOUNCE_MS = 50;
 
 // --- Screen navigation ---
-constexpr uint8_t SCREEN_COUNT = 7;
-constexpr uint8_t SCREEN_PD_DIAG = 4;       // PD/TPS diagnostic readout
-constexpr uint8_t SCREEN_POWER_PATH = 5;    // VIN / IIN / VSYS power-path readout
-constexpr uint8_t SCREEN_POWER_CTRL = 6;    // last screen — buttons act as power on/off
-constexpr unsigned long AUTO_RETURN_MS = 15000;  // Auto-return to home after 15s
+// Screen strip (power.status v2 debug screens). Home (0) is the dashboard;
+// 1..4 are the developer readouts split along the v2 struct sections.
+constexpr uint8_t SCREEN_HOME    = 0;
+constexpr uint8_t SCREEN_INPUT   = 1;   // VIN / input PD contract / source
+constexpr uint8_t SCREEN_OUTPUT  = 2;   // Vout RP2040 vs CH32X / output PD / Ilim
+constexpr uint8_t SCREEN_BATTERY = 3;   // Vbat RP2040 vs CH32X / mode / charge current
+constexpr uint8_t SCREEN_SYSTEM  = 4;   // uptime / temps / fault bitmap
+constexpr uint8_t SCREEN_COUNT   = 5;
+constexpr unsigned long AUTO_RETURN_MS = 20000;  // Auto-return to home after 20s
 
 // --- Bad charger alert state ---
 bool badChargerAlertPlayed = false;
@@ -199,11 +203,20 @@ unsigned long lastInteractionTime = 0;
 bool lastBtnLeftState = HIGH;
 bool lastBtnRightState = HIGH;
 
-// --- Cached CH32X power.status (binary v1) ---
-// CH32X emits a power.status frame every 1 s. wups_on_local_frame() copies
-// the payload here and projects fields into the `ui` snapshot below.
+// --- Cached CH32X power.status ---
+// CH32X emits a power.status frame every 1 s. wups_on_local_frame() projects
+// fields into the `ui` snapshot below. The v2 redesign is NOT a prefix-
+// compatible superset of v1, so we cache the RAW payload (version-agnostic)
+// for the republish / uplink paths — forwarding the decoded struct would
+// truncate the v2 tail. Last_Power_Status / Last_Pwr_V2 are kept as decoded
+// snapshots for convenience but MUST NOT gate forwarding.
 wups_power_status_v1_t Last_Power_Status = {};
+static wups_power_status_v2_t Last_Pwr_V2 = {};
 unsigned long Last_Power_Status_Ms = 0;
+
+// Raw last-accepted power.status payload (any version) for republish/uplink.
+static uint8_t  Last_Pwr_Raw[WUPS_MAX_PAYLOAD];
+static uint16_t Last_Pwr_Raw_Len = 0;
 
 // --- UPS view: snapshot for OLED rendering and alarm logic ----------------
 // Populated by wups_on_local_frame() from CH32X power.status (binary v1)
@@ -224,6 +237,17 @@ static struct {
     int vr, ir;     // VBUS_OUT V/A (0.1 V / 0.1 A units)
     // Held at last known from previous protocol; not yet in v1 power.status:
     int pd, pdo, role, snk_ok, snk_v, snk_i;
+    // From CH32X power.status v2 (raw mV / mA, 0 = N/A sentinel for PD fields):
+    int pd_in_mV, pd_in_mA;     // HUSB238 input contract (0 = no contract)
+    int pd_out_mV, pd_out_mA;   // output PD contract to the Pi (0 = rail off)
+    int vbus_out_ch_mV;         // CH32X PA0 VBUS_OUT measurement (mV)
+    int vsys_mV;                // MP2762A VSYS rail (mV)
+    int iin_mA;                 // MP2762A charger input current (mA)
+    int temp_lm_dC;             // LM75B board temp (deci-Celsius)
+    int temp_mp_dC;             // MP2762A junction temp (deci-Celsius, -32768 = N/A)
+    int usb_c_attach;           // 1 if HUSB238 reports a PD contract present
+    int soc_ch;                 // SOC from CH32X vbat (0..100, LUT)
+    int iout_limit_mA;          // TPS55289 current LIMIT (mA)
     // Computed locally on RP2040:
     int bv;         // battery voltage (mV, ADC + EMA)
     int soc;        // 0..100 from LUT + adaptive EMA
@@ -439,6 +463,8 @@ static void drawScreenIndicator(uint8_t screen) {
 }
 
 // Screen 0: Home dashboard
+static const __FlashStringHelper* batteryModeLabel(bool mains, int cs);
+
 static void drawScreenHome(int soc, bool noBattery, uint8_t animPhase) {
   // Battery icon (left side, 10x22 pixels)
   drawBatteryIcon(0, 0, soc, displayCs, noBattery, animPhase);
@@ -459,17 +485,7 @@ static void drawScreenHome(int soc, bool noBattery, uint8_t animPhase) {
   // Middle line: charge state + battery voltage
   oled.setTextSize(1);
   oled.setCursor(15, 16);
-  if (noBattery) {
-    oled.print(F("NoB"));
-  } else {
-    switch (displayCs) {
-      case 0: oled.print(F("DSC")); break;
-      case 1: oled.print(F("PRE")); break;
-      case 2: oled.print(F("CHG")); break;
-      case 3: oled.print(F("FUL")); break;
-      default: oled.print(F("---")); break;
-    }
-  }
+  oled.print(batteryModeLabel(ui.pg, displayCs));
   // Battery voltage (right of charge state)
   oled.setCursor(39, 16);
   oled.print(ui.bv / 1000);
@@ -497,239 +513,228 @@ static void drawScreenHome(int soc, bool noBattery, uint8_t animPhase) {
   oled.print(F("V"));
 }
 
-// Screen 1: Power (TPS55289 SET vs READ)
-static void drawScreenPower() {
+// Map (mains-present, charge-state) to a 3-char mode label. On battery (no
+// mains) the MP2762A is unpowered and reports cs=0 — that is a genuine
+// discharge. On mains, cs=0 means "not charging" (idle / pack full), which
+// must NOT be shown as discharge. Used by Home and the Battery screen.
+static const __FlashStringHelper* batteryModeLabel(bool mains, int cs) {
+  if (!mains) return F("DSC");           // no mains -> discharging
+  switch (cs) {
+    case 1:  return F("PRE");
+    case 2:  return F("CHG");
+    case 3:  return F("FUL");
+    default: return F("IDL");            // mains present, not charging
+  }
+}
+
+// Screen 1 (INPUT): VIN, input PD contract (HUSB238), derived power, source.
+// 64x32, 6x8 font => max 10 chars per line at y=0/8/16/24.
+static void drawScreenInput() {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
 
-  // Line 0: Header
+  // row0: "IN  %2d.%dV" — VIN whole.frac (e.g. "IN  12.3V")
   oled.setCursor(0, 0);
-  oled.print(F("PWR SET:"));
+  oled.print(F("IN  "));
+  int vi_w = ui.vi / 1000;
+  if (vi_w < 10) oled.print(F(" "));
+  oled.print(vi_w);
+  oled.print(F("."));
+  oled.print((ui.vi % 1000) / 100);
+  oled.print(F("V"));
 
-  // Line 1: Voltage SET, Current SET
+  // row1: input PD contract, or "PD N/A" when no contract negotiated.
   oled.setCursor(0, 8);
-  oled.print(ui.vs / 10);
-  oled.print(F("."));
-  oled.print(ui.vs % 10);
-  oled.print(F("V "));
-  oled.print(ui.is / 10);
-  oled.print(F("."));
-  oled.print(ui.is % 10);
-  oled.print(F("A"));
+  if (ui.pd_in_mV > 0) {
+    int v = ui.pd_in_mV / 1000;
+    oled.print(F("PD"));
+    if (v < 10) oled.print(F(" "));
+    oled.print(v);
+    oled.print(F("V"));
+    oled.print(ui.pd_in_mA / 1000);
+    oled.print(F("."));
+    oled.print((ui.pd_in_mA % 1000) / 100);
+    oled.print(F("A"));
+  } else {
+    oled.print(F("PD N/A"));
+  }
 
-  // Line 2: Header
+  // row2: contract power (V*A, integer watts), only when a contract exists.
   oled.setCursor(0, 16);
-  oled.print(F("PWR RD:"));
+  if (ui.pd_in_mV > 0) {
+    int w = (ui.pd_in_mV / 1000) * (ui.pd_in_mA / 1000);
+    oled.print(F("="));
+    oled.print(w);
+    oled.print(F("W"));
+  }
 
-  // Line 3: Voltage READ, Current READ
+  // row3: which source is feeding us.
   oled.setCursor(0, 24);
-  oled.print(ui.vr / 10);
-  oled.print(F("."));
-  oled.print(ui.vr % 10);
-  oled.print(F("V "));
-  oled.print(ui.ir / 10);
-  oled.print(F("."));
-  oled.print(ui.ir % 10);
-  oled.print(F("A"));
+  if (ui.usb_c_attach) {
+    oled.print(F("SRC:USB-C"));
+  } else if (ui.pg) {
+    oled.print(F("SRC:BARR"));
+  } else {
+    oled.print(F("SRC:OFF"));
+  }
 
-  drawScreenIndicator(1);
+  drawScreenIndicator(SCREEN_INPUT);
 }
 
-// Screen 2: Battery details
+// Screen 2 (OUTPUT): RP2040 vs CH32X VBUS_OUT, output PD contract, Ilimit.
+static void drawScreenOutput() {
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+
+  // row0: RP2040's own ADC measurement of the Pi rail.
+  oled.setCursor(0, 0);
+  oled.print(F("Vo R "));
+  oled.print(vbus_out_mV / 1000);
+  oled.print(F("."));
+  oled.print((vbus_out_mV % 1000) / 100);
+  oled.print(F("V"));
+
+  // row1: CH32X PA0 measurement (fallback to ui.vr*100 if v2 field is 0,
+  // e.g. legacy v1 frames where vbus_out_ch_mV was never populated).
+  int vout_ch = (ui.vbus_out_ch_mV > 0) ? ui.vbus_out_ch_mV : (ui.vr * 100);
+  oled.setCursor(0, 8);
+  oled.print(F("Vo C "));
+  oled.print(vout_ch / 1000);
+  oled.print(F("."));
+  oled.print((vout_ch % 1000) / 100);
+  oled.print(F("V"));
+
+  // row2: output PD contract to the Pi, or "PD N/A" when the rail is off.
+  oled.setCursor(0, 16);
+  if (ui.pd_out_mV > 0) {
+    int v = ui.pd_out_mV / 1000;
+    oled.print(F("PD"));
+    if (v < 10) oled.print(F(" "));
+    oled.print(v);
+    oled.print(F("V"));
+    oled.print(ui.pd_out_mA / 1000);
+    oled.print(F("."));
+    oled.print((ui.pd_out_mA % 1000) / 100);
+    oled.print(F("A"));
+  } else {
+    oled.print(F("PD N/A"));
+  }
+
+  // row3: TPS55289 current limit (mA -> whole.frac A).
+  oled.setCursor(0, 24);
+  oled.print(F("Ilim "));
+  oled.print(ui.iout_limit_mA / 1000);
+  oled.print(F("."));
+  oled.print((ui.iout_limit_mA % 1000) / 100);
+  oled.print(F("A"));
+
+  drawScreenIndicator(SCREEN_OUTPUT);
+}
+
+// Screen 3 (BATTERY): RP2040 vs CH32X Vbat/SOC, charge mode, charge current.
 static void drawScreenBattery() {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
 
-  // Line 0: Temperature
+  // row0: RP2040 ADC battery voltage + SOC. "R %d.%dV%2d%%"
   oled.setCursor(0, 0);
-  oled.print(F("T:"));
-  oled.print(ui.t / 10);
-  oled.print(F("."));
-  oled.print(abs(ui.t % 10));
-  oled.print(F("C"));
-
-  // Line 1: Battery voltage (from ADC)
-  oled.setCursor(0, 8);
-  oled.print(F("Bat:"));
+  oled.print(F("R "));
   oled.print(ui.bv / 1000);
   oled.print(F("."));
-  int frac = (ui.bv % 1000) / 10;
-  if (frac < 10) oled.print(F("0"));
-  oled.print(frac);
+  oled.print((ui.bv % 1000) / 100);
   oled.print(F("V"));
+  if (ui.soc < 10) oled.print(F(" "));
+  oled.print(ui.soc);
+  oled.print(F("%"));
 
-  // Line 2: Charger fault flags (hex)
-  oled.setCursor(0, 16);
-  oled.print(F("CF:0x"));
-  if (ui.cf < 16) oled.print(F("0"));
-  oled.print(ui.cf, HEX);
-
-  // Line 3: Charge current
-  oled.setCursor(0, 24);
-  oled.print(F("CI:"));
-  oled.print(ui.ci);
-  oled.print(F("mA"));
-
-  drawScreenIndicator(2);
-}
-
-// Screen 3: USB-PD info (output side to RPi)
-static void drawScreenPDInfo() {
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-
-  // Line 0: Header
-  oled.setCursor(0, 0);
-  oled.print(F("PD OUT>Pi"));
-
-  // Line 1: PD State
+  // row1: CH32X battery voltage + SOC. "C %d.%dV%2d%%"
   oled.setCursor(0, 8);
-  oled.print(F("State:"));
-  oled.print(ui.pd);
-
-  // Line 2: PDO Index
-  oled.setCursor(0, 16);
-  oled.print(F("PDO:"));
-  oled.print(ui.pdo);
-
-  // Line 3: Output voltage (measured from ADC3)
-  oled.setCursor(0, 24);
-  oled.print(F("Vo:"));
-  oled.print(vbus_out_mV / 1000);
+  oled.print(F("C "));
+  oled.print(ui.vbc / 1000);
   oled.print(F("."));
-  oled.print((vbus_out_mV % 1000) / 100);
+  oled.print((ui.vbc % 1000) / 100);
   oled.print(F("V"));
+  if (ui.soc_ch < 10) oled.print(F(" "));
+  oled.print(ui.soc_ch);
+  oled.print(F("%"));
 
-  drawScreenIndicator(3);
+  // row2: charge/discharge mode (mains-aware: cs=0 on mains is "not charging",
+  // not discharge).
+  oled.setCursor(0, 16);
+  oled.print(F("Mode:"));
+  oled.print(batteryModeLabel(ui.pg, ui.cs));
+
+  // row3: charge current (mA -> whole.frac A; absolute value for sign-safe
+  // single-digit fraction). "Ich %d.%dA"
+  int ich = abs(ui.ci);
+  oled.setCursor(0, 24);
+  oled.print(F("Ich "));
+  oled.print(ich / 1000);
+  oled.print(F("."));
+  oled.print((ich % 1000) / 100);
+  oled.print(F("A"));
+
+  drawScreenIndicator(SCREEN_BATTERY);
 }
 
-// Screen 4: PD/TPS diagnostic readout. ui.vr/ir come from CH32X reading the
-// TPS55289 REF/IOUT_LIMIT registers back, so they reflect what's currently
-// programmed on the converter — which CH32X overwrites in STA_TX_ACCEPT to
-// match the negotiated PDO:
-//   pre-PD:        5.1V / 3.0A (VBUS_set_5V default)
-//   PDO #1 5V5A:   5.1V / 5.0A
-//   PDO #2 9V3A:   9.0V / 3.0A
-//   PDO #3 12V:   12.0V / 2.25A
-//   PDO #4 15V:   15.0V / 1.8A
-// (ui.vs/is map to pd_contract_mV/mA — that's the SINK side of CH32X, i.e.
-// the upstream charger contract, not the USB-C output. Don't use here.)
-// Vo is RP2040's own ADC reading of VBUS_OUT, independent of the CH32X path.
-static void drawScreenPDDiag() {
+// Screen 4 (SYSTEM): RP2040 uptime, both temps, fault bitmap.
+static void drawScreenSystem() {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
 
+  // row0: compact RP2040 uptime. "UP %s"
+  //   < 100 min -> "%dm"; < 100 h -> "%dh%02dm" (or "%dh" once >= 10 h to
+  //   stay <= 10 chars); else "%dd".
+  unsigned long up_s = millis() / 1000UL;
+  unsigned long up_m = up_s / 60UL;
   oled.setCursor(0, 0);
-  oled.print(F("PD>Pi"));
-  /* TPS55289 STATUS bits packed into the high byte of `faults` by CH32X:
-   *   bit 8  = SCP (short-circuit protection)
-   *   bit 9  = OCP (overcurrent protection)
-   *   bit 10 = OVP (overvoltage protection)
-   * Show single-letter suffix when a trip is latched so it's obvious on
-   * the OLED what protection killed the rail. */
-  if (ui.cf & ((1 << 8) | (1 << 9) | (1 << 10))) {
-    oled.print(F(" !"));
-    if (ui.cf & (1 << 8))  oled.print(F("S"));
-    if (ui.cf & (1 << 9))  oled.print(F("O"));
-    if (ui.cf & (1 << 10)) oled.print(F("V"));
+  oled.print(F("UP "));
+  if (up_m < 100UL) {
+    oled.print(up_m);
+    oled.print(F("m"));
+  } else {
+    unsigned long up_h = up_m / 60UL;
+    if (up_h < 100UL) {
+      oled.print(up_h);
+      oled.print(F("h"));
+      if (up_h < 10UL) {
+        // "UP 9h59m" = 8 chars — room for minutes.
+        unsigned long rem_m = up_m % 60UL;
+        if (rem_m < 10UL) oled.print(F("0"));
+        oled.print(rem_m);
+        oled.print(F("m"));
+      }
+    } else {
+      oled.print(up_h / 24UL);
+      oled.print(F("d"));
+    }
   }
 
+  // row1: LM75B board temp (deci-C -> whole C). "Tlm %3dC"
   oled.setCursor(0, 8);
-  oled.print(F("S:"));
-  oled.print(ui.vr / 10);
-  oled.print(F("."));
-  oled.print(ui.vr % 10);
-  oled.print(F("V"));
+  oled.print(F("Tlm "));
+  oled.print(ui.temp_lm_dC / 10);
+  oled.print(F("C"));
 
+  // row2: MP2762A junction temp, "N/A" when unpowered (-32768 sentinel).
   oled.setCursor(0, 16);
-  oled.print(F("L:"));
-  oled.print(ui.ir / 10);
-  oled.print(F("."));
-  oled.print(ui.ir % 10);
-  oled.print(F("A"));
+  if (ui.temp_mp_dC == -32768) {
+    oled.print(F("Tmp  N/A"));
+  } else {
+    oled.print(F("Tmp "));
+    oled.print(ui.temp_mp_dC / 10);
+    oled.print(F("C"));
+  }
 
+  // row3: fault bitmap as 4 hex digits. "Flt:%04X"
   oled.setCursor(0, 24);
-  oled.print(F("Vo:"));
-  oled.print(vbus_out_mV / 1000);
-  oled.print(F("."));
-  int frac = (vbus_out_mV % 1000) / 10;
-  if (frac < 10) oled.print(F("0"));
-  oled.print(frac);
-  oled.print(F("V"));
+  oled.print(F("Flt:"));
+  unsigned int flt = (unsigned int)(ui.cf & 0xFFFF);
+  for (int sh = 12; sh >= 0; sh -= 4) {
+    oled.print((flt >> sh) & 0xF, HEX);
+  }
 
-  drawScreenIndicator(SCREEN_PD_DIAG);
-}
-
-// Screen 5: Power-path diagnostic. Diagnoses TPS55289 UVLO trips that
-// don't show up in STATUS register — typical signature when running with
-// no battery to cushion VSYS during a USB-C load step.
-//   Vi = VIN to MP2762A (DC IN, e.g. 12 V from barrel jack)
-//   Ii = IIN to MP2762A (current the chip is pulling from VIN)
-//   Vs = VSYS rail (the rail feeding TPS55289 VIN — if this dips below
-//        ~3 V under load, TPS resets and VBUS_OUT collapses)
-// CH32X diagnostic-aliases pd_contract_mV/mA to VSYS/IIN whenever there
-// is no upstream PD SINK contract (i.e. nearly always on the bench),
-// so ui.vs/is carry VSYS/IIN here.
-static void drawScreenPowerPath() {
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-
-  oled.setCursor(0, 0);
-  oled.print(F("Vi:"));
-  oled.print(ui.vi / 1000);
-  oled.print(F("."));
-  int vi_frac = (ui.vi % 1000) / 100;
-  oled.print(vi_frac);
-  oled.print(F("V"));
-
-  oled.setCursor(0, 8);
-  oled.print(F("Ii:"));
-  oled.print(ui.is / 10);
-  oled.print(F("."));
-  oled.print(ui.is % 10);
-  oled.print(F("A"));
-
-  oled.setCursor(0, 16);
-  oled.print(F("Vs:"));
-  /* ui.vs is in 0.1 V units (CH32X passes VSYS in mV through
-   * pd_contract_mV, then RP2040 divides by 100 → 0.1 V). */
-  oled.print(ui.vs / 10);
-  oled.print(F("."));
-  oled.print(ui.vs % 10);
-  oled.print(F("V"));
-
-  drawScreenIndicator(SCREEN_POWER_PATH);
-}
-
-// Screen 6: Power Control — LEFT disables VBUS_OUT, RIGHT re-enables it.
-static void drawScreenPowerCtrl() {
-  oled.setTextSize(1);
-  oled.setTextColor(SSD1306_WHITE);
-
-  // Line 0: header
-  oled.setCursor(0, 0);
-  oled.print(F("Power Ctrl"));
-
-  // Line 1: ON / OFF status — derived from RP2040's own VBUS_OUT ADC so
-  // we don't depend on the cached CH32X TPS55289 set values for the truth.
-  bool outputOn = (vbus_out_mV > 1000);
-  oled.setCursor(0, 8);
-  oled.print(F("OUT: "));
-  oled.print(outputOn ? F("ON") : F("OFF"));
-
-  // Line 2: button hint — LEFT turns off, RIGHT turns on
-  oled.setCursor(0, 16);
-  oled.print(F("<OFF  ON>"));
-
-  // Line 3: measured output voltage + screen indicator
-  oled.setCursor(0, 24);
-  oled.print(F("Vo:"));
-  oled.print(vbus_out_mV / 1000);
-  oled.print(F("."));
-  oled.print((vbus_out_mV % 1000) / 100);
-  oled.print(F("V"));
-
-  drawScreenIndicator(SCREEN_POWER_CTRL);
+  drawScreenIndicator(SCREEN_SYSTEM);
 }
 
 // --- Web3 Pi UPS binary wire protocol v1 — RP2040 hub-side handling ---
@@ -753,7 +758,7 @@ static void drawScreenPowerCtrl() {
 //
 // Defined here (in main.cpp) because the body needs access to RP2040
 // firmware globals (ui, lastFrameTime, etc.). Declared in wups_router.h.
-static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t& s);
+static void wupsPublishTelemetryStatus(uint8_t seq, const uint8_t* payload, uint16_t len);
 static void wupsPublishHostStatus(uint8_t seq, const wups_host_status_v1_t& s);
 static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq, uint8_t code);
 static void wupsPublishEventFrame(const WupsFrame& f);
@@ -793,71 +798,154 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   }
 
   // CH32X power.status — cache and project into the `ui` snapshot so the
-  // OLED / alarm code keeps working unchanged. PD detail and snk_* are not
-  // in v1 power.status; they stay at last known.
+  // OLED / alarm code keeps working unchanged. The wire format is version-
+  // dispatched on payload[0]: v2 (the current CH32X firmware) carries split
+  // INPUT/OUTPUT PD contracts + real VSYS/IIN; v1 is the legacy fallback.
+  // We forward/uplink the RAW payload (not a decoded struct) so the v2 tail
+  // is never truncated.
   if (f.cls == WUPS_CLASS_POWER && f.op == WUPS_OP_PWR_STATUS &&
-      f.src == WUPS_ADDR_CH32X &&
-      f.len >= sizeof(wups_power_status_v1_t)) {
-    wups_power_status_v1_t s;
-    memcpy(&s, f.payload, sizeof(s));
-    if (s.version != 1) return;
+      f.src == WUPS_ADDR_CH32X && f.len >= 1) {
+    const uint8_t pwrVersion = f.payload[0];
+    bool     decoded   = false;
+    bool     pgNow     = false;   // input "good" — set in whichever branch decodes
+    uint16_t faultsNow = 0;       // fault bitmap — set in whichever branch decodes
 
-    Last_Power_Status    = s;
+    if (pwrVersion == 2 && f.len >= sizeof(wups_power_status_v2_t)) {
+      // --- power.status v2 ---
+      wups_power_status_v2_t s2;
+      memcpy(&s2, f.payload, sizeof(s2));
+      Last_Pwr_V2 = s2;
+
+      // Temperature: prefer MP2762A junction temp, but it reads -32768 when
+      // the charger is unpowered — fall back to LM75B board temp then.
+      ui.t  = (s2.temp_mp_dC == -32768) ? s2.temp_lm_dC
+                                        : max((int)s2.temp_mp_dC, (int)s2.temp_lm_dC);
+      ui.cs = s2.charge_state;
+      ui.pg = (s2.vbus_in_mV > 5000) ? 1 : 0;
+      ui.vi = s2.vbus_in_mV;
+      ui.ci = s2.ichg_mA;
+      ui.cf = s2.faults;
+      ui.bp = (s2.flags & WUPS_PWR2_FLAG_BATT_PRESENT) ? 1 : 0;
+      ui.vb  = s2.vbat_mV;
+      ui.vbc = s2.vbat_mV;
+      ui.vr  = (int)(s2.vout_read_mV / 100);
+      ui.ir  = (int)(s2.iout_limit_mA / 100);
+      ui.vs  = (int)(s2.vout_set_mV  / 100);
+      ui.is  = (int)(s2.iout_limit_mA / 100);
+      // New v2 fields.
+      ui.pd_in_mV     = s2.pd_in_mV;
+      ui.pd_in_mA     = s2.pd_in_mA;
+      ui.pd_out_mV    = s2.pd_out_mV;
+      ui.pd_out_mA    = s2.pd_out_mA;
+      ui.vbus_out_ch_mV = s2.vbus_out_mV;
+      ui.vsys_mV      = s2.vsys_mV;
+      ui.iin_mA       = s2.iin_mA;
+      ui.temp_lm_dC   = s2.temp_lm_dC;
+      ui.temp_mp_dC   = s2.temp_mp_dC;
+      ui.usb_c_attach = (s2.flags & WUPS_PWR2_FLAG_USB_C_ATTACH) ? 1 : 0;
+      ui.iout_limit_mA = s2.iout_limit_mA;
+      ui.soc_ch       = voltageToSoc(s2.vbat_mV);
+
+      pgNow     = (s2.vbus_in_mV > 5000);
+      faultsNow = s2.faults;
+      decoded   = true;
+    } else if (pwrVersion == 1 && f.len >= sizeof(wups_power_status_v1_t)) {
+      // --- power.status v1 (legacy fallback, mapping unchanged) ---
+      wups_power_status_v1_t s;
+      memcpy(&s, f.payload, sizeof(s));
+      Last_Power_Status = s;
+
+      ui.t   = s.temp_dC;
+      ui.cs  = s.charge_state;
+      ui.pg  = (s.vbus_in_mV > 5000) ? 1 : 0;     // derived: input "good"
+      ui.vi  = s.vbus_in_mV;
+      ui.ci  = s.ibat_mA;
+      ui.cf  = s.faults;
+      ui.bp  = (s.vbat_mV > 100) ? 1 : 0;          // derived: battery present
+      ui.vb  = s.vbat_mV;
+      ui.vbc = s.vbat_mV;                          // single source in v1
+      // Set vs read separation lost in v1: report measured values for both.
+      ui.vs  = (int)(s.pd_contract_mV / 100);
+      ui.is  = (int)(s.pd_contract_mA / 100);
+      ui.vr  = (int)(s.vbus_out_mV / 100);
+      ui.ir  = (int)(s.ibus_out_mA / 100);
+      // PD detail (pd, pdo, role, snk_*) is not in v1 power.status — hold previous values.
+
+      pgNow     = (s.vbus_in_mV > 5000);
+      faultsNow = s.faults;
+      decoded   = true;
+    }
+
+    if (!decoded) return;  // unknown version or short frame — drop
+
+    // Cache the RAW payload (version-agnostic) for the on-demand republish
+    // and the throttled uplink — forwarding a decoded struct would truncate
+    // the v2 tail.
+    if (f.len <= sizeof(Last_Pwr_Raw)) {
+      memcpy(Last_Pwr_Raw, f.payload, f.len);
+      Last_Pwr_Raw_Len = f.len;
+    }
     Last_Power_Status_Ms = millis();
-
-    ui.t   = s.temp_dC;
-    ui.cs  = s.charge_state;
-    ui.pg  = (s.vbus_in_mV > 5000) ? 1 : 0;     // derived: input "good"
-    ui.vi  = s.vbus_in_mV;
-    ui.ci  = s.ibat_mA;
-    ui.cf  = s.faults;
-    ui.bp  = (s.vbat_mV > 100) ? 1 : 0;          // derived: battery present
-    ui.vb  = s.vbat_mV;
-    ui.vbc = s.vbat_mV;                          // single source in v1
-    // Set vs read separation lost in v1: report measured values for both.
-    ui.vs  = (int)(s.pd_contract_mV / 100);
-    ui.is  = (int)(s.pd_contract_mA / 100);
-    ui.vr  = (int)(s.vbus_out_mV / 100);
-    ui.ir  = (int)(s.ibus_out_mA / 100);
-    // PD detail (pd, pdo, role, snk_*) is not in v1 power.status — hold previous values.
-
     newFrameReceived = true;
     lastFrameTime    = millis();
 
     // Mirror parsed power.status to the debug stream (USB-CDC + Probe UART
     // via J350) so the firmware author can read CH32X telemetry remotely
-    // without unplugging the bench setup. One line per frame, fixed
-    // column order so it's easy to grep / diff between runs.
+    // without unplugging the bench setup. One line per frame, fixed column
+    // order so it's easy to grep / diff between runs. For v2, Vsys/Iin come
+    // from the real dedicated fields (not the v1 pd_contract aliasing).
     dbgOut.print(F("[t="));
     dbgOut.print(millis() / 1000);
-    dbgOut.print(F("s] cs="));
-    dbgOut.print(s.charge_state);
+    dbgOut.print(F("s] v="));
+    dbgOut.print(pwrVersion);
+    dbgOut.print(F(" cs="));
+    dbgOut.print(ui.cs);
     dbgOut.print(F(" pg="));
-    dbgOut.print((s.vbus_in_mV > 5000) ? 1 : 0);
+    dbgOut.print(pgNow ? 1 : 0);
     dbgOut.print(F(" Vin="));
-    dbgOut.print(s.vbus_in_mV);
-    dbgOut.print(F("mV Vsys="));
-    dbgOut.print(s.pd_contract_mV);   // diag-aliased (see CH32X main.c)
-    dbgOut.print(F("mV Iin="));
-    dbgOut.print(s.pd_contract_mA);   // diag-aliased
+    dbgOut.print(ui.vi);
+    if (pwrVersion == 2) {
+      dbgOut.print(F("mV Vsys="));
+      dbgOut.print(Last_Pwr_V2.vsys_mV);
+      dbgOut.print(F("mV Iin="));
+      dbgOut.print(Last_Pwr_V2.iin_mA);
+    } else {
+      dbgOut.print(F("mV Vsys="));
+      dbgOut.print(Last_Power_Status.pd_contract_mV);   // diag-aliased (v1)
+      dbgOut.print(F("mV Iin="));
+      dbgOut.print(Last_Power_Status.pd_contract_mA);   // diag-aliased (v1)
+    }
     dbgOut.print(F("mA Vbat="));
-    dbgOut.print(s.vbat_mV);
+    dbgOut.print(ui.vbc);
     dbgOut.print(F("mV Ichg="));
-    dbgOut.print(s.ibat_mA);
+    dbgOut.print(ui.ci);
     dbgOut.print(F("mA Vout="));
-    dbgOut.print(s.vbus_out_mV);
-    dbgOut.print(F("mV Iout="));
-    dbgOut.print(s.ibus_out_mA);
-    dbgOut.print(F("mA T="));
-    dbgOut.print(s.temp_dC);
+    dbgOut.print((pwrVersion == 2) ? ui.vbus_out_ch_mV : (ui.vr * 100));
+    dbgOut.print(F("mV T="));
+    dbgOut.print(ui.t);
     dbgOut.print(F("dC f=0x"));
-    dbgOut.println(s.faults, HEX);
+    dbgOut.println((unsigned int)faultsNow, HEX);
 
-    // Push-mode aggregate to RPi: forward the same frame on USB-CDC with
-    // SRC=CH32X preserved. RPi service decodes and treats it as authoritative.
+    // --- DIAG (temporary): ADC comparison — RP2040 own ADC (ui.bv, drives
+    // the OLED SOC) vs CH32X PA5 (ui.vbc). Lets us see on one line which
+    // source is closer to a bench multimeter. Remove once the SOC source is
+    // settled. 1 Hz (one per CH32X power.status frame). grep tag: [ADCcmp]
+    dbgOut.print(F("[ADCcmp] RP2040_bv="));
+    dbgOut.print(ui.bv);
+    dbgOut.print(F("mV soc="));
+    dbgOut.print(ui.soc);
+    dbgOut.print(F("% | CH32X_vbat="));
+    dbgOut.print(ui.vbc);
+    dbgOut.print(F("mV | delta(RP-CH)="));
+    dbgOut.print(ui.bv - ui.vbc);
+    dbgOut.println(F("mV"));
+
+    // Push-mode aggregate to RPi: forward the RAW payload on USB-CDC with
+    // SRC=CH32X preserved (so the v2 tail survives). RPi service decodes and
+    // treats it as authoritative.
     wups_send_with_src(WUPS_PORT_RPI, WUPS_ADDR_RPI, WUPS_ADDR_CH32X,
                        WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
-                       WUPS_FLAG_EVENT, f.seq, &s, sizeof(s));
+                       WUPS_FLAG_EVENT, f.seq, f.payload, f.len);
 
     // Drive the cellular uplink via net.publish to the ESP32. ESP32 is a
     // dumb pipe to MQTT — it forwards `topic`+`payload` to the broker and
@@ -869,9 +957,7 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     // budget, with an immediate publish whenever the input-power state or
     // the charger fault bitmap changes (see notes at the static decls).
     {
-      const bool     pgNow     = (s.vbus_in_mV > 5000);
-      const uint16_t faultsNow = s.faults;
-      const uint32_t nowMs     = millis();
+      const uint32_t nowMs = millis();
       bool publishNow;
       if (!Telemetry_Uplink_Primed) {
         publishNow = true;                  // first frame: announce we're online
@@ -883,7 +969,7 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
                          >= TELEMETRY_UPLINK_INTERVAL_MS;
       }
       if (publishNow) {
-        wupsPublishTelemetryStatus(f.seq, s);
+        wupsPublishTelemetryStatus(f.seq, f.payload, f.len);
         Last_Telemetry_Uplink_Ms = nowMs;
         Last_Uplink_Pg           = pgNow;
         Last_Uplink_Faults       = faultsNow;
@@ -976,8 +1062,10 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   // Iout / temperature granularity.
   if (f.cls == WUPS_CLASS_POWER && f.op == WUPS_OP_PWR_STATUS &&
       (f.flags & WUPS_FLAG_REQ)) {
-    if (Last_Power_Status_Ms != 0) {
-      wupsPublishTelemetryStatus(f.seq, Last_Power_Status);
+    if (Last_Power_Status_Ms != 0 && Last_Pwr_Raw_Len != 0) {
+      // Republish the RAW cached payload (any version) so the v2 tail is
+      // preserved end-to-end.
+      wupsPublishTelemetryStatus(f.seq, Last_Pwr_Raw, Last_Pwr_Raw_Len);
     }
     wupsPublishCmdResponse(f.cls, f.op, f.seq, /*code=*/0);
     return;
@@ -1028,10 +1116,10 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
 
   // ADR-0012 — ui.set_screen forces a particular dashboard screen.
   // Used by the system menu's "Debug" entry: it puts the RP2040 on one
-  // of the developer screens (1=Power, 2=Battery, 3=PD, 4=Power Ctrl)
+  // of the developer screens (1=INPUT, 2=OUTPUT, 3=BATTERY, 4=SYSTEM)
   // and the user can navigate them with the normal LEFT/RIGHT shorts
-  // (which only run when currentScreen != 0). Auto-return to home (15s
-  // idle) brings the user back to the dashboard / menu activation
+  // (which now run on every screen, Home included). Auto-return to home
+  // (20s idle) brings the user back to the dashboard / menu activation
   // gesture window.
   if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_SET_SCREEN &&
       f.len >= sizeof(wups_ui_set_screen_v1_t)) {
@@ -1209,15 +1297,18 @@ static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq,
   wupsRequestPublish("cmd/response", /*qos=*/1, /*retain=*/0, frame, (uint16_t)n);
 }
 
-// Wrap a cached CH32X power.status into a WUPS frame (src=CH32X preserved
-// for the panel's audit trail) and ship it to the ESP32 as net.publish
-// onto the "telemetry" subtopic.
-static void wupsPublishTelemetryStatus(uint8_t seq, const wups_power_status_v1_t& s) {
-  uint8_t frame[WUPS_FRAMING_BYTES + sizeof(wups_power_status_v1_t)];
+// Wrap a CH32X power.status RAW payload (any version — v1 or v2) into a WUPS
+// frame (src=CH32X preserved for the panel's audit trail) and ship it to the
+// ESP32 as net.publish onto the "telemetry" subtopic. Taking raw bytes (not a
+// decoded struct) keeps the v2 tail intact end-to-end; the panel's wupsproto
+// decoder version-dispatches on payload[0] just like we do.
+static void wupsPublishTelemetryStatus(uint8_t seq, const uint8_t* payload, uint16_t len) {
+  if (payload == nullptr || len == 0 || len > WUPS_MAX_PAYLOAD) return;
+  uint8_t frame[WUPS_FRAMING_BYTES + WUPS_MAX_PAYLOAD];
   size_t n = wupsBuildFrame(frame, sizeof(frame),
                             WUPS_ADDR_BROADCAST, WUPS_ADDR_CH32X,
                             WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
-                            WUPS_FLAG_EVENT, seq, &s, sizeof(s));
+                            WUPS_FLAG_EVENT, seq, payload, len);
   if (n == 0) return;
   wupsRequestPublish("telemetry", /*qos=*/0, /*retain=*/0, frame, (uint16_t)n);
 }
@@ -1433,16 +1524,30 @@ void loop() {
   // button=0xFF, action=long} broadcast which the ESP32 interprets as
   // "open system menu". Exit isn't a hold — once the menu is open the
   // user selects "Back" (short press, just like any other nav).
-  // Gesture is one-shot per hold episode; latch clears on LEFT release.
+  //
+  // Short LEFT presses now also navigate the screen strip from Home (see
+  // the button-handling block below), so the hold must be distinguished
+  // from a tap WITHOUT being cancelled the instant a tap nav fires. We
+  // latch on the hold itself: the episode is gated on currentScreen==0 at
+  // the START of the hold (s_home_at_start), then driven purely by the
+  // LEFT held-state — so a short LEFT that bumps currentScreen off Home
+  // mid-hold doesn't reset the timer. s_menu_fired one-shots per episode;
+  // both latches clear on LEFT release. s_left_consumed tells the nav
+  // block below to skip the LEFT-release tap (the press became a hold).
+  static bool s_left_consumed = false;   // shared with nav block below
   {
-    static uint32_t s_left_start_ms = 0;
-    static bool     s_menu_fired    = false;
+    static uint32_t s_left_start_ms  = 0;
+    static bool     s_menu_fired     = false;
+    static bool     s_home_at_start  = false;
     constexpr uint32_t MENU_ACTIVATION_HOLD_MS = 2000;
     bool left_down = digitalRead(BTN_LEFT_PIN) == LOW;
-    if (left_down && currentScreen == 0) {
+    if (left_down) {
       uint32_t now_ms = millis();
-      if (s_left_start_ms == 0) s_left_start_ms = now_ms;
-      if (!s_menu_fired &&
+      if (s_left_start_ms == 0) {
+        s_left_start_ms = now_ms;
+        s_home_at_start = (currentScreen == 0);  // only Home arms the gesture
+      }
+      if (s_home_at_start && !s_menu_fired &&
           (now_ms - s_left_start_ms) >= MENU_ACTIVATION_HOLD_MS) {
         wups_ui_button_event_v1_t e;
         e.version  = 1;
@@ -1453,7 +1558,8 @@ void loop() {
                   WUPS_CLASS_UI, WUPS_OP_UI_BUTTON_EVENT,
                   WUPS_FLAG_EVENT, &e, sizeof(e));
         tone(BUZZER_PIN, 1200, 80);
-        s_menu_fired = true;
+        s_menu_fired    = true;
+        s_left_consumed = true;   // this LEFT became a hold — no tap nav
         // Control hands over to trust_ui as soon as the ESP32 sends
         // back the first menu prompt — the trust_ui_active() branch
         // at the top of loop() takes over then. If no prompt arrives
@@ -1464,15 +1570,16 @@ void loop() {
       }
     } else {
       s_left_start_ms = 0;
-      s_menu_fired = false;
+      s_menu_fired    = false;
+      s_home_at_start = false;
     }
   }
 
   // ESP32 timeout for the activation gesture above. If trust_ui took over,
   // the ESP32 responded — clear the pending state silently. Otherwise jump
-  // directly to the debug screens (Power=1 is the first one in the strip
-  // 1→2→3→PD_DIAG→POWER_PATH→POWER_CTRL); a second short beep flags the
-  // fallback so the user can tell the menu didn't open.
+  // directly to the debug screens (INPUT=1 is the first one in the strip
+  // 1→2→3→4); a second short beep flags the fallback so the user can tell
+  // the menu didn't open.
   //
   // TEMPORARY (2026-06-09): debug-screen fallback disabled. With no ESP32
   // module the long-LEFT gesture used to drop into the RP2040-local debug
@@ -1517,41 +1624,41 @@ void loop() {
   // back, the router can grow a per-port "stray byte sink".
 
   // --- Button handling ---
-  // ADR-0012 — on the home screen (screen 0) short button presses are
-  // intentionally NO-OPs. The home screen is the dashboard; the only
-  // valid interaction here is hold-RIGHT-2s to open the system menu
-  // (handled above). Short presses are reserved for the menu itself
-  // (LEFT=cursor up, RIGHT=select) once it's active, and trust_ui owns
-  // the buttons while the menu / claim flow is up.
+  // Short LEFT/RIGHT presses cycle the screen strip on EVERY screen,
+  // including Home: RIGHT = next, LEFT = previous, both wrap around
+  // SCREEN_COUNT. This supersedes the old ADR-0012 home no-op — the owner
+  // wants the v2 debug screens reachable directly from Home.
   //
-  // On non-home screens (currently unreachable until "MENU > Debug"
-  // wiring lands) the original LEFT/RIGHT nav + SCREEN_POWER_CTRL
-  // power buttons still apply, so the code path is preserved.
+  // RIGHT has no hold meaning, so it navigates on the press edge (snappy).
+  // LEFT doubles as the system-menu hold gesture, so to keep both working
+  // cleanly on Home we navigate LEFT on its RELEASE edge and only when the
+  // press did NOT become a hold (s_left_consumed, set by the gesture block
+  // above). That way a quick LEFT tap goes back one screen while a 2 s LEFT
+  // hold opens the menu without first flicking the display to SYSTEM.
+  // trust_ui owns the buttons while the menu / claim flow is up, so this
+  // block is skipped entirely in that mode (early return at top of loop()).
   int8_t btnAction = checkButtons();
-  if (btnAction != 0 && currentScreen != 0) {
+  if (btnAction > 0) {
+    // RIGHT pressed - next screen (wrap)
     lastInteractionTime = millis();
-
-    if (currentScreen == SCREEN_POWER_CTRL) {
-      // Power Control screen: send a binary REQ to CH32X. No NEED_ACK in v1,
-      // so we don't wait for a response — confirmation comes via the next
-      // power.status push (vbus_out_mV transitioning).
-      uint8_t op  = (btnAction < 0) ? WUPS_OP_PWR_DISABLE : WUPS_OP_PWR_ENABLE;
-      uint8_t seq = wups_send(WUPS_PORT_CH32X, WUPS_ADDR_CH32X,
-                              WUPS_CLASS_POWER, op, WUPS_FLAG_REQ,
-                              nullptr, 0);
-      dbgOut.print(btnAction < 0 ? F("[btn] LEFT -> power.disable seq=")
-                                 : F("[btn] RIGHT -> power.enable seq="));
-      dbgOut.println(seq);
-    } else {
-      if (btnAction > 0) {
-        // RIGHT pressed - next screen (wrap)
-        currentScreen = (currentScreen + 1) % SCREEN_COUNT;
-      } else {
-        // LEFT pressed - previous screen (wrap)
-        currentScreen = (currentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT;
-      }
-    }
+    currentScreen = (currentScreen + 1) % SCREEN_COUNT;
     tone(BUZZER_PIN, 1000, 20);
+  }
+
+  // LEFT release-edge nav: previous screen (wrap), unless this LEFT episode
+  // already fired the system-menu hold gesture.
+  {
+    static bool s_left_prev_down = false;
+    bool left_down = digitalRead(BTN_LEFT_PIN) == LOW;
+    if (s_left_prev_down && !left_down) {       // release edge
+      if (!s_left_consumed) {
+        lastInteractionTime = millis();
+        currentScreen = (currentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT;
+        tone(BUZZER_PIN, 1000, 20);
+      }
+      s_left_consumed = false;   // re-arm for the next LEFT episode
+    }
+    s_left_prev_down = left_down;
   }
 
   // Auto-return to home screen after timeout
@@ -1604,35 +1711,17 @@ void loop() {
       previousPowerGood = (ui.pg == 1);
       lastLowBatteryBeep = millis();
       displayCs = ui.cs;
-      noBatteryDebounced = (lastFrameTime > 0) ? (ui.bp == 0)
-                         : (ui.bv > 10000 || ui.bv < 5000);
     } else {
       delay(50);
       return;
     }
   }
 
-  // Battery presence detection:
-  // Primary: use bp (battery present) from MP2762A charger IC (hardware UVLO threshold)
-  // Fallback: voltage-based detection when no UART data received yet
-  bool rawNoBattery;
-  if (lastFrameTime > 0) {
-    rawNoBattery = (ui.bp == 0);
-  } else {
-    rawNoBattery = (ui.bv > 10000) || (ui.bv < 5000);
-  }
-
-  // Debounce battery presence to prevent display flicker
-  if (rawNoBattery != noBatteryDebounced) {
-    noBatteryCounter++;
-    if (noBatteryCounter >= NO_BATTERY_DEBOUNCE) {
-      noBatteryDebounced = rawNoBattery;
-      noBatteryCounter = 0;
-    }
-  } else {
-    noBatteryCounter = 0;
-  }
-  bool noBattery = noBatteryDebounced;
+  // Battery-presence detection removed (owner decision 2026-06-21): the
+  // MP2762A presence signal is unreliable on this hardware — it falsely
+  // reports "no battery" when the pack is full and mains is present — and
+  // presence checking is not wanted. Always treat a battery as present.
+  bool noBattery = false;
 
   // Smooth displayed charge state to prevent CHG/FUL flicker at end-of-charge
   // (MP2762A toggles between CC and CV states when battery is nearly full)
@@ -1691,26 +1780,20 @@ void loop() {
 
     // Draw current screen based on navigation
     switch (currentScreen) {
-      case 0:
+      case SCREEN_HOME:
         drawScreenHome(soc, noBattery, animPhase);
         break;
-      case 1:
-        drawScreenPower();
+      case SCREEN_INPUT:
+        drawScreenInput();
         break;
-      case 2:
+      case SCREEN_OUTPUT:
+        drawScreenOutput();
+        break;
+      case SCREEN_BATTERY:
         drawScreenBattery();
         break;
-      case 3:
-        drawScreenPDInfo();
-        break;
-      case SCREEN_PD_DIAG:
-        drawScreenPDDiag();
-        break;
-      case SCREEN_POWER_PATH:
-        drawScreenPowerPath();
-        break;
-      case SCREEN_POWER_CTRL:
-        drawScreenPowerCtrl();
+      case SCREEN_SYSTEM:
+        drawScreenSystem();
         break;
     }
   }

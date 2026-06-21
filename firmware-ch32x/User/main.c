@@ -83,6 +83,7 @@ volatile u16    DC_Inp_ADC_Val = 0;
 static UINT16   DC_Inp_Voltage_mV = 0;
 volatile u16    Vbat_ADC_Val = 0;
 static UINT16   Vbat_Voltage_mV = 0;
+static UINT16   Vbus_Out_Voltage_mV = 0;   /* PA0 ADC, same 27.4k/5.1k divider as PA1 */
 static UINT16   Json_Timer_Ms = 0;
 static UINT16   Temp_Timer_Ms = 0;
 static UINT16   Chg_Timer_Ms = 0;
@@ -502,63 +503,80 @@ static void wups_send_frame(uint8_t dst, uint8_t cls, uint8_t op,
     Usart2_Send_Bytes(trailer, 4);
 }
 
-/* Compose power.status from current globals and send to `dst`.
+/* Negotiated OUTPUT PD contract (CH32X is the source to the Pi). Derived
+ * from the accepted PDO index PD_Ctl.ReqPDO_Idx (1..4); mirrors the advertised
+ * SrcCap_5V5A_Tab / the STA_TX_ACCEPT switch in PD_Process.c. 0 = rail off. */
+static void pd_out_contract(uint16_t *mv, uint16_t *ma)
+{
+    switch (PD_Ctl.ReqPDO_Idx) {
+    case 1: *mv = 5000;  *ma = 5000; break;
+    case 2: *mv = 9000;  *ma = 3000; break;
+    case 3: *mv = 12000; *ma = 2250; break;
+    case 4: *mv = 15000; *ma = 1800; break;
+    default: *mv = 0; *ma = 0; break;  /* no contract / rail off */
+    }
+}
+
+/* Compose power.status v2 from current globals and send to `dst`.
  * Used both for the 1 Hz periodic EVENT (dst=RP2040) and as RESP to
- * system.status_query (dst=requester). */
+ * system.status_query (dst=requester). See wups_power_status_v2_t. */
 static void wups_send_power_status(uint8_t dst, uint8_t flags, uint8_t seq)
 {
-    wups_power_status_v1_t s;
-    s.version        = 1;
-    s.charge_state   = (uint8_t)Chg_Data.chg_state;
-    /* vbus_in: always from our own PA1 ADC. Works in every state — mains
-     * present, mains absent, Q222 cut, MP2762A dead. The MP2762A's VIN
-     * reading is redundant when mains is on and unavailable on battery; we
-     * ignore it unconditionally to keep the source uniform. */
-    s.vbus_in_mV     = DC_Inp_Voltage_mV;
-    /* Tps_Vread_v10 / Tps_Iread_a10 are 0.1 V / 0.1 A units — *100 → mV / mA. */
-    s.vbus_out_mV    = (uint16_t)((int32_t)Tps_Vread_v10 * 100);
-    s.ibus_out_mA    = (int16_t)((int32_t)Tps_Iread_a10 * 100);
-    /* vbat: always from our own PA5 ADC. Available whether MP2762A is alive
-     * or not. With mains on and no battery present, BATTFET leakage can
-     * leave residual voltage on PPVAR_VBAT+ caps; that's a known edge case
-     * (the panel infers "no battery" from charge state + faults). */
-    s.vbat_mV        = Vbat_Voltage_mV;
-    s.ibat_mA        = (int16_t)Chg_Data.ichg_ma;
-    /* Hottest of LM75B (board, near TPS55289) and MP2762A junction.
-     * When MP2762A is unpowered, mp2762a_read_all() sets tjunc_c10 to
-     * MP2762A_TJ_NA — use LM75B alone in that case. Both inputs are in
-     * deci-Celsius. */
+    wups_power_status_v2_t s;
+    s.version      = 2;
+
+    /* Packed booleans. PA6/PA7 are read back from the output data register
+     * (idiom shared with mp2762a_powered()). */
+    s.flags = 0;
+    if (GPIO_ReadOutputDataBit(GPIOA, GPIO_Pin_6)) s.flags |= WUPS_PWR2_FLAG_DC_IN_EN;
+    if (GPIO_ReadOutputDataBit(GPIOA, GPIO_Pin_7)) s.flags |= WUPS_PWR2_FLAG_VBUS_OUT_EN;
+    if (mp2762a_is_battery_present())              s.flags |= WUPS_PWR2_FLAG_BATT_PRESENT;
+    if (Chg_Data.power_good)                       s.flags |= WUPS_PWR2_FLAG_POWER_GOOD;
+    if (Husb_Data.attached)                        s.flags |= WUPS_PWR2_FLAG_USB_C_ATTACH;
+
+    s.charge_state = (uint8_t)Chg_Data.chg_state;
+    s.reserved     = 0;
+
+    /* --- INPUT --- */
+    /* vbus_in: our own PA1 ADC (post ideal-diode OR of USB-C + barrel),
+     * reliable in every state (mains on/off, MP2762A dead). */
+    s.vbus_in_mV = DC_Inp_Voltage_mV;
+    /* HUSB238 negotiated input contract; 0 already means "no USB-C PD". */
+    s.pd_in_mV   = Husb_Data.voltage_mV;
+    s.pd_in_mA   = Husb_Data.current_mA;
+
+    /* --- OUTPUT --- */
+    s.vbus_out_mV   = Vbus_Out_Voltage_mV;                              /* PA0 ADC */
+    /* TPS55289 getters are 0.1 V / 0.1 A units → *100 = mV / mA. */
+    s.vout_set_mV   = (uint16_t)((int32_t)tps55289_get_voltage_set_v10() * 100);
+    s.vout_read_mV  = (uint16_t)((int32_t)Tps_Vread_v10 * 100);
+    s.iout_limit_mA = (uint16_t)((int32_t)Tps_Iread_a10 * 100);        /* limit, not load */
+    pd_out_contract(&s.pd_out_mV, &s.pd_out_mA);
+
+    /* --- BATTERY --- */
+    /* vbat: our own PA5 ADC, authoritative (MP2762A reads 0 on battery). */
+    s.vbat_mV = Vbat_Voltage_mV;
+    s.ichg_mA = (int16_t)Chg_Data.ichg_ma;   /* charge current; 0 on discharge */
+
+    /* --- SYSTEM --- */
+    s.vsys_mV     = (uint16_t)Chg_Data.vsys_mv;   /* real fields now (v1 aliased these) */
+    s.iin_mA      = (uint16_t)Chg_Data.iin_ma;
+    s.temp_lm_dC  = Board_Temp_c10;
+    s.temp_mp_dC  = Chg_Data.tjunc_c10;           /* MP2762A_TJ_NA (-32768) when unpowered */
+
+    /* Pack TPS55289 STATUS bits into the high byte of `faults`; MP2762A fault
+     * byte stays in the low byte. bit8=SCP bit9=OCP bit10=OVP. */
     {
-        int16_t lm = Board_Temp_c10;
-        int16_t tj = Chg_Data.tjunc_c10;
-        s.temp_dC = (tj == MP2762A_TJ_NA) ? lm : ((tj > lm) ? tj : lm);
+        uint16_t tps_flags = 0;
+        if (Tps_Status_Latched & STATUS_SCP_BIT) tps_flags |= (1u << 8);
+        if (Tps_Status_Latched & STATUS_OCP_BIT) tps_flags |= (1u << 9);
+        if (Tps_Status_Latched & STATUS_OVP_BIT) tps_flags |= (1u << 10);
+        s.faults = (uint16_t)(Chg_Data.fault | tps_flags);
+        /* Clear the latch only after packing into the frame about to ship. */
+        Tps_Status_Latched = 0;
     }
-    /* v3 is source-only — the upstream USB-C PD negotiation is handled
-     * entirely by HUSB238 (U150), CH32X never acts as a sink. There is
-     * no SINK contract to report. Repurpose `pd_contract_mV` as VSYS
-     * (mV) and `pd_contract_mA` as IIN (mA from MP2762A) — both are
-     * critical to diagnose TPS55289 UVLO trips that don't show up in
-     * the STATUS register. This aliasing is a known protocol-v1 hack
-     * (see common/protocol_desc.md §7); the real fix is protocol v2
-     * with dedicated diag fields. */
-    s.pd_contract_mV = (uint16_t)Chg_Data.vsys_mv;
-    s.pd_contract_mA = (uint16_t)Chg_Data.iin_ma;
-    /* Pack TPS55289 STATUS bits into the high byte of `faults` so the
-     * MP2762A fault byte (low byte) is preserved. The host can see what
-     * tripped the converter without bumping the protocol version:
-     *   bit  8 (TPS SCP)  ← STATUS bit 7
-     *   bit  9 (TPS OCP)  ← STATUS bit 6
-     *   bit 10 (TPS OVP)  ← STATUS bit 5
-     */
-    uint16_t tps_flags = 0;
-    if (Tps_Status_Latched & STATUS_SCP_BIT) tps_flags |= (1u << 8);
-    if (Tps_Status_Latched & STATUS_OCP_BIT) tps_flags |= (1u << 9);
-    if (Tps_Status_Latched & STATUS_OVP_BIT) tps_flags |= (1u << 10);
-    s.faults = (uint16_t)(Chg_Data.fault | tps_flags);
-    /* Clear the latch only after the bits have been packed into the
-     * frame about to ship — otherwise a trip between read and frame
-     * emission would be lost. */
-    Tps_Status_Latched = 0;
+
+    s.uptime_s = Uptime_Sec;
 
     wups_send_frame(dst, WUPS_CLASS_POWER, WUPS_OP_PWR_STATUS,
                     flags, seq, &s, sizeof(s));
@@ -1278,6 +1296,10 @@ int main(void)
             Vbat_ADC_Val = Get_ADC_Val(ADC_Channel_5);
             Vbat_Voltage_mV = (UINT16)((UINT32)Vbat_ADC_Val * 10322u / 4096u);
 
+            /* Output rail from PA0 ADC: same 27.4k/5.1k divider as PA1, so the
+             * same 21029/4096 scale. Independent of the TPS55289 readback. */
+            Vbus_Out_Voltage_mV = (UINT16)((UINT32)Get_ADC_Val(ADC_Channel_0) * 21029 / 4096);
+
             /* Edge detector first — it reads the same fault latch the
              * status send below clears after packing. */
             wups_power_event_tick();
@@ -1423,6 +1445,11 @@ void ADC_Function_Init(void)
 
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE);
+
+    //PA0: VBUS_OUT_ADC — output rail to the Pi, 27.4k/5.1k divider (same as PA1)
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_0;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
 
     //PA1: DC_INP_ADC_SRC
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1;

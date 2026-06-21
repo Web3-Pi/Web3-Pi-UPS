@@ -229,6 +229,50 @@ typedef struct WUPS_PACKED {
 #define WUPS_PWR_FAULT_OTP        (1u << 2)
 #define WUPS_PWR_FAULT_PD_NEG     (1u << 3)
 
+/* power.status v2 — emitted by CH32X every 1 s (EVENT) and on demand.
+ * Redesign of v1, NOT a prefix-compatible superset: receivers MUST dispatch
+ * on the version byte (offset 0) and pick the matching decoder. Improvements
+ * over v1: dedicated INPUT (HUSB238) and OUTPUT (CH32X source) PD contracts;
+ * VSYS / IIN are real fields instead of being aliased onto pd_contract_*;
+ * the two temperature sensors are split; booleans are packed into `flags`.
+ *
+ * Sentinels: pd_in / pd_out fields = 0 means "no contract / not connected";
+ * temp_mp_dC = -32768 means MP2762A unpowered (junction temp unavailable). */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 2 */
+    uint8_t  flags;          /* see WUPS_PWR2_FLAG_* */
+    uint8_t  charge_state;   /* 0=idle 1=charging 2=charged 3=fault */
+    uint8_t  reserved;       /* 0 (alignment / future use) */
+    /* --- INPUT --- */
+    uint16_t vbus_in_mV;     /* PA1 ADC (post ideal-diode OR of USB-C + barrel) */
+    uint16_t pd_in_mV;       /* HUSB238 negotiated input contract; 0 = N/A */
+    uint16_t pd_in_mA;       /* HUSB238 negotiated input contract; 0 = N/A */
+    /* --- OUTPUT --- */
+    uint16_t vbus_out_mV;    /* PA0 ADC (independent measurement of the Pi rail) */
+    uint16_t vout_set_mV;    /* TPS55289 commanded voltage */
+    uint16_t vout_read_mV;   /* TPS55289 voltage readback */
+    uint16_t iout_limit_mA;  /* TPS55289 current LIMIT (NOT a load-current measurement) */
+    uint16_t pd_out_mV;      /* output PD contract to the Pi; 0 = rail off */
+    uint16_t pd_out_mA;      /* output PD contract to the Pi; 0 = rail off */
+    /* --- BATTERY --- */
+    uint16_t vbat_mV;        /* PA5 ADC (authoritative VBAT) */
+    int16_t  ichg_mA;        /* MP2762A charge current; 0 on discharge (not measured) */
+    /* --- SYSTEM --- */
+    uint16_t vsys_mV;        /* MP2762A VSYS rail (feeds TPS55289 VIN) */
+    uint16_t iin_mA;         /* MP2762A charger input current */
+    int16_t  temp_lm_dC;     /* LM75B board temp, deci-Celsius */
+    int16_t  temp_mp_dC;     /* MP2762A junction temp, deci-Celsius; -32768 = N/A */
+    uint16_t faults;         /* lo byte = MP2762A fault; bits 8/9/10 = TPS SCP/OCP/OVP */
+    uint32_t uptime_s;       /* CH32X uptime (restart detection) */
+} wups_power_status_v2_t;     /* 40 bytes */
+
+/* power.status v2 `flags` bits. */
+#define WUPS_PWR2_FLAG_DC_IN_EN     (1u << 0)  /* PA6 DC_INP_EN_SRC asserted */
+#define WUPS_PWR2_FLAG_VBUS_OUT_EN  (1u << 1)  /* PA7 VBUS_OUT_EN asserted   */
+#define WUPS_PWR2_FLAG_BATT_PRESENT (1u << 2)  /* MP2762A debounced presence */
+#define WUPS_PWR2_FLAG_POWER_GOOD   (1u << 3)  /* MP2762A ACOK (mains good)   */
+#define WUPS_PWR2_FLAG_USB_C_ATTACH (1u << 4)  /* HUSB238 PD contract present */
+
 /* power.cycle */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */

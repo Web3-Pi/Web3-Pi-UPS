@@ -128,7 +128,7 @@ cycles possible).
 
 | Op   | Name           | Direction              | Payload struct              |
 |------|----------------|------------------------|------------------------------|
-| 0x01 | status         | EVENT (CH32X→RP2040 @1Hz), RESP on query | `wups_power_status_v1_t` |
+| 0x01 | status         | EVENT (CH32X→RP2040 @1Hz), RESP on query | `wups_power_status_v2_t` (was `_v1_t`) |
 | 0x02 | enable         | REQ                    | empty                        |
 | 0x03 | disable        | REQ                    | empty                        |
 | 0x04 | cycle          | REQ                    | `wups_power_cycle_v1_t`     |
@@ -138,6 +138,16 @@ cycles possible).
 CH32X emits `power.status` autonomously every 1 s, **unicast to RP2040**.
 RP2040 caches the latest sample and includes the data in its own
 `host.aggregate` frames sent to RPi.
+
+Since 2026-06: the payload is **`wups_power_status_v2_t` (version byte = 2,
+40 bytes)** — a redesign, not a v1 superset, so every receiver dispatches on
+the version byte (offset 0): `1` → `wups_power_status_v1_t` (legacy), `2` →
+`wups_power_status_v2_t`. v2 adds separate INPUT (HUSB238) and OUTPUT PD
+contracts, real `vsys_mV`/`iin_mA` (v1 aliased these onto `pd_contract_*`),
+split LM75B/MP2762A temperatures, and a packed `flags` byte. Roll-out order:
+make all readers version-tolerant (RPi host, RP2040) **before** the CH32X
+emitter flips to v2; the RP2040 hub must forward the raw payload length, not
+`sizeof(v1)`. ESP32 is a transparent forwarder (v2 ≤ 64 B, no change).
 
 ### Class 0x03 NET (ESP32)
 
@@ -200,7 +210,7 @@ Every 1 s CH32X emits unicast to RP2040:
 
 ```
 DST=02  SRC=03  CLASS=02  OP=01  FLAGS=04  SEQ=auto
-LEN=18 00  payload=wups_power_status_v1_t (24 B)
+LEN=28 00  payload=wups_power_status_v2_t (40 B)   # v1 was 20 B (LEN=14 00)
 ```
 
 RP2040 caches it. RP2040's own `host.status`-equivalent frame to RPi
