@@ -535,7 +535,7 @@ static void drawScreenInput() {
 
   // row0: "IN  %2d.%dV" — VIN whole.frac (e.g. "IN  12.3V")
   oled.setCursor(0, 0);
-  oled.print(F("IN  "));
+  oled.print(F("IN "));
   int vi_w = ui.vi / 1000;
   if (vi_w < 10) oled.print(F(" "));
   oled.print(vi_w);
@@ -547,7 +547,7 @@ static void drawScreenInput() {
   oled.setCursor(0, 8);
   if (ui.pd_in_mV > 0) {
     int v = ui.pd_in_mV / 1000;
-    oled.print(F("PD"));
+    oled.print(F("PD "));
     if (v < 10) oled.print(F(" "));
     oled.print(v);
     oled.print(F("V"));
@@ -598,7 +598,7 @@ static void drawScreenOutput() {
   oled.setCursor(0, 8);
   if (ui.pd_out_mV > 0) {
     int v = ui.pd_out_mV / 1000;
-    oled.print(F("PD"));
+    oled.print(F("PD "));
     if (v < 10) oled.print(F(" "));
     oled.print(v);
     oled.print(F("V"));
@@ -612,7 +612,7 @@ static void drawScreenOutput() {
 
   // row2: TPS55289 current limit (mA -> whole.frac A).
   oled.setCursor(0, 16);
-  oled.print(F("Ilim "));
+  oled.print(F("Ilim  "));
   oled.print(ui.iout_limit_mA / 1000);
   oled.print(F("."));
   oled.print((ui.iout_limit_mA % 1000) / 100);
@@ -632,7 +632,7 @@ static void drawScreenBattery() {
   oled.print(ui.bv / 1000);
   oled.print(F("."));
   oled.print((ui.bv % 1000) / 100);
-  oled.print(F("V"));
+  oled.print(F("V "));
   if (ui.soc < 10) oled.print(F(" "));
   oled.print(ui.soc);
   oled.print(F("%"));

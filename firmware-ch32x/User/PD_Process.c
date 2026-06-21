@@ -790,15 +790,21 @@ void PD_Main_Proc( )
                      * asked for. ReqPDO_Idx is 1..4 per our SrcCap;
                      * any out-of-range value would have been rejected
                      * in the REQUEST handler before reaching here. */
+                    /* curr is the TPS55289 current limit, set a few % above the
+                     * negotiated PDO current so the rail can source full rated
+                     * power (≈27 W) under test load without the converter folding
+                     * into constant-current at the profile boundary. Limits sit
+                     * on the 0.1 A grid so the 2 s watchdog re-apply (from the
+                     * 0.1 A telemetry cache) reproduces them exactly. */
                     float volt = 5.0f;
                     float curr = 3.0f;
                     switch (PD_Ctl.ReqPDO_Idx)
                     {
-                        case 1: volt = 5.0f;  curr = 5.0f;  break;
-                        case 2: volt = 9.0f;  curr = 3.0f;  break;
-                        case 3: volt = 12.0f; curr = 2.25f; break;
-                        case 4: volt = 15.0f; curr = 1.8f;  break;
-                        default: /* keep safe defaults */     break;
+                        case 1: volt = 5.0f;  curr = 5.2f; break;  /* PDO 5V/5A     -> 5.2A (+4.0%) */
+                        case 2: volt = 9.0f;  curr = 3.1f; break;  /* PDO 9V/3A     -> 3.1A (+3.3%) */
+                        case 3: volt = 12.0f; curr = 2.3f; break;  /* PDO 12V/2.25A -> 2.3A (+2.2%) */
+                        case 4: volt = 15.0f; curr = 1.9f; break;  /* PDO 15V/1.8A  -> 1.9A (+5.6%) */
+                        default: /* keep safe defaults */    break;
                     }
                     tps55289_set_cdc_compensation(CDC_COMP_0V7);
                     tps55289_set_current_limit(curr);
