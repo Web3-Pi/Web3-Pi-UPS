@@ -586,26 +586,16 @@ static void drawScreenOutput() {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
 
-  // row0: RP2040's own ADC measurement of the Pi rail.
+  // row0: output rail voltage (RP2040's own ADC).
   oled.setCursor(0, 0);
-  oled.print(F("Vo R "));
+  oled.print(F("V "));
   oled.print(vbus_out_mV / 1000);
   oled.print(F("."));
   oled.print((vbus_out_mV % 1000) / 100);
   oled.print(F("V"));
 
-  // row1: CH32X PA0 measurement (fallback to ui.vr*100 if v2 field is 0,
-  // e.g. legacy v1 frames where vbus_out_ch_mV was never populated).
-  int vout_ch = (ui.vbus_out_ch_mV > 0) ? ui.vbus_out_ch_mV : (ui.vr * 100);
+  // row1: output PD contract to the Pi, or "PD N/A" when the rail is off.
   oled.setCursor(0, 8);
-  oled.print(F("Vo C "));
-  oled.print(vout_ch / 1000);
-  oled.print(F("."));
-  oled.print((vout_ch % 1000) / 100);
-  oled.print(F("V"));
-
-  // row2: output PD contract to the Pi, or "PD N/A" when the rail is off.
-  oled.setCursor(0, 16);
   if (ui.pd_out_mV > 0) {
     int v = ui.pd_out_mV / 1000;
     oled.print(F("PD"));
@@ -620,8 +610,8 @@ static void drawScreenOutput() {
     oled.print(F("PD N/A"));
   }
 
-  // row3: TPS55289 current limit (mA -> whole.frac A).
-  oled.setCursor(0, 24);
+  // row2: TPS55289 current limit (mA -> whole.frac A).
+  oled.setCursor(0, 16);
   oled.print(F("Ilim "));
   oled.print(ui.iout_limit_mA / 1000);
   oled.print(F("."));
@@ -636,9 +626,9 @@ static void drawScreenBattery() {
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
 
-  // row0: RP2040 ADC battery voltage + SOC. "R %d.%dV%2d%%"
+  // row0: battery voltage + SOC (RP2040's own ADC). "V %d.%dV%2d%%"
   oled.setCursor(0, 0);
-  oled.print(F("R "));
+  oled.print(F("V "));
   oled.print(ui.bv / 1000);
   oled.print(F("."));
   oled.print((ui.bv % 1000) / 100);
@@ -647,27 +637,16 @@ static void drawScreenBattery() {
   oled.print(ui.soc);
   oled.print(F("%"));
 
-  // row1: CH32X battery voltage + SOC. "C %d.%dV%2d%%"
-  oled.setCursor(0, 8);
-  oled.print(F("C "));
-  oled.print(ui.vbc / 1000);
-  oled.print(F("."));
-  oled.print((ui.vbc % 1000) / 100);
-  oled.print(F("V"));
-  if (ui.soc_ch < 10) oled.print(F(" "));
-  oled.print(ui.soc_ch);
-  oled.print(F("%"));
-
-  // row2: charge/discharge mode (mains-aware: cs=0 on mains is "not charging",
+  // row1: charge/discharge mode (mains-aware: cs=0 on mains is "not charging",
   // not discharge).
-  oled.setCursor(0, 16);
+  oled.setCursor(0, 8);
   oled.print(F("Mode:"));
   oled.print(batteryModeLabel(ui.pg, ui.cs));
 
-  // row3: charge current (mA -> whole.frac A; absolute value for sign-safe
+  // row2: charge current (mA -> whole.frac A; absolute value for sign-safe
   // single-digit fraction). "Ich %d.%dA"
   int ich = abs(ui.ci);
-  oled.setCursor(0, 24);
+  oled.setCursor(0, 16);
   oled.print(F("Ich "));
   oled.print(ich / 1000);
   oled.print(F("."));
