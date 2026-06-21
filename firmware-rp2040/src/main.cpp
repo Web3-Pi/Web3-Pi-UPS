@@ -7,6 +7,8 @@
 #include "wups_proto.h"
 #include "wups_router.h"
 #include "trust_ui.h"
+#include "ui_settings.h"
+#include "local_menu.h"
 
 // --- I2C for OLED ---
 constexpr uint8_t I2C0_SDA_PIN = 8;
@@ -281,17 +283,14 @@ bool startupComplete = false;
 constexpr unsigned long STARTUP_STABILIZE_MS = 3000;
 unsigned long startupEndTime = 0;
 
-// --- System-menu activation feedback (ADR-0012) ---
-// The gesture broadcasts a ui.button_event to the ESP32, which then drives
-// the menu via trust_ui. The M.2 module (ESP32+modem) is optional in the
-// product, so we may have no peer to answer. When the ESP32 doesn't
-// respond within MENU_RESPONSE_TIMEOUT_MS we fall back to opening the
-// debug screens directly — that's the only menu entry that is purely
-// RP2040-local (the ESP32 menu's Debug item does nothing more than
-// ui.set_screen back to us). Mode/Reset/RegenWallet require ESP32 state
-// and stay gated. menu_pending_deadline_ms = 0 means no gesture in
-// flight; non-zero means we're waiting for the ESP32's trust_prompt and
-// will time out at that absolute millis().
+// --- ESP32 backend-menu hand-off (ADR-0012, revised) ---
+// The LEFT-hold gesture now opens the RP2040-LOCAL menu (local_menu.*). The
+// ESP32 backend menu is reached from there via the "Network" item, which
+// broadcasts the activation ui.button_event and arms this deadline. The M.2
+// module (ESP32+modem) is optional, so we may have no peer to answer: if no
+// trust_prompt arrives within MENU_RESPONSE_TIMEOUT_MS we reopen the local
+// menu with a "No modem" notice. menu_pending_deadline_ms = 0 means no
+// hand-off in flight; non-zero is the absolute millis() to time out at.
 static uint32_t menu_pending_deadline_ms = 0;
 constexpr uint32_t MENU_RESPONSE_TIMEOUT_MS = 1500;
 
@@ -386,9 +385,10 @@ static void drawBatteryIcon(int x, int y, int soc, int cs, bool noBattery, uint8
 
 // Play error sound sequence (alarm pattern) - blocking
 static void playErrorSound() {
+  if (!ui_settings_sound_enabled()) return;  // muted: skip the blocking delays too
   // Three rapid high-pitched beeps
   for (int i = 0; i < 6; i++) {
-    tone(BUZZER_PIN, 2400, 100);
+    ui_settings_beep(2400, 100);
     delay(150);
   }
   
@@ -396,20 +396,22 @@ static void playErrorSound() {
 
 // Play gentle reminder beep - blocking
 static void playReminderBeep() {
-  tone(BUZZER_PIN, 2400, 80);
+  if (!ui_settings_sound_enabled()) return;
+  ui_settings_beep(2400, 80);
   delay(50);
-  tone(BUZZER_PIN, 2400, 80);
+  ui_settings_beep(2400, 80);
   delay(50);
 }
 
 // Play startup melody - pleasant ascending tones
 static void playStartupMelody() {
+  if (!ui_settings_sound_enabled()) return;
   // C5, E5, G5, C6 - major chord arpeggio
   const int notes[] = {523, 659, 784, 1047};
   const int durations[] = {100, 100, 100, 200};
 
   for (int i = 0; i < 4; i++) {
-    tone(BUZZER_PIN, notes[i], durations[i]);
+    ui_settings_beep(notes[i], durations[i]);
     delay(durations[i] + 30);
   }
   noTone(BUZZER_PIN);
@@ -417,13 +419,14 @@ static void playStartupMelody() {
 
 // Play power loss alarm - alarming descending tones
 static void playPowerLossAlarm() {
+  if (!ui_settings_sound_enabled()) return;
   // Descending urgent pattern
   for (int i = 0; i < 3; i++) {
-    tone(BUZZER_PIN, 1500, 150);
+    ui_settings_beep(1500, 150);
     delay(180);
-    tone(BUZZER_PIN, 1000, 150);
+    ui_settings_beep(1000, 150);
     delay(180);
-    tone(BUZZER_PIN, 700, 200);
+    ui_settings_beep(700, 200);
     delay(300);
   }
   noTone(BUZZER_PIN);
@@ -431,16 +434,18 @@ static void playPowerLossAlarm() {
 
 // Play low battery warning beep - single short beep
 static void playLowBatteryBeep() {
-  tone(BUZZER_PIN, 1800, 100);
+  if (!ui_settings_sound_enabled()) return;
+  ui_settings_beep(1800, 100);
   delay(100);
   noTone(BUZZER_PIN);
 }
 
 // Play critical battery warning beep - double short beep
 static void playCriticalBatteryBeep() {
-  tone(BUZZER_PIN, 2000, 80);
+  if (!ui_settings_sound_enabled()) return;
+  ui_settings_beep(2000, 80);
   delay(120);
-  tone(BUZZER_PIN, 2000, 80);
+  ui_settings_beep(2000, 80);
   delay(80);
   noTone(BUZZER_PIN);
 }
@@ -1075,6 +1080,11 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   // forwarding — this is an internal ESP32↔RP2040 round-trip.
   if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_TRUST_PROMPT &&
       (f.flags & WUPS_FLAG_REQ)) {
+    // trust_ui is about to take the OLED. Close the RP2040-local menu first
+    // so it can't silently resume (possibly on a destructive confirm screen)
+    // with a phantom button edge when trust_ui later ends. No-op on the
+    // normal "Network" hand-off (already closed) and on remote claim prompts.
+    if (local_menu_active()) local_menu_close();
     trust_ui_on_prompt(f.payload, f.len, f.seq);
     return;
   }
@@ -1136,7 +1146,7 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
       // 50 ms delay, so a long active tone is mostly fine — cap at 5 s
       // as a safety net).
       if (dur > 5000) dur = 5000;
-      tone(BUZZER_PIN, freq, dur);
+      ui_settings_beep(freq, dur);
     }
 
     uint8_t out_port = WUPS_PORT_NONE;
@@ -1374,6 +1384,27 @@ static int8_t checkButtons() {
   return result;
 }
 
+// ADR-0012 (revised) — the local menu's "Network" item hands off to the
+// ESP32 backend menu (Mode / HTTP Key / Wallet / Reset). We reuse the
+// original activation path: broadcast ui.button_event{0xFF, long}, which the
+// ESP32 opens its menu on, then close the local menu and arm a response
+// timeout. If the ESP32 answers, its trust_prompt makes trust_ui take over
+// the OLED; if nothing answers (no M.2 module / wedged ESP32), the timeout
+// in loop() reopens the local menu with a "No modem" notice.
+void local_menu_host_open_esp32(void) {
+  wups_ui_button_event_v1_t e;
+  e.version  = 1;
+  e.button   = 0xFF;   // activation gesture sentinel (ADR-0012)
+  e.action   = 2;      // long
+  e.reserved = 0;
+  wups_send(WUPS_PORT_ESP32, WUPS_ADDR_BROADCAST,
+            WUPS_CLASS_UI, WUPS_OP_UI_BUTTON_EVENT,
+            WUPS_FLAG_EVENT, &e, sizeof(e));
+  ui_settings_beep(1200, 80);
+  menu_pending_deadline_ms = millis() + MENU_RESPONSE_TIMEOUT_MS;
+  local_menu_close();  // release the OLED; trust_ui takes over if ESP32 answers
+}
+
 void setup() {
   // Power-hold
   pinMode(RP_HOLD_VDD_PIN, OUTPUT);
@@ -1386,6 +1417,10 @@ void setup() {
   // Buzzer pin
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+
+  // Load persisted UI settings (brightness + sound mute) before the first
+  // beep / brightness apply. Seeds defaults on first boot.
+  ui_settings_begin();
 
   // Button pins (active LOW with internal pullup)
   pinMode(BTN_LEFT_PIN, INPUT_PULLUP);
@@ -1454,6 +1489,9 @@ void setup() {
     while (true) { delay(1000); }
   }
 
+  // Apply persisted brightness so the splash already shows at the user's level.
+  ui_settings_apply_brightness(oled);
+
   oled.clearDisplay();
   oled.setTextSize(1);
   oled.setTextColor(SSD1306_WHITE);
@@ -1497,6 +1535,32 @@ void loop() {
     return;
   }
 
+  // ADR-0012 (revised) — the RP2040-LOCAL universal menu owns the OLED +
+  // buttons while open, exactly like trust_ui above. Built from local state,
+  // so it works with or without the M.2 module. Only opens while trust_ui is
+  // inactive (checked above), so the two never fight over the display.
+  if (local_menu_active()) {
+    LocalMenuCtx ctx;
+    ctx.uptime_s    = millis() / 1000UL;
+    ctx.temp_lm_dC  = ui.temp_lm_dC;
+    ctx.temp_mp_dC  = ui.temp_mp_dC;
+    ctx.power_fresh = (Last_Power_Status_Ms != 0) &&
+                      ((uint32_t)(millis() - Last_Power_Status_Ms) < 3000u);
+    // Read the output rail live so the Output screen reflects a just-issued
+    // enable/disable (the main ADC read below is skipped while we early-return).
+    {
+      float lsb_mV = (VREF * 1000.0f) / ADC_MAX;
+      ctx.vbus_out_mV =
+          (int)(analogRead(ADC_VBUS_OUT_PIN) * lsb_mV / VBUS_DIVIDER_RATIO + 0.5f);
+    }
+    local_menu_tick(oled,
+                    digitalRead(BTN_LEFT_PIN)  == LOW,
+                    digitalRead(BTN_RIGHT_PIN) == LOW,
+                    ctx);
+    delay(50);
+    return;
+  }
+
   // ADR-0012 — system-menu activation gesture: hold LEFT for
   // MENU_ACTIVATION_HOLD_MS on the home screen. One-button gesture
   // (ergonomically easiest). Sends a single ui.button_event{
@@ -1528,24 +1592,17 @@ void loop() {
       }
       if (s_home_at_start && !s_menu_fired &&
           (now_ms - s_left_start_ms) >= MENU_ACTIVATION_HOLD_MS) {
-        wups_ui_button_event_v1_t e;
-        e.version  = 1;
-        e.button   = 0xFF;    // activation gesture sentinel (ADR-0012)
-        e.action   = 2;       // long
-        e.reserved = 0;
-        wups_send(WUPS_PORT_ESP32, WUPS_ADDR_BROADCAST,
-                  WUPS_CLASS_UI, WUPS_OP_UI_BUTTON_EVENT,
-                  WUPS_FLAG_EVENT, &e, sizeof(e));
-        tone(BUZZER_PIN, 1200, 80);
+        // ADR-0012 (revised): the LEFT-hold now opens the RP2040-LOCAL
+        // universal menu (brightness / sound / info / output), which works
+        // with or without the M.2 module. The ESP32 backend menu (Mode /
+        // HTTP Key / Wallet / Reset) is reached from inside it via the
+        // "Network" item — see local_menu_host_open_esp32(). The
+        // local_menu_active() branch at the top of loop() takes over the
+        // OLED on the next iteration.
+        local_menu_open();
+        ui_settings_beep(1200, 80);
         s_menu_fired    = true;
         s_left_consumed = true;   // this LEFT became a hold — no tap nav
-        // Control hands over to trust_ui as soon as the ESP32 sends
-        // back the first menu prompt — the trust_ui_active() branch
-        // at the top of loop() takes over then. If no prompt arrives
-        // within MENU_RESPONSE_TIMEOUT_MS we surface "NO ESP32" so the
-        // user doesn't think the device hung — handles both the
-        // M.2-module-absent case and a stuck ESP32 the same way.
-        menu_pending_deadline_ms = now_ms + MENU_RESPONSE_TIMEOUT_MS;
       }
     } else {
       s_left_start_ms = 0;
@@ -1554,30 +1611,20 @@ void loop() {
     }
   }
 
-  // ESP32 timeout for the activation gesture above. If trust_ui took over,
-  // the ESP32 responded — clear the pending state silently. Otherwise jump
-  // directly to the debug screens (INPUT=1 is the first one in the strip
-  // 1→2→3→4); a second short beep flags the fallback so the user can tell
-  // the menu didn't open.
-  //
-  // TEMPORARY (2026-06-09): debug-screen fallback disabled. With no ESP32
-  // module the long-LEFT gesture used to drop into the RP2040-local debug
-  // screens and short presses then navigated them — we don't want that UX
-  // right now. We still emit the "NO ESP32" beep so the gesture is
-  // acknowledged, but stay on the home dashboard (currentScreen stays 0, so
-  // the short-press nav below is a no-op). Flip this back to true to restore
-  // the old behaviour.
-  constexpr bool ENABLE_DEBUG_SCREEN_FALLBACK = false;
+  // ADR-0012 (revised) — "Network" hand-off result. local_menu_host_open_esp32()
+  // broadcast the activation gesture, armed this deadline, and closed the
+  // local menu. If trust_ui took over, the ESP32 answered — clear silently.
+  // Otherwise (no M.2 module / wedged ESP32) reopen the local menu and flash
+  // a "No modem" notice so the user isn't dropped back to the dashboard
+  // wondering what happened.
   if (menu_pending_deadline_ms != 0) {
     if (trust_ui_active()) {
       menu_pending_deadline_ms = 0;
     } else if ((int32_t)(millis() - menu_pending_deadline_ms) >= 0) {
       menu_pending_deadline_ms = 0;
-      tone(BUZZER_PIN, 1500, 80);
-      if (ENABLE_DEBUG_SCREEN_FALLBACK) {
-        currentScreen = 1;
-        lastInteractionTime = millis();
-      }
+      ui_settings_beep(1500, 80);
+      local_menu_open();
+      local_menu_note_no_modem();
     }
   }
 
@@ -1621,7 +1668,7 @@ void loop() {
     // RIGHT pressed - next screen (wrap)
     lastInteractionTime = millis();
     currentScreen = (currentScreen + 1) % SCREEN_COUNT;
-    tone(BUZZER_PIN, 1000, 20);
+    ui_settings_beep(1000, 20);
   }
 
   // LEFT release-edge nav: previous screen (wrap), unless this LEFT episode
@@ -1633,7 +1680,7 @@ void loop() {
       if (!s_left_consumed) {
         lastInteractionTime = millis();
         currentScreen = (currentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT;
-        tone(BUZZER_PIN, 1000, 20);
+        ui_settings_beep(1000, 20);
       }
       s_left_consumed = false;   // re-arm for the next LEFT episode
     }

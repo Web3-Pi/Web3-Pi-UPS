@@ -5,6 +5,7 @@
 #include "trust_ui.h"
 #include "wups_router.h"
 #include "wups_proto.h"
+#include "ui_settings.h"
 #include <string.h>
 
 /* 64x32 OLED, default GFX font: 6 px advance, 8 px tall. */
@@ -404,7 +405,7 @@ void trust_ui_tick(Adafruit_SSD1306& oled, bool btnLeftDown,
         uint32_t held = now - S.hold_start_ms;
         uint32_t need = (uint32_t)S.confirm_secs * 1000u;
         if (held >= need) {
-            tone(BUZZER_PIN, 2000, 120);
+            ui_settings_beep(2000, 120);
             send_result(RES_CONFIRMED);
             S.active = false;
             return;
