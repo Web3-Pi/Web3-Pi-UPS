@@ -92,8 +92,10 @@ UINT8 tps55289_set_current_limit(float amps)
     if (amps < 0.0f || amps > 6.35f)
         return -1;
 
-    //int reg_val = (int)roundf(amps * IOUT_LSB_PER_AMP); // 0..100
-    int reg_val = (int) (amps * IOUT_LSB_PER_AMP); // 0..100
+    /* Round, don't truncate. Float repr of e.g. 1.8 is 1.79999… so the old
+     * (int) cast gave 35 LSB (1.75 A) instead of 36 (1.80 A); same rounding-down
+     * bit every non-exact target. roundf lands on the nearest 0.05 A LSB. */
+    int reg_val = (int)roundf(amps * IOUT_LSB_PER_AMP); // 0..127
 
     if (reg_val > 0x7F)
         reg_val = 0x7F;
@@ -101,7 +103,7 @@ UINT8 tps55289_set_current_limit(float amps)
     reg_val |= 0x80;    // enable bit
 
     tps55289_write_byte(REG_IOUT_LIMIT, (UINT8)reg_val);
-    g_current_set_a10 = (int16_t)(amps * 10.0f);
+    g_current_set_a10 = (int16_t)roundf(amps * 10.0f);  /* round: 5.2f*10=51.99→52, not 51 */
     return 0;
 }
 // -----------------------------------------------------------------------------
@@ -140,7 +142,7 @@ UINT8 tps55289_set_voltage(float vout)
 
     tps55289_write_byte(REG_VOUT_FS, vout_fs_val);
 	write_word_lsb_first(REG_REF_LSB, (UINT16)reg);
-	g_voltage_set_v10 = (int16_t)(vout * 10.0f);
+	g_voltage_set_v10 = (int16_t)roundf(vout * 10.0f);  /* round for parity with current cache */
 	return 0;
 }
 // -----------------------------------------------------------------------------
