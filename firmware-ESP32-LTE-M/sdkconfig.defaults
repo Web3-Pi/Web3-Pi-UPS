@@ -1,4 +1,7 @@
-# Defaults for the LilyGo T-SIM7080G-S3 board (ESP32-S3-WROOM-1, 16 MB Flash, OPI PSRAM).
+# Defaults for the W3P MODEM V1 M.2 card (ESP32-S3FH4R2: 4 MB in-package Flash,
+# 2 MB PSRAM — PSRAM left disabled, firmware does not use it).
+# (Was: LilyGo T-SIM7080G-S3 dev board, ESP32-S3-WROOM-1, 16 MB Flash. The M.2
+#  production card has a different flash size AND a different GPIO/PMU pinout.)
 # Delete sdkconfig if you want a clean rebuild from these defaults.
 
 # --- Console (USB-Serial-JTAG over USB-C) ---
@@ -13,8 +16,8 @@ CONFIG_LWIP_PPP_PAP_SUPPORT=y
 CONFIG_LWIP_PPP_CHAP_SUPPORT=y
 CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
 
-# --- Flash size (board has 16 MB) ---
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# --- Flash size (M.2 card's ESP32-S3FH4R2 has 4 MB in-package flash) ---
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # --- Custom partition table (Track 0 / WS-10): adds the `prov` NVS
 #     partition for the per-device MQTT secret. See partitions.csv. ---
