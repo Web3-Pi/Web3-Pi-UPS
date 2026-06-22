@@ -27,14 +27,33 @@
 
 #define MODEM_TAG "modem"
 
-#define MODEM_PWR_GPIO    41
-#define MODEM_DTR_GPIO    42
-#define MODEM_RI_GPIO      3
-#define MODEM_RX_GPIO      4   /* ESP32 RX ← Modem TX */
-#define MODEM_TX_GPIO      5   /* ESP32 TX → Modem RX */
+/* W3P MODEM V1 (M.2) pinout — ESP32-S3FH4R2 ↔ SIM7080G UART1.
+ * (Was LilyGo T-SIM7080G-S3: PWRKEY=41, DTR=42, RI=3, RX=4, TX=5. GPIO3 is a
+ *  strapping pin and is left NC on the M.2 card.) Only PWRKEY/TX/RX are used
+ *  in software; DTR/RI are routed but not driven here. */
+#define MODEM_PWR_GPIO     1   /* ESP_PWRKEY    → SIM7080G PWRKEY */
+#define MODEM_TX_GPIO      2   /* ESP_UART1_TXD : ESP TX → Modem RX */
+#define MODEM_RX_GPIO      4   /* ESP_UART1_RXD : ESP RX ← Modem TX */
+#define MODEM_DTR_GPIO     5   /* ESP_UART1_DTR (not driven in SW) */
+#define MODEM_RI_GPIO      6   /* ESP_UART1_RI  (not driven in SW) */
 
 #define MODEM_UART        UART_NUM_1
 #define MODEM_BAUD        115200
+
+/* Post-power-on settle before AT is reliable. SIM7080G Ton(uart) = 1.8 s
+ * (HW Design V1.05, Table 9); we keep a conservative 5 s so the SIM/AT stack
+ * is fully up, and esp_modem's sync (20×500 ms) absorbs any extra cold-start. */
+#define MODEM_BOOT_DELAY_MS  5000
+
+/* --- Bench bring-up diagnostic (set 0 for normal/production builds) -------
+ * When 1: skip esp_modem/PPP entirely and run a raw UART probe that writes
+ * "AT\r\n" on UART1 (TX=GPIO2 / RX=GPIO4) and hexdumps any reply, and NEVER
+ * power-cycles the modem — so a healthy, network-searching modem stays ON for
+ * measurement. Used to validate the TXB0108 level-translator power
+ * (LTE_VDD_EXT) bodge on the W3P MODEM V1 card:
+ *   RX TIMEOUT / 0 bytes -> UART path dead (translator unpowered / wiring)
+ *   "AT\r\r\nOK\r\n"      -> path alive, translator working. */
+#define MODEM_UART_DIAG   0
 
 #define APN_1NCE_IOT      "iot.1nce.net"
 
@@ -86,6 +105,63 @@ esp_err_t modem_power_on(void)
     gpio_set_level(MODEM_PWR_GPIO, 0);
     ESP_LOGI(MODEM_TAG, "PWRKEY released — modem boot in progress");
     return ESP_OK;
+}
+
+void modem_ensure_on(void)
+{
+    /* The modem's VBAT (PP3800_SYS) is always-on and independent of the ESP,
+     * so the modem stays powered across ESP resets/reflashes. A blind PWRKEY
+     * pulse here would toggle a healthy, running modem OFF (PWRKEY is a
+     * level-edge toggle, not an on-only signal). So probe AT on a temporary
+     * raw UART first; only pulse PWRKEY if the modem is actually silent. The
+     * UART driver is removed afterwards so esp_modem can claim UART1 cleanly. */
+    uart_config_t cfg = {
+        .baud_rate  = MODEM_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    if (uart_driver_install(MODEM_UART, 512, 0, 0, NULL, 0) != ESP_OK) {
+        /* Fall back to an unconditional power-on if we can't probe. */
+        modem_power_on();
+        vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_DELAY_MS));
+        return;
+    }
+    uart_param_config(MODEM_UART, &cfg);
+    uart_set_pin(MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    /* If the modem is stuck in PPP/data mode (the ESP rebooted mid-session —
+     * the modem keeps its own data session up), pull it back to command mode
+     * with the "+++" escape: ~1 s of UART idle, "+++", ~1 s idle. Harmless when
+     * the modem is off or already in command mode. */
+    uint8_t buf[64];
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_write_bytes(MODEM_UART, "+++", 3);
+    vTaskDelay(pdMS_TO_TICKS(1100));
+    uart_flush_input(MODEM_UART);
+
+    bool alive = false;
+    for (int i = 0; i < 5 && !alive; i++) {
+        uart_flush_input(MODEM_UART);
+        uart_write_bytes(MODEM_UART, "AT\r\n", 4);
+        int n = uart_read_bytes(MODEM_UART, buf, sizeof(buf) - 1, pdMS_TO_TICKS(300));
+        if (n > 0) {
+            buf[n] = '\0';
+            if (strstr((char *)buf, "OK")) alive = true;
+        }
+    }
+    uart_driver_delete(MODEM_UART);
+
+    if (alive) {
+        ESP_LOGI(MODEM_TAG, "modem already powered (AT answered) — skipping PWRKEY pulse");
+        return;
+    }
+    ESP_LOGI(MODEM_TAG, "modem silent — powering on via PWRKEY");
+    modem_power_on();
+    vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_DELAY_MS));  /* let the modem finish booting */
 }
 
 /* --- esp_netif PPP event hooks ------------------------------------------- */
@@ -511,8 +587,73 @@ static void ppp_supervisor_task(void *arg)
     }
 }
 
+#if MODEM_UART_DIAG
+/* Send one AT command on the raw UART and log the reply on a single line.
+ * Used only for bench bring-up (MODEM_UART_DIAG). */
+static void diag_send_at(const char *cmd, int wait_ms)
+{
+    static uint8_t buf[512];
+    uart_flush_input(MODEM_UART);
+    uart_write_bytes(MODEM_UART, cmd, strlen(cmd));
+    uart_write_bytes(MODEM_UART, "\r\n", 2);
+    int n = uart_read_bytes(MODEM_UART, buf, sizeof(buf) - 1, pdMS_TO_TICKS(wait_ms));
+    if (n > 0) {
+        buf[n] = '\0';
+        for (int i = 0; i < n; i++) if (buf[i] == '\r' || buf[i] == '\n') buf[i] = ' ';
+        ESP_LOGI(MODEM_TAG, "DIAG %-10s -> [%d] %s", cmd, n, (char *)buf);
+    } else {
+        ESP_LOGW(MODEM_TAG, "DIAG %-10s -> TIMEOUT (0 bytes)", cmd);
+    }
+}
+
+/* Raw UART AT-sweep diagnostic: owns UART1 directly (no esp_modem), never
+ * power-cycles the modem. Confirms the level-translator path and reports SIM,
+ * signal, ICCID and registration so we can see exactly where bring-up stops. */
+static void raw_uart_diag_task(void *arg)
+{
+    (void)arg;
+    uart_config_t cfg = {
+        .baud_rate  = MODEM_BAUD,
+        .data_bits  = UART_DATA_8_BITS,
+        .parity     = UART_PARITY_DISABLE,
+        .stop_bits  = UART_STOP_BITS_1,
+        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_driver_install(MODEM_UART, 2048, 0, 0, NULL, 0);
+    uart_param_config(MODEM_UART, &cfg);
+    uart_set_pin(MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    ESP_LOGW(MODEM_TAG, "MODEM_UART_DIAG: raw AT sweep on UART%d TX=GPIO%d RX=GPIO%d @ %d "
+                        "(no esp_modem, no power-cycle)",
+             MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO, MODEM_BAUD);
+    for (;;) {
+        ESP_LOGI(MODEM_TAG, "================ DIAG AT sweep ================");
+        diag_send_at("AT",        1000);  /* sanity / link alive            */
+        diag_send_at("ATE0",      1000);  /* echo off for cleaner replies   */
+        diag_send_at("AT+CPIN?",  2000);  /* SIM ready? (READY / SIM PIN..) */
+        diag_send_at("AT+CICCID", 2000);  /* SIM7080G ICCID command         */
+        diag_send_at("AT+CCID",   2000);  /* legacy ICCID command (compare) */
+        diag_send_at("AT+CIMI",   2000);  /* IMSI — proves SIM file access  */
+        diag_send_at("AT+CRSM=176,12258,0,0,10", 3000); /* read EF_ICCID raw */
+        diag_send_at("AT+CSQ",    2000);  /* signal (rssi,ber); 99=unknown  */
+        diag_send_at("AT+CGREG?", 2000);  /* GPRS registration             */
+        diag_send_at("AT+CEREG?", 2000);  /* LTE/EPS registration          */
+        diag_send_at("AT+COPS?",  3000);  /* operator                      */
+        diag_send_at("AT+CGNAPN", 3000);  /* network-assigned APN          */
+        diag_send_at("AT+CNMP?",  1000);  /* preferred network mode        */
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+#endif /* MODEM_UART_DIAG */
+
 void modem_at_pass_through_start(void)
 {
+#if MODEM_UART_DIAG
+    /* Bench bring-up: raw AT sweep instead of PPP/esp_modem. Modem stays ON. */
+    xTaskCreate(raw_uart_diag_task, "uart_diag", 4096, NULL, 5, NULL);
+    ESP_LOGW(MODEM_TAG, "MODEM_UART_DIAG active — raw UART AT sweep (PPP/esp_modem disabled)");
+#else
     /* Despite the legacy name, this now spawns the PPP supervisor task
      * (espressif/esp_modem). It brings PPP up, starts esp-mqtt on first
      * success, and then runs forever — re-creating the DCE whenever PPP
@@ -520,4 +661,5 @@ void modem_at_pass_through_start(void)
      * outage. */
     xTaskCreate(ppp_supervisor_task, "ppp_sup", 8192, NULL, 5, NULL);
     ESP_LOGI(MODEM_TAG, "PPP supervisor task started (esp_modem)");
+#endif
 }

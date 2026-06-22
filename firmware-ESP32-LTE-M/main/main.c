@@ -140,14 +140,15 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(200));
     ESP_LOGI(TAG, "calling modem_init...");
 
-    /* Configure GPIO + UART, then pulse PWRKEY. */
+    /* Configure the PWRKEY GPIO. */
     ESP_ERROR_CHECK(modem_init());
-    ESP_LOGI(TAG, "calling modem_power_on...");
-    ESP_ERROR_CHECK(modem_power_on());
 
-    /* Wait for the modem to finish booting before we start watching the UART. */
-    ESP_LOGI(TAG, "waiting %d ms for modem boot...", MODEM_BOOT_DELAY_MS);
-    vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_DELAY_MS));
+    /* Power the modem on ONLY if it isn't already running — the modem keeps its
+     * own VBAT across ESP resets, so a blind PWRKEY pulse would toggle a healthy
+     * modem OFF. modem_ensure_on() probes AT first and pulses PWRKEY + waits for
+     * boot only when the modem is silent. */
+    ESP_LOGI(TAG, "ensuring modem is powered...");
+    modem_ensure_on();
 
     /* Bring up the binary protocol link to RP2040 (UART2 with HW flow control,
      * MQTT data → net.downlink hook). Done before PPP/MQTT so RP2040 can
