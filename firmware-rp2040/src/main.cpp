@@ -1531,6 +1531,12 @@ void loop() {
   // the OLED and both buttons, and the normal dashboard / navigation is
   // fully suppressed. Buttons are active-LOW with pullups (LOW = pressed).
   if (trust_ui_active()) {
+    // The ESP32 answered the "Network" hand-off — clear the No-modem deadline
+    // HERE. This branch returns before the deadline check further down ever
+    // runs, so if we don't clear it now the stale deadline fires the instant
+    // the menu closes (spurious "No modem" + a second beep + the local menu
+    // reopening instead of going Home, on every menu exit).
+    menu_pending_deadline_ms = 0;
     trust_ui_tick(oled,
                   digitalRead(BTN_LEFT_PIN)  == LOW,
                   digitalRead(BTN_RIGHT_PIN) == LOW);
