@@ -21,6 +21,7 @@
 /* writable runtime state (default `nvs`) — separate from WS-9's w3wsec. */
 #define STATE_NAMESPACE "w3arkiv"
 #define KEY_OWNER_PUB   "owner_pub"     /* 64 B X||Y — bound at OLED confirm */
+#define KEY_ENC_PUB     "enc_pub"       /* 64 B X||Y — owner ECDH key (ADR-13)*/
 #define KEY_KEY_EPOCH   "key_epoch"     /* u32 — revocation/ratchet (§4.5)   */
 #define KEY_LAST_CTR    "last_ctr"      /* u64 — monotonic replay baseline   */
 #define KEY_CUR_BLOCK   "cur_block"     /* u64 — Braga cursor (§4.4)         */
@@ -35,6 +36,9 @@ static uint8_t             s_dev_pub[PUB_LEN];
 static uint8_t             s_owner_pub[PUB_LEN];
 static uint8_t             s_owner_addr[ADDR_LEN]; /* derived from owner_pub */
 static bool                s_have_owner;
+static uint8_t             s_enc_pub[PUB_LEN];     /* owner ECDH key (ADR-0013) */
+static bool                s_have_enc;
+static uint32_t            s_binding_gen;          /* bumps on bind/epoch/clear */
 
 /* Ethereum address from an uncompressed pubkey: keccak256(X||Y)[12:32]. */
 static void pub_to_addr(const uint8_t pub[PUB_LEN], uint8_t addr[ADDR_LEN])
@@ -106,6 +110,11 @@ esp_err_t cmdauth_arkiv_init(void)
         pub_to_addr(s_owner_pub, s_owner_addr);
         s_have_owner = true;
     }
+    size_t elen = sizeof(s_enc_pub);
+    if (nvs_get_blob(sh, KEY_ENC_PUB, s_enc_pub, &elen) == ESP_OK &&
+        elen == PUB_LEN) {
+        s_have_enc = true;
+    }
     if (nvs_get_u32(sh, KEY_KEY_EPOCH, &s_key_epoch) != ESP_OK) s_key_epoch = 0;
     if (nvs_get_u64(sh, KEY_LAST_CTR, &s_last_ctr) != ESP_OK) s_last_ctr = 0;
     if (nvs_get_u64(sh, KEY_CUR_BLOCK, &s_cur_block) != ESP_OK) s_cur_block = 0;
@@ -130,6 +139,12 @@ const uint8_t *cmdauth_arkiv_owner_addr(void)
 {
     return s_have_owner ? s_owner_addr : NULL;
 }
+const uint8_t *cmdauth_arkiv_enc_pub(void)
+{
+    return s_have_enc ? s_enc_pub : NULL;
+}
+uint32_t cmdauth_arkiv_key_epoch(void)    { return s_key_epoch; }
+uint32_t cmdauth_arkiv_binding_gen(void)  { return s_binding_gen; }
 uint64_t cmdauth_arkiv_cursor_block(void) { return s_cur_block; }
 
 static bool persist_progress(uint64_t ctr, uint64_t block)
@@ -266,13 +281,22 @@ bool cmdauth_arkiv_check(const arkiv_cmd_t *cmd,
     return true;
 }
 
-esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_pub[64], uint32_t epoch)
+esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_pub[64],
+                                   const uint8_t enc_pub[64], uint32_t epoch)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
+    /* Defence in depth: never persist an off-curve / infinity key (the claim
+     * path validates too, but bind is the trust boundary). */
+    if (arkiv_secp256k1_valid_pubkey(owner_pub) != 1 ||
+        arkiv_secp256k1_valid_pubkey(enc_pub) != 1) {
+        ESP_LOGE(TAG, "bind: invalid owner_pub/enc_pub — refusing");
+        return ESP_ERR_INVALID_ARG;
+    }
     nvs_handle_t sh;
     esp_err_t err = state_open(&sh, NVS_READWRITE);
     if (err != ESP_OK) return err;
     err = nvs_set_blob(sh, KEY_OWNER_PUB, owner_pub, PUB_LEN);
+    if (err == ESP_OK) err = nvs_set_blob(sh, KEY_ENC_PUB, enc_pub, PUB_LEN);
     if (err == ESP_OK) err = nvs_set_u32(sh, KEY_KEY_EPOCH, epoch);
     /* Fresh counter namespace per owner (§10.6) so a previous owner's old
      * signed commands can never collide post-resale. */
@@ -284,11 +308,15 @@ esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_pub[64], uint32_t epoch)
 
     memcpy(s_owner_pub, owner_pub, PUB_LEN);
     pub_to_addr(s_owner_pub, s_owner_addr);
+    memcpy(s_enc_pub, enc_pub, PUB_LEN);
     s_have_owner = true;
+    s_have_enc = true;
     s_key_epoch = epoch;
     s_last_ctr = 0;
     s_claim_state = ARKIV_CLAIMED;
-    ESP_LOGI(TAG, "owner bound (epoch=%u) — ARKIV_CLAIMED", (unsigned)epoch);
+    s_binding_gen++;   /* invalidate any cached K_dir in the writer */
+    ESP_LOGI(TAG, "owner bound (epoch=%u, enc_pub set) — ARKIV_CLAIMED",
+             (unsigned)epoch);
     return ESP_OK;
 }
 
@@ -308,6 +336,7 @@ esp_err_t cmdauth_arkiv_set_epoch(uint32_t epoch)
     nvs_close(sh);
     if (err != ESP_OK) return err;
     s_key_epoch = epoch;
+    s_binding_gen++;   /* new epoch → writer must re-derive K_dir */
     ESP_LOGI(TAG, "key epoch ratcheted → %u", (unsigned)epoch);
     return ESP_OK;
 }
@@ -318,6 +347,7 @@ esp_err_t cmdauth_arkiv_clear(void)
     esp_err_t err = state_open(&sh, NVS_READWRITE);
     if (err != ESP_OK) return err;
     nvs_erase_key(sh, KEY_OWNER_PUB);
+    nvs_erase_key(sh, KEY_ENC_PUB);
     nvs_erase_key(sh, KEY_KEY_EPOCH);
     nvs_erase_key(sh, KEY_LAST_CTR);
     nvs_erase_key(sh, KEY_CUR_BLOCK);
@@ -326,11 +356,14 @@ esp_err_t cmdauth_arkiv_clear(void)
     nvs_close(sh);
     memset(s_owner_pub, 0, PUB_LEN);
     memset(s_owner_addr, 0, ADDR_LEN);
+    memset(s_enc_pub, 0, PUB_LEN);
     s_have_owner = false;
+    s_have_enc = false;
     s_key_epoch = 0;
     s_last_ctr = 0;
     s_cur_block = 0;
     s_claim_state = ARKIV_UNCLAIMED;
+    s_binding_gen++;   /* binding gone → invalidate cached K_dir */
     ESP_LOGI(TAG, "Arkiv binding cleared — UNCLAIMED");
     return err;
 }

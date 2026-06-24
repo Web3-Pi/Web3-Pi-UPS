@@ -155,7 +155,12 @@ static esp_err_t emit_via_arkiv(wups_backend_mode_t from,
     /* `seq` is a numeric attr so the panel's ingest sorts it the same
      * way as other w3pups-event entities (apps/api/src/lib/arkiv/
      * ingest.ts → ingestEvents → numbers[Attr.SEQ]). */
-    arkiv_attr_t attrs[7] = {
+    /* mode_changed is on the ADR-0013 no-encrypt allowlist: every bit of
+     * semantics is in plaintext attributes (from/to/pending/class), so the
+     * 4-byte body stays plaintext and we mark scheme=0 (self-describing
+     * "unencrypted") — the reader dispatches on `scheme` and routes this to
+     * applyModeChange untouched, never attempting to decrypt it. */
+    arkiv_attr_t attrs[8] = {
         { .key = "type",      .value_str = "w3pups-event",   .is_numeric = false },
         { .key = "device_id", .value_str = iccid,            .is_numeric = false },
         { .key = "class",     .value_str = "mode_changed",   .is_numeric = false },
@@ -163,6 +168,7 @@ static esp_err_t emit_via_arkiv(wups_backend_mode_t from,
         { .key = "to",        .value_str = to_str,           .is_numeric = false },
         { .key = "pending",   .value_str = pending_str,      .is_numeric = false },
         { .key = "seq",       .value_num = (int64_t)seq,     .is_numeric = true  },
+        { .key = "scheme",    .value_num = 0,                .is_numeric = true  },
     };
     /* Tiny payload: same 4 bytes the MQTT path carries, so consumers
      * sharing decoding logic can parse either uniformly later. */

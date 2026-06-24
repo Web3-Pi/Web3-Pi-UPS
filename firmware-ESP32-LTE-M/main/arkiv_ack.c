@@ -2,6 +2,7 @@
 #include "arkiv_writer.h"
 #include "arkiv_cfg.h"
 #include "identity.h"
+#include "arkiv_crypto/aead.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -134,22 +135,42 @@ bool arkiv_ack_emit(uint8_t seq, const uint8_t *resp_payload, size_t resp_len)
      * for ack/telemetry/event together. */
     uint64_t ack_seq = arkiv_writer_next_seq();
 
-    arkiv_attr_t attrs[5] = {
-        { .key = "type",       .value_str = "w3pups-ack",   .is_numeric = false },
-        { .key = "device_id",  .value_str = iccid,           .is_numeric = false },
-        { .key = "command_id", .value_str = cmd_id,          .is_numeric = false },
+    /* Seal the RESP body (ADR-0013 posture B). command_id is bound into the
+     * AAD so a gateway cannot transplant this ack onto another command. `code`
+     * stays a plaintext attribute (status routing). Fail-closed: drop on error. */
+    if (resp_len > 256) {
+        ESP_LOGW(TAG, "w3pups-ack RESP too large (%u) — dropping", (unsigned)resp_len);
+        return false;
+    }
+    uint8_t  sealed[256 + ARKIV_AEAD_OVERHEAD];
+    size_t   sealed_len = 0;
+    uint32_t epoch = 0;
+    int sr = arkiv_writer_payload_seal(ARKIV_AEAD_TYPE_ACK, ack_seq,
+                                       "w3pups-ack", cmd_id,
+                                       resp_payload, resp_len,
+                                       sealed, sizeof(sealed), &sealed_len, &epoch);
+    if (sr != 0) {
+        ESP_LOGW(TAG, "w3pups-ack seal failed (rc=%d cmd=%s) — dropping (fail-closed)",
+                 sr, cmd_id);
+        return false;
+    }
+
+    arkiv_attr_t attrs[7] = {
+        { .key = "type",       .value_str = "w3pups-ack",     .is_numeric = false },
+        { .key = "device_id",  .value_str = iccid,            .is_numeric = false },
+        { .key = "command_id", .value_str = cmd_id,           .is_numeric = false },
         { .key = "seq",        .value_num = (int64_t)ack_seq, .is_numeric = true },
-        { .key = "code",       .value_num = code,            .is_numeric = true },
+        { .key = "code",       .value_num = code,             .is_numeric = true },
+        { .key = "epoch",      .value_num = (int64_t)epoch,   .is_numeric = true },
+        { .key = "scheme",     .value_num = 3,                .is_numeric = true },
     };
 
-    /* Payload: the raw RESP bytes — useful for the backend to surface the
-     * full result blob in `commands.result.hex`, mirroring the MQTT path.
-     * Use the ENQUEUE variant: this function is called from wups_rx (4 KB
-     * stack) and the synchronous submit would stack-overflow during the
-     * TLS handshake + RLP signing (caught during P4 bring-up). */
+    /* Sealed RESP body. Use the ENQUEUE variant: this runs on wups_rx (4 KB
+     * stack); the synchronous submit would stack-overflow during the TLS
+     * handshake + RLP signing (caught during P4 bring-up). */
     bool ok = arkiv_writer_enqueue_create_entity(
         "application/octet-stream",
-        resp_payload, resp_len,
+        sealed, sealed_len,
         15 * 60,  /* 15 min TTL — backend sweep is 30 s, ample headroom */
         attrs, sizeof(attrs) / sizeof(attrs[0]));
     if (!ok) {

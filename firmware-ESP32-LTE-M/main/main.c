@@ -41,6 +41,7 @@
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
+#include "arkiv_crypto_selftest.h"
 
 static const char *TAG = "app";
 
@@ -82,6 +83,13 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "app_main entered");
     log_boot_banner();
+
+#if ARKIV_CRYPTO_SELFTEST
+    /* ADR-0013: confirm the on-device crypto path (mbedtls + HW AES) is
+     * byte-identical to the host/JS golden vectors before trusting it to seal
+     * telemetry onto the immutable ledger. */
+    (void)arkiv_crypto_selftest();
+#endif
 
     /* esp_netif and esp_modem need NVS for runtime state (DNS, etc). */
     esp_err_t nvs_err = nvs_flash_init();

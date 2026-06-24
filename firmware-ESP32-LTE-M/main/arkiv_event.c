@@ -3,6 +3,7 @@
 #include "cmdauth_arkiv.h"
 #include "identity.h"
 #include "wups_proto.h"
+#include "arkiv_crypto/aead.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -61,19 +62,39 @@ void arkiv_event_observe_frame(const uint8_t *frame, uint16_t frame_len)
 
     uint64_t seq = arkiv_writer_next_seq();
 
-    arkiv_attr_t attrs[4] = {
+    /* Seal the inner event bytes (ADR-0013 posture B). `class` stays a
+     * plaintext attribute — it is the dead-man / alert key the backend reads
+     * WITHOUT decrypting (§12.3). Fail-closed: drop on any seal error. */
+    if (inner_len > 256) {
+        ESP_LOGW(TAG, "w3pups-event inner too large (%u) — dropping", (unsigned)inner_len);
+        return;
+    }
+    uint8_t  sealed[256 + ARKIV_AEAD_OVERHEAD];
+    size_t   sealed_len = 0;
+    uint32_t epoch = 0;
+    int sr = arkiv_writer_payload_seal(ARKIV_AEAD_TYPE_EVENT, seq,
+                                       "w3pups-event", NULL,
+                                       inner, inner_len, sealed, sizeof(sealed),
+                                       &sealed_len, &epoch);
+    if (sr != 0) {
+        ESP_LOGW(TAG, "w3pups-event seal failed (rc=%d class=%s) — dropping (fail-closed)",
+                 sr, cls_str);
+        return;
+    }
+
+    arkiv_attr_t attrs[6] = {
         { .key = "type",      .value_str = "w3pups-event", .is_numeric = false },
         { .key = "device_id", .value_str = iccid,          .is_numeric = false },
         { .key = "class",     .value_str = cls_str,        .is_numeric = false },
-        { .key = "seq",       .value_num = (int64_t)seq, .is_numeric = true  },
+        { .key = "seq",       .value_num = (int64_t)seq,   .is_numeric = true  },
+        { .key = "epoch",     .value_num = (int64_t)epoch, .is_numeric = true  },
+        { .key = "scheme",    .value_num = 3,              .is_numeric = true  },
     };
 
-    /* Carry the raw inner bytes so the panel can surface specifics later
-     * (e.g. fault bitmaps) without changing the entity schema. Use the
-     * enqueue path: this is called from wups_rx (4 KB stack), see the
-     * P4 stack-overflow incident in arkiv_ack.c for the rationale. */
+    /* Sealed inner bytes. Use the enqueue path: this is called from wups_rx
+     * (4 KB stack), see the P4 stack-overflow incident in arkiv_ack.c. */
     bool ok = arkiv_writer_enqueue_create_entity(
-        "application/octet-stream", inner, inner_len,
+        "application/octet-stream", sealed, sealed_len,
         60 * 60,  /* 1 h TTL — events are sticky; ample headroom */
         attrs, sizeof(attrs) / sizeof(attrs[0]));
     if (!ok) {
