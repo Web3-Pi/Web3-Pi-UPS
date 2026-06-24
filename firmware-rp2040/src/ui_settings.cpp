@@ -10,7 +10,7 @@ static constexpr uint8_t BUZZER_PIN = 15;
 
 /* SSD1306 contrast per brightness level. Level 0 stays usable (not blanked);
  * level 3 is the panel's max. */
-static const uint8_t kContrast[UI_BRIGHTNESS_LEVELS] = { 16, 80, 160, 255 };
+static const uint8_t kContrast[UI_BRIGHTNESS_LEVELS] = { 5, 10, 15, 32, 64, 128 };
 
 /* Persisted blob. `magic`+`version` guard against reading uninitialised or
  * stale-layout flash. Sound defaults ON, brightness defaults to brightest. */
@@ -76,6 +76,17 @@ bool ui_settings_sound_enabled(void) {
 
 void ui_settings_set_sound_enabled(bool enabled) {
   s.sound = enabled ? 1 : 0;
+}
+
+void ui_settings_reset_defaults(void) {
+  /* Same values as the static initializer / first-boot seed: brightest,
+   * sound on. Persist immediately so the defaults survive the reboot. */
+  s.magic      = UI_SETTINGS_MAGIC;
+  s.version    = UI_SETTINGS_VERSION;
+  s.brightness = UI_BRIGHTNESS_DEFAULT;
+  s.sound      = 1;
+  s.reserved   = 0;
+  ui_settings_commit();
 }
 
 void ui_settings_beep(uint16_t freq_hz, uint16_t dur_ms) {

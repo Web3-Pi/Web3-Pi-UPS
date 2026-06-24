@@ -1184,6 +1184,16 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     return;
   }
 
+  // ui.local_reset → the ESP32 is doing a device factory reset and wants the
+  // RP2040-local OLED settings wiped to defaults too (brightest, sound on),
+  // so the unit comes back fully "as-new". No payload.
+  if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_LOCAL_RESET) {
+    ui_settings_reset_defaults();
+    ui_settings_apply_brightness(oled);   // push the restored brightness now
+    ui_settings_beep(1500, 40);           // short confirm (sound now default-on)
+    return;
+  }
+
   // system.ping → respond with uptime + fw_version.
   if (f.cls == WUPS_CLASS_SYSTEM && f.op == WUPS_OP_SYS_PING &&
       (f.flags & WUPS_FLAG_REQ)) {

@@ -22,8 +22,8 @@
 /* Brightness is a small set of discrete levels (a 2-button menu can only
  * cycle, not slide). Level index 0..UI_BRIGHTNESS_LEVELS-1 maps to an
  * SSD1306 contrast value in ui_settings.cpp. Default = brightest. */
-#define UI_BRIGHTNESS_LEVELS  4
-#define UI_BRIGHTNESS_DEFAULT  (UI_BRIGHTNESS_LEVELS - 1)
+#define UI_BRIGHTNESS_LEVELS  6
+#define UI_BRIGHTNESS_DEFAULT  (UI_BRIGHTNESS_LEVELS - 3)
 
 /* Load settings from flash (or seed defaults on first boot / bad magic).
  * Call once in setup() before the first beep and before applying brightness. */
@@ -42,6 +42,11 @@ void    ui_settings_apply_brightness(Adafruit_SSD1306& oled);
 
 bool ui_settings_sound_enabled(void);
 void ui_settings_set_sound_enabled(bool enabled);
+
+/* Restore brightness + sound to factory defaults and persist. Triggered by
+ * the ESP32's WUPS_OP_UI_LOCAL_RESET as part of a device factory reset, so a
+ * reset unit comes back fully "as-new" (brightest, sound on). */
+void ui_settings_reset_defaults(void);
 
 /* Buzzer helper that honours ui_settings_sound_enabled(). All firmware
  * beeps go through this — see the header comment. No-op when muted. */

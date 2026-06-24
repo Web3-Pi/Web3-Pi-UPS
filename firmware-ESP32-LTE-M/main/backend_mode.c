@@ -310,7 +310,22 @@ esp_err_t backend_mode_request_switch(wups_backend_mode_t new_mode)
 
 void backend_mode_factory_reset(void)
 {
-    ESP_LOGW(TAG, "factory reset — erasing writable nvs partition + rebooting");
+    ESP_LOGW(TAG, "factory reset — regen device wallet + erasing writable nvs partition + rebooting");
+
+    /* Roll the device's Arkiv wallet too. ak_dev_priv lives in the `prov`
+     * partition, which nvs_flash_erase() below does NOT touch — so without
+     * this the device wallet would survive a factory reset and only the
+     * standalone "Regen Wallet" item could change it. Rolling it here makes
+     * factory reset a complete return to "as-new": no on-chain link to the
+     * prior owner's (possibly funded / used) wallet. The fresh key lands in
+     * `prov` and is picked up on the next boot, which starts UNCLAIMED. The
+     * wallet is a disposable gas-payer (the owner funds it at claim time), so
+     * regenerating it costs nothing. Non-fatal on failure — we still wipe. */
+    esp_err_t rerr = cmdauth_arkiv_regenerate_wallet();
+    if (rerr != ESP_OK) {
+        ESP_LOGE(TAG, "factory reset: device-wallet regen failed: %s — "
+                      "wiping nvs anyway", esp_err_to_name(rerr));
+    }
 
     /* Erase the entire writable NVS partition. This blows away:
      *   - w3mode/cur_mode + prev_mode (this module)

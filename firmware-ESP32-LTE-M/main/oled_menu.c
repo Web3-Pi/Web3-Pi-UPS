@@ -362,14 +362,21 @@ static bool activate_current(void)
             } else {
                 ESP_LOGW(TAG, "menu → factory reset confirmed");
                 push_transition_screen("FACTORY\nRESET\nPlease\nwait...");
-                backend_mode_factory_reset();  /* reboots */
+                /* Drop the RP2040-local settings (brightness/sound) back to
+                 * defaults too, so the reset is a complete "as-new". Sent
+                 * before the ESP32 reboots; harmless no-op on an un-updated
+                 * RP2040 (unknown op is ignored). */
+                wups_link_send(WUPS_ADDR_RP2040, WUPS_CLASS_UI,
+                               WUPS_OP_UI_LOCAL_RESET, 0, NULL, 0);
+                vTaskDelay(pdMS_TO_TICKS(80));  /* let the frame flush over UART */
+                backend_mode_factory_reset();  /* regens wallet, wipes nvs, reboots */
             }
             return false;
         case SCR_REGEN_ARKIV:
             if (S.cursor == 0) {
-                /* Back → Arkiv wallet submenu, land on Regen */
+                /* Back → Arkiv wallet submenu, land on Regen (item 2) */
                 S.screen = SCR_ARKIV_WALLET;
-                S.cursor = 1;
+                S.cursor = 2;
                 push_screen();
             } else {
                 ESP_LOGW(TAG, "menu → regenerate Arkiv wallet confirmed");

@@ -163,6 +163,11 @@ typedef enum {
        the sole authority and the in-board link stays the trust boundary. */
     WUPS_OP_UI_TRUST_PROMPT   = 0x05,  /* ESP32→RP2040 REQ  */
     WUPS_OP_UI_TRUST_RESULT   = 0x06,  /* RP2040→ESP32 RESP */
+    /* ESP32→RP2040 — reset RP2040-local OLED settings (brightness/sound)
+       back to factory defaults. Sent as part of a device factory reset so
+       the unit returns fully "as-new". No payload. An RP2040 without this
+       handler simply ignores the unknown op (forward-safe). */
+    WUPS_OP_UI_LOCAL_RESET    = 0x07,  /* ESP32→RP2040 REQ  */
 } wups_op_ui_t;
 
 /* ---- Capability bitmap (used in system.hello) ---------------------------- */
