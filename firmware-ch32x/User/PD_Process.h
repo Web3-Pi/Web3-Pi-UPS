@@ -19,7 +19,16 @@
 #endif
 #define LowpowerON 1
 #define LowpowerOff 0
-#define Lowpower LowpowerON
+/* Web3 Pi UPS v3: low-power is OFF by design. This is an always-on UPS
+ * output controller — it must keep running the charger watchdog, telemetry
+ * and the source PD FSM at all times. The upstream WCH sample left this at
+ * LowpowerON, which made STA_DISCONNECT call PWR_EnterSTANDBYMode() on every
+ * sink unplug: the MCU went to STANDBY *before* PD_PHY_Reset(), so the
+ * TPS55289 was never told to drop the negotiated rail (9V/15V stayed live on
+ * an open USB-C port) and the next CC wake came back as a full reset. Forcing
+ * LowpowerOff removes that standby path entirely (matches CLAUDE.md, which
+ * already documents low-power as disabled for this design). */
+#define Lowpower LowpowerOff
 
 #define GPIOWake_up 1
 #define USBPDWake_up 0

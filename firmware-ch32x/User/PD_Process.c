@@ -38,6 +38,12 @@
  * + PB0 (PDS_EN) — called from PD_Det_Proc when a sink connects so
  * vSafe5V is on the bus before SRC_CAP advertise. */
 extern void VBUS_set_5V(void);
+/* VBUS_disable() drops VBUS_OUT to vSafe0V (PA7 low + TPS55289 output off)
+ * and clears the cached setpoint so the 2 s TPS re-apply watchdog in main.c
+ * stops driving the rail. Called from STA_DISCONNECT so a sink unplug returns
+ * the output to a safe, de-energized state instead of leaving the last
+ * negotiated 9V/15V live on an open port. */
+extern void VBUS_disable(void);
 
 void USBPD_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 
@@ -710,6 +716,16 @@ void PD_Main_Proc( )
     {
         case STA_DISCONNECT:
             printf("Disconnect\r\n");
+            /* Sink detached (CC open for >=5 detect ticks). Return VBUS_OUT
+             * to vSafe0V *before* anything else: clears the TPS55289 output
+             * and the cached 9V/15V setpoint so the main-loop 2 s watchdog no
+             * longer re-applies the stale contract and pins the rail high.
+             * Leaving voltage on an unattached USB-C port is both a Type-C
+             * violation and a real hazard with a power-source sink (a
+             * powerbank back-feeding into our still-driven 15V rail was
+             * resetting the whole unit). A fresh attach re-arms 5V via
+             * VBUS_set_5V() in PD_Det_Proc, so dropping to 0V here is safe. */
+            VBUS_disable();
 #if(Lowpower==LowpowerON)
 #if(Wake_up_mode==USBPDWake_up)
             RCC_APB1PeriphClockCmd(RCC_APB1Periph_PWR, ENABLE);
