@@ -296,6 +296,10 @@ static uint32_t menu_pending_deadline_ms = 0;
 // section swallows any still-held press until release, so the button that
 // selected "Back"/exit doesn't leak into dashboard nav (phantom screen + beep).
 static bool s_btn_release_guard = false;
+// Set while the ESP32 menu was entered from the RP2040 local menu (via
+// "Network"); its "Back" (set_screen 0) then returns one level up to the local
+// menu instead of dropping all the way to the Home dashboard.
+static bool s_esp32_menu_from_local = false;
 // Generous so a BUSY-but-present ESP32 (mid TLS / Arkiv telemetry submit) isn't
 // falsely declared "No modem". A genuinely absent/wedged M.2 just waits this
 // long before the notice — a better trade-off than spurious "No modem" flashes.
@@ -1122,6 +1126,18 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     wups_ui_set_screen_v1_t s;
     memcpy(&s, f.payload, sizeof(s));
     if (s.version == 1 && s.screen < SCREEN_COUNT) {
+      // If the ESP32 menu was reached from the RP2040 local menu (via
+      // "Network"), its "Back" (screen 0) backs up one level to that local
+      // menu rather than dropping to Home. "Debug" (screen != 0) still jumps
+      // to the requested dashboard screen. The flag is one-shot: it only
+      // governs the action that closes the ESP32 menu.
+      bool from_local = s_esp32_menu_from_local;
+      s_esp32_menu_from_local = false;
+      if (from_local && s.screen == 0) {
+        trust_ui_force_close();   // relinquish the OLED from the ESP32 side
+        local_menu_open();        // re-enter the parent menu (syncs held btn)
+        return;
+      }
       currentScreen = s.screen;
       lastInteractionTime = millis();
       // The system menu was just closed by the ESP32 — make sure the
@@ -1409,6 +1425,7 @@ void local_menu_host_open_esp32(void) {
             WUPS_FLAG_EVENT, &e, sizeof(e));
   ui_settings_beep(1200, 80);
   menu_pending_deadline_ms = millis() + MENU_RESPONSE_TIMEOUT_MS;
+  s_esp32_menu_from_local = true;   // ESP32 "Back" returns here, not to Home
   local_menu_close();  // release the OLED; trust_ui takes over if ESP32 answers
 }
 
@@ -1587,6 +1604,11 @@ void loop() {
     }
     s_btn_release_guard = false;
   }
+
+  // We're back on the dashboard with no hand-off pending: the ESP32 menu (if
+  // any) closed by timeout, not its "Back". Drop the back-to-local intent so a
+  // later unrelated set_screen(0) isn't misread as a menu back-out.
+  if (menu_pending_deadline_ms == 0) s_esp32_menu_from_local = false;
 
   // ADR-0012 — system-menu activation gesture: hold LEFT for
   // MENU_ACTIVATION_HOLD_MS on the home screen. One-button gesture
