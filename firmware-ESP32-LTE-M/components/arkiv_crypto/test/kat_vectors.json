@@ -1,0 +1,50 @@
+{
+  "dev_priv": "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318",
+  "owner_priv": "2bdd5d8b3e1a2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f607182930405",
+  "dev_pub": "4e3b81af9c2234cad09d679ce6035ed1392347ce64ce405f5dcd36228a25de6e47fd35c4215d1edf53e6f83de344615ce719bdb0fd878f6ed76f06dd277956de",
+  "owner_pub": "5083c73d0dad1c9b044b032928b31cc88d796a99b57aa28adf1447b436d0cdce151e2d25f8e358a76a21f5b5fd9b675f9ca4cce6e32669645cc72fa67f914154",
+  "shared_x": "1bc15d3634946d7e2e39a566efbad261804d27a5f7404504881abbb9426a672d",
+  "noble": "MATCH (@noble/curves == OpenSSL)",
+  "hkdf": {
+    "salt": "0x9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c|4e3b81af9c2234cad09d679ce6035ed1392347ce64ce405f5dcd36228a25de6e47fd35c4215d1edf53e6f83de344615ce719bdb0fd878f6ed76f06dd277956de",
+    "info": "w3pups-arkiv-telemetry|epoch=7",
+    "ikm": "1bc15d3634946d7e2e39a566efbad261804d27a5f7404504881abbb9426a672d",
+    "okm": "c64b7af96ed15ab6efc4fecf423642be3d5cf604614e0de9ff583b0eda7e182a"
+  },
+  "gcm": {
+    "key": "c64b7af96ed15ab6efc4fecf423642be3d5cf604614e0de9ff583b0eda7e182a",
+    "nonce": "03014000000000000000002a",
+    "aad": "747970653d7733707570732d74656c656d657472797c65706f63683d377c6465763d38393838323238303636363134313839393230",
+    "pt": "5765623350695550532d47434d2d4b41540001ff7f",
+    "ct": "1889c2e20789a07d92a8aac34d6153cda103bf8998",
+    "tag": "f8dece2280fe2a5c5e68e29ba113c73d"
+  },
+  "seal": {
+    "owner_addr": "0x9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c",
+    "device_pubkey": "4e3b81af9c2234cad09d679ce6035ed1392347ce64ce405f5dcd36228a25de6e47fd35c4215d1edf53e6f83de344615ce719bdb0fd878f6ed76f06dd277956de",
+    "shared_x": "1bc15d3634946d7e2e39a566efbad261804d27a5f7404504881abbb9426a672d",
+    "telemetry": {
+      "typeTag": 1,
+      "purpose": "telemetry",
+      "epoch": 7,
+      "seq": 1234,
+      "device_id": "8988228066614189920",
+      "entity_type": "w3pups-telemetry",
+      "kdir": "c64b7af96ed15ab6efc4fecf423642be3d5cf604614e0de9ff583b0eda7e182a",
+      "pt": "544c4d3a766275733d31322e33342c736f633d38372c666c6167733d307831",
+      "body": "0301000000070000000004d24fb9ae3b451daf80bb989e1b21a8ca215df62bd778904c5003cf9d92cd3aeaffff9e55b904adbfcde64bc629d91e49"
+    },
+    "ack": {
+      "typeTag": 2,
+      "purpose": "ack",
+      "epoch": 7,
+      "seq": 1235,
+      "device_id": "8988228066614189920",
+      "entity_type": "w3pups-ack",
+      "command_id": "550e8400-e29b-41d4-a716-446655440000",
+      "kdir": "06ec92444f7c21bac443c32124188ed1e75bbbaab1031f33dbce36ee81e853f6",
+      "pt": "01002aff",
+      "body": "0302000000070000000004d3a8635a3770b7709149516548eb46b6679ac36cd7"
+    }
+  }
+}
