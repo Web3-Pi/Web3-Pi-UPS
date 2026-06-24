@@ -7,6 +7,7 @@
 #include "wups_proto.h"
 #include "ui_settings.h"
 #include <string.h>
+#include <qrcode.h>   /* ricmoo/QRCode — fund-address QR page */
 
 /* 64x32 OLED, default GFX font: 6 px advance, 8 px tall. */
 static constexpr uint8_t  SCR_COLS   = 10;   /* 64 / 6 (1 px slack)     */
@@ -321,6 +322,89 @@ static void draw_menu(Adafruit_SSD1306& oled)
     oled.display();
 }
 
+/* Hand-drawn lowercase 'c', open on the right. The default 5x7 font draws 'c'
+ * almost closed, so on this 64x32 OLED it reads as 'o' — the one genuinely
+ * confusable glyph in a hex string. Cell is 6px advance; draw at the x-height.
+ *   .###.
+ *   #....
+ *   #....
+ *   #....
+ *   .###.   */
+static void draw_glyph_c(Adafruit_SSD1306& oled, int x, int y)
+{
+    oled.drawLine(x + 1, y + 2, x + 3, y + 2, SSD1306_WHITE); /* top    */
+    oled.drawLine(x + 0, y + 3, x + 0, y + 5, SSD1306_WHITE); /* left   */
+    oled.drawLine(x + 1, y + 6, x + 3, y + 6, SSD1306_WHITE); /* bottom */
+}
+
+/* QR of the full "0x"+address, drawn dark-on-light (the OLED's lit pixels are
+ * the light field, unlit pixels the dark modules) so a phone scans a standard
+ * QR. v3 = 29x29 modules; "0x"+40hex (42 B) fits byte mode at ECC LOW. Centered
+ * on a fully-lit panel for the largest quiet zone the 64x32 allows. */
+static void draw_wallet_qr(Adafruit_SSD1306& oled, const char* addr)
+{
+    static constexpr uint8_t QR_VER   = 3;                          /* 29x29 */
+    static constexpr int     QR_DIM   = 4 * QR_VER + 17;
+    static constexpr int     QR_BUFSZ = (QR_DIM * QR_DIM + 7) / 8;  /* = 106 */
+    QRCode qr;
+    static uint8_t qrbuf[QR_BUFSZ];
+    qrcode_initText(&qr, qrbuf, QR_VER, ECC_LOW, addr);
+    const int n  = qr.size;
+    const int ox = (oled.width()  - n) / 2;
+    const int oy = (oled.height() - n) / 2;
+    oled.fillScreen(SSD1306_WHITE);
+    for (int yy = 0; yy < n; ++yy)
+        for (int xx = 0; xx < n; ++xx)
+            if (qrcode_getModule(&qr, (uint8_t)xx, (uint8_t)yy))
+                oled.drawPixel(ox + xx, oy + yy, SSD1306_BLACK);
+    oled.display();
+}
+
+/* Device Arkiv fund-address screen (mode=3). `S.text` is the bare "0x"+40hex
+ * address. Alternates every ~4 s between a legible hex page (custom open-right
+ * 'c' so it can't be misread as 'o'/'0') and a QR of the full address — scan
+ * instead of transcribe. Non-address text falls back to plain rendering. */
+static void draw_wallet(Adafruit_SSD1306& oled)
+{
+    const char* s = S.text;
+    const bool is_addr = (s[0] == '0' && (s[1] == 'x' || s[1] == 'X') &&
+                          strlen(s) >= 42);
+    if (is_addr && ((millis() / 4000u) % 2u) == 1u) {
+        draw_wallet_qr(oled, s);
+        return;
+    }
+
+    oled.clearDisplay();
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+
+    if (!is_addr) {
+        uint8_t row = 0, col = 0;
+        for (const char* p = s; *p && row < SCR_ROWS; ++p) {
+            if (*p == '\n') { row++; col = 0; continue; }
+            if (col >= SCR_COLS) continue;
+            oled.setCursor(col * 6, row * 8);
+            oled.write((uint8_t)*p);
+            col++;
+        }
+        oled.display();
+        return;
+    }
+
+    const char* hex = s + 2;   /* 40 hex chars */
+    for (uint8_t i = 0; i < 40; ++i) {
+        const uint8_t col = i % 10, row = i / 10;
+        const int x = col * 6, y = row * 8;
+        if (hex[i] == 'c') {
+            draw_glyph_c(oled, x, y);   /* unambiguous open-right 'c' */
+        } else {
+            oled.setCursor(x, y);
+            oled.write((uint8_t)hex[i]);
+        }
+    }
+    oled.display();
+}
+
 /* ADR-0012 — broadcast a ui.button_event so the ESP32 menu state
  * machine can react. button: 0=left, 1=right; action: 0=press, 1=release,
  * 2=long. Sent BROADCAST so the (otherwise dumb) protocol stays
@@ -351,7 +435,10 @@ void trust_ui_tick(Adafruit_SSD1306& oled, bool btnLeftDown,
      * Exit was originally hold-both-3s, but the user reported the
      * two-button press is awkward — hold-LEFT (single button) is the
      * primary gesture now. */
-    if (S.mode == 2) {
+    /* Menu (mode=2) and the wallet fund-address screen (mode=3) share the same
+     * navigation: the ESP32 owns the state, we just render + forward presses.
+     * Only the renderer differs (draw_menu vs draw_wallet). */
+    if (S.mode == 2 || S.mode == 3) {
         if (now - S.t0_ms > CONFIRM_TIMEOUT_MS) {
             send_result(RES_TIMEOUT);
             S.active = false;
@@ -365,7 +452,7 @@ void trust_ui_tick(Adafruit_SSD1306& oled, bool btnLeftDown,
             S.menu_prev_left       = btnLeftDown;
             S.menu_prev_right      = btnRightDown;
             S.menu_btn_initialized = true;
-            draw_menu(oled);
+            if (S.mode == 3) draw_wallet(oled); else draw_menu(oled);
             return;
         }
 
@@ -374,12 +461,15 @@ void trust_ui_tick(Adafruit_SSD1306& oled, bool btnLeftDown,
          * item, a normal short-press selection. We only emit the press
          * edge (action=0); release (action=1) would be redundant and
          * the menu state machine only acts on action=0 anyway. */
-        if (btnLeftDown && !S.menu_prev_left)   send_button_event(0, 0);
-        if (btnRightDown && !S.menu_prev_right) send_button_event(1, 0);
+        /* Click feedback — the local menu beeps on press; the ESP32-driven
+         * menu (entered via "Network") forwards presses through here, so beep
+         * here too or those screens feel dead. ui_settings_beep honours mute. */
+        if (btnLeftDown && !S.menu_prev_left)   { ui_settings_beep(1000, 20); send_button_event(0, 0); }
+        if (btnRightDown && !S.menu_prev_right) { ui_settings_beep(1000, 20); send_button_event(1, 0); }
         S.menu_prev_left  = btnLeftDown;
         S.menu_prev_right = btnRightDown;
 
-        draw_menu(oled);
+        if (S.mode == 3) draw_wallet(oled); else draw_menu(oled);
         return;
     }
 

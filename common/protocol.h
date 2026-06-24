@@ -433,7 +433,7 @@ typedef struct WUPS_PACKED {
  *                            ui.trust_prompt mode=2 with the new text. */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */
-    uint8_t  mode;           /* 0=fingerprint, 1=claim-code, 2=menu (ADR-0012) */
+    uint8_t  mode;           /* 0=fingerprint, 1=claim-code, 2=menu, 3=wallet  */
     uint8_t  confirm_secs;   /* both-button hold to confirm/exit (e.g. 5)  */
     uint8_t  text_len;       /* bytes of ASCII following                   */
     uint32_t nonce;          /* echoed in wups_ui_trust_result_v1_t        */
@@ -445,6 +445,10 @@ typedef struct WUPS_PACKED {
 #define WUPS_TRUST_PROMPT_MODE_FINGERPRINT 0u
 #define WUPS_TRUST_PROMPT_MODE_CLAIM_CODE  1u
 #define WUPS_TRUST_PROMPT_MODE_MENU        2u
+/* Device Arkiv fund-address screen: text is the bare "0x"+40hex address; the
+ * RP2040 renders a legible hex page (slashed zeros) alternating with a QR code.
+ * Navigation behaves like MENU (button presses forwarded as ui.button_event). */
+#define WUPS_TRUST_PROMPT_MODE_WALLET      3u
 
 /* trust_result.result codes (extended for mode=2 menu exits). */
 #define WUPS_TRUST_RESULT_CONFIRMED 0u  /* mode 0 confirmed / mode 2 exit  */

@@ -52,6 +52,8 @@ typedef enum {
     SCR_MODE,             /* MQTT / ARKIV / HTTP */
     SCR_FACTORY_RESET,    /* confirm screen      */
     SCR_REGEN_ARKIV,      /* confirm screen — re-roll device Arkiv wallet */
+    SCR_ARKIV_WALLET,     /* Arkiv wallet submenu: Address / Regen / Back    */
+    SCR_ARKIV_ADDR,       /* show the device's Arkiv fund address (read-only)*/
     SCR_HTTP_KEY,         /* show HTTP-mode secret + Back/New                */
     SCR_HTTP_REGEN,       /* confirm screen — re-roll HTTP-mode secret       */
 } menu_screen_t;
@@ -72,6 +74,8 @@ static uint8_t screen_item_count(menu_screen_t s)
         case SCR_MODE:          return 4;  /* MQTT / ARKIV / HTTP / Back  */
         case SCR_FACTORY_RESET: return 2;  /* Back / Wipe                 */
         case SCR_REGEN_ARKIV:   return 2;  /* Back / Regen                */
+        case SCR_ARKIV_WALLET:  return 3;  /* Address / Regen / Back      */
+        case SCR_ARKIV_ADDR:    return 1;  /* read-only — any press = Back */
         case SCR_HTTP_KEY:      return 2;  /* Back / New key              */
         case SCR_HTTP_REGEN:    return 2;  /* Back / Regen                */
         default:                return 0;
@@ -181,6 +185,42 @@ static void render_screen(char *out, size_t cap)
                      S.cursor == 0 ? '>' : ' ',
                      S.cursor == 1 ? '>' : ' ');
             break;
+        case SCR_ARKIV_WALLET:
+            /* Submenu: view the fund address (read-only) or re-roll the key. */
+            snprintf(out, cap,
+                     "%cAddress\n"
+                     "%cRegen\n"
+                     "%cBack",
+                     S.cursor == 0 ? '>' : ' ',
+                     S.cursor == 1 ? '>' : ' ',
+                     S.cursor == 2 ? '>' : ' ');
+            break;
+        case SCR_ARKIV_ADDR: {
+            /* The device's own Arkiv (Braga) wallet — the owner funds THIS with
+             * GLM so it can pay gas to publish telemetry. Shown on the OLED for
+             * the cold-start bootstrap (owner has the device physically; no
+             * backend / on-chain write needed first, §4.6). 20-byte EOA = 40 hex;
+             * at ~10 chars/line that's exactly 4 rows, so there is no room for a
+             * "0x"/label/Back — the owner prepends 0x, and any button returns
+             * (handled in oled_menu_on_button_event). */
+            if (!cmdauth_arkiv_ready()) {
+                snprintf(out, cap, "No Arkiv\nwallet yet");
+                break;
+            }
+            const uint8_t *a = cmdauth_arkiv_device_addr();
+            static const char H[] = "0123456789abcdef";
+            char hex[41];
+            for (int i = 0; i < 20; ++i) {
+                hex[2 * i]     = H[a[i] >> 4];
+                hex[2 * i + 1] = H[a[i] & 0x0F];
+            }
+            hex[40] = '\0';
+            /* Raw 0x-address. The RP2040 (MODE_WALLET) renders a legible hex
+             * page (slashed zeros) alternating with a QR built from this exact
+             * string — so no row-splitting here. */
+            snprintf(out, cap, "0x%s", hex);
+            break;
+        }
     }
 }
 
@@ -192,13 +232,14 @@ static void push_screen(void)
     if (!S.active) return;
     char text[200];
     render_screen(text, sizeof text);
-    /* `confirm_secs = EXIT_HOLD_SECS` tells the RP2040 the both-button
-     * hold length needed to exit (mode=2 menu reinterprets the existing
-     * countdown timer as the back/exit gesture). */
-    wups_link_trust_prompt(WUPS_TRUST_PROMPT_MODE_MENU,
-                           EXIT_HOLD_SECS,
-                           S.nonce,
-                           text);
+    /* The fund-address screen uses MODE_WALLET (RP2040 draws hex + QR); every
+     * other screen is a plain MODE_MENU list. Both forward button presses, so
+     * navigation (incl. "any press = Back" on the address page) works the same.
+     * `confirm_secs = EXIT_HOLD_SECS` is the both-button hold length to exit. */
+    const uint8_t mode = (S.screen == SCR_ARKIV_ADDR)
+                             ? WUPS_TRUST_PROMPT_MODE_WALLET
+                             : WUPS_TRUST_PROMPT_MODE_MENU;
+    wups_link_trust_prompt(mode, EXIT_HOLD_SECS, S.nonce, text);
     S.last_button_ms = (uint32_t)(esp_timer_get_time() / 1000);
 }
 
@@ -259,8 +300,8 @@ static bool activate_current(void)
                     S.cursor = 0;
                     push_screen();
                     break;
-                case 4:  /* Wallet → regen Arkiv confirm screen */
-                    S.screen = SCR_REGEN_ARKIV;
+                case 4:  /* Wallet → Arkiv wallet submenu (address / regen) */
+                    S.screen = SCR_ARKIV_WALLET;
                     S.cursor = 0;
                     push_screen();
                     break;
@@ -326,9 +367,9 @@ static bool activate_current(void)
             return false;
         case SCR_REGEN_ARKIV:
             if (S.cursor == 0) {
-                /* Back → root */
-                S.screen = SCR_ROOT;
-                S.cursor = 3;  /* land on "Wallet" so retry is easy */
+                /* Back → Arkiv wallet submenu, land on Regen */
+                S.screen = SCR_ARKIV_WALLET;
+                S.cursor = 1;
                 push_screen();
             } else {
                 ESP_LOGW(TAG, "menu → regenerate Arkiv wallet confirmed");
@@ -347,6 +388,31 @@ static bool activate_current(void)
                     push_screen();   /* back to the confirm screen */
                 }
             }
+            return false;
+        case SCR_ARKIV_WALLET:
+            switch (S.cursor) {
+                case 0:  /* Address → read-only fund-address screen */
+                    S.screen = SCR_ARKIV_ADDR;
+                    S.cursor = 0;
+                    push_screen();
+                    break;
+                case 1:  /* Regen → re-roll confirm screen */
+                    S.screen = SCR_REGEN_ARKIV;
+                    S.cursor = 0;
+                    push_screen();
+                    break;
+                case 2:  /* Back → root, land on Wallet */
+                    S.screen = SCR_ROOT;
+                    S.cursor = 4;
+                    push_screen();
+                    break;
+            }
+            return false;
+        case SCR_ARKIV_ADDR:
+            /* Read-only — any select returns to the wallet submenu. */
+            S.screen = SCR_ARKIV_WALLET;
+            S.cursor = 0;
+            push_screen();
             return false;
         case SCR_HTTP_KEY:
             if (S.cursor == 0) {
@@ -431,6 +497,15 @@ void oled_menu_on_button_event(uint8_t button, uint8_t action)
      * (release) is informational; action=2 (long) is reserved for the
      * RP2040's exit-gesture path (which arrives as trust_result). */
     if (action != 0u) return;
+
+    /* The read-only fund-address page has no on-screen Back (the 40-hex address
+     * fills all 4 rows) — either button returns to the wallet submenu. */
+    if (S.screen == SCR_ARKIV_ADDR) {
+        S.screen = SCR_ARKIV_WALLET;
+        S.cursor = 0;
+        push_screen();
+        return;
+    }
 
     const uint8_t n = screen_item_count(S.screen);
     if (n == 0) return;
