@@ -20,6 +20,9 @@
 
 #define TAG "arkiv_rpc"
 
+/* Single hex-nibble decode; defined with the other hex helpers below. */
+static int hexnib(char c);
+
 /* --- HTTP JSON-RPC ---------------------------------------------------- */
 
 typedef struct {
@@ -139,6 +142,49 @@ esp_err_t arkiv_eth_get_tx_count(const uint8_t addr[20], uint64_t *out_nonce)
     static char resp[256];
     if (rpc_post(body, resp, sizeof(resp)) != ESP_OK) return ESP_FAIL;
     return parse_result_uint(resp, out_nonce);
+}
+
+/* Parse a JSON-RPC `result` 0x-hex quantity into a uint64, failing closed on
+ * overflow (a value too large to be a small-GLM test balance). Distinct from
+ * parse_result_uint's strtoull, which silently saturates and would report a
+ * wrapped figure as a real balance. */
+static esp_err_t parse_result_wei(const char *resp, uint64_t *out)
+{
+    cJSON *root = cJSON_Parse(resp);
+    if (!root) return ESP_FAIL;
+    cJSON *r = cJSON_GetObjectItemCaseSensitive(root, "result");
+    esp_err_t rc = ESP_FAIL;
+    if (cJSON_IsString(r) && r->valuestring) {
+        const char *h = r->valuestring;
+        if (h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h += 2;
+        while (*h == '0') ++h;            /* skip leading zeros */
+        uint64_t v = 0;
+        rc = ESP_OK;
+        for (; *h; ++h) {
+            int nib = hexnib(*h);
+            if (nib < 0) { rc = ESP_FAIL; break; }
+            if (v > (UINT64_MAX >> 4)) { rc = ESP_ERR_INVALID_SIZE; break; }
+            v = (v << 4) | (uint64_t)nib;
+        }
+        if (rc == ESP_OK) *out = v;
+    }
+    cJSON_Delete(root);
+    return rc;
+}
+
+esp_err_t arkiv_eth_get_balance(const uint8_t addr[20], uint64_t *out_wei)
+{
+    if (!addr || !out_wei) return ESP_ERR_INVALID_ARG;
+    char addr_hex[43];
+    addr_to_hex(addr, addr_hex);
+    char body[160];
+    int n = snprintf(body, sizeof(body),
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getBalance\","
+        "\"params\":[\"%s\",\"latest\"]}", addr_hex);
+    if (n <= 0 || n >= (int)sizeof(body)) return ESP_FAIL;
+    static char resp[256];
+    if (rpc_post(body, resp, sizeof(resp)) != ESP_OK) return ESP_FAIL;
+    return parse_result_wei(resp, out_wei);
 }
 
 esp_err_t arkiv_eth_gas_price(uint64_t *out_wei)

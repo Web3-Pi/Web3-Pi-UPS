@@ -1,5 +1,6 @@
 #include "arkiv_tlm.h"
 #include "arkiv_writer.h"
+#include "arkiv_rpc.h"
 #include "cmdauth_arkiv.h"
 #include "identity.h"
 #include "wups_proto.h"
@@ -37,6 +38,15 @@ typedef struct {
 /* Three slots: POWER.STATUS, HOST.STATUS, NET.STATUS. */
 static slot_t s_slots[3];
 static SemaphoreHandle_t s_lock;
+
+/* Device-wallet balance cache (wei), refreshed from the arkiv_tlm task (6 KB
+ * stack, RPC-safe) every ARKIV_TLM_BALANCE_PERIOD successful telemetry submits.
+ * The OLED "Balance" screen reads this WITHOUT any RPC: a blocking eth_getBalance
+ * on the 4 KB wups_rx button-event task overflowed its stack and rebooted the
+ * device. */
+#define ARKIV_TLM_BALANCE_PERIOD 8u   /* ≈ every 8 × 30 s = 4 min */
+static uint64_t s_bal_wei;
+static bool     s_bal_valid;
 
 static void ensure_lock(void)
 {
@@ -192,6 +202,18 @@ static void tlm_task(void *arg)
             ESP_LOGI(TAG, "w3pups-telemetry submitted enc (seq=%llu epoch=%u, %u B%s)",
                      (unsigned long long)seq, (unsigned)epoch, (unsigned)sealed_len,
                      announce ? ", +dev_pub" : "");
+            /* Refresh the cached device-wallet balance for the OLED "Balance"
+             * screen — done HERE (6 KB stack, RPC-safe), never on the 4 KB
+             * wups_rx button task. First refresh on the first submit, then
+             * every ARKIV_TLM_BALANCE_PERIOD submits. */
+            if ((s_tlm_ok % ARKIV_TLM_BALANCE_PERIOD) == 1u) {
+                const uint8_t *da = cmdauth_arkiv_device_addr();
+                uint64_t bal = 0;
+                if (da && arkiv_eth_get_balance(da, &bal) == ESP_OK) {
+                    s_bal_wei   = bal;
+                    s_bal_valid = true;
+                }
+            }
         }
     }
 }
@@ -205,4 +227,11 @@ void arkiv_tlm_start(void)
     xTaskCreate(tlm_task, "arkiv_tlm", 6144, NULL, 4, NULL);
     ESP_LOGI(TAG, "Arkiv telemetry task started (period=%dms)",
              ARKIV_TLM_PERIOD_MS);
+}
+
+bool arkiv_tlm_cached_balance_wei(uint64_t *out_wei)
+{
+    if (!s_bal_valid) return false;
+    if (out_wei) *out_wei = s_bal_wei;
+    return true;
 }

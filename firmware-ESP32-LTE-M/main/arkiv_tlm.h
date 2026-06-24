@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,12 @@ void arkiv_tlm_observe_frame(const uint8_t *frame, uint16_t frame_len);
  * ARKIV_CLAIMED + the writer is ready + at least one cache slot is fresh.
  * Safe to call unconditionally at boot. */
 void arkiv_tlm_start(void);
+
+/* Latest device-wallet balance (wei) cached by the emit task. Returns false
+ * until the first successful refresh. Non-blocking, no RPC — the OLED "Balance"
+ * screen reads this instead of doing a heavy eth_getBalance on the small
+ * wups_rx button-event task (which overflowed its stack). */
+bool arkiv_tlm_cached_balance_wei(uint64_t *out_wei);
 
 #ifdef __cplusplus
 }

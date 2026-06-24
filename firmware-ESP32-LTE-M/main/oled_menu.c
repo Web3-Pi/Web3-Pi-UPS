@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 
 #include "../../common/protocol.h"
+#include "arkiv_tlm.h"
 #include "backend_mode.h"
 #include "cmdauth_arkiv.h"
 #include "esp_system.h"
@@ -52,8 +53,9 @@ typedef enum {
     SCR_MODE,             /* MQTT / ARKIV / HTTP */
     SCR_FACTORY_RESET,    /* confirm screen      */
     SCR_REGEN_ARKIV,      /* confirm screen — re-roll device Arkiv wallet */
-    SCR_ARKIV_WALLET,     /* Arkiv wallet submenu: Address / Regen / Back    */
+    SCR_ARKIV_WALLET,     /* Arkiv wallet submenu: Address/Balance/Regen/Back*/
     SCR_ARKIV_ADDR,       /* show the device's Arkiv fund address (read-only)*/
+    SCR_ARKIV_BALANCE,    /* show the device wallet GLM balance (read-only)  */
     SCR_HTTP_KEY,         /* show HTTP-mode secret + Back/New                */
     SCR_HTTP_REGEN,       /* confirm screen — re-roll HTTP-mode secret       */
 } menu_screen_t;
@@ -66,6 +68,12 @@ static struct {
     uint32_t      last_button_ms;
 } S;
 
+/* Result text for SCR_ARKIV_BALANCE. The balance query is network/blocking,
+ * so it runs once in activate_current() and stashes the formatted line here;
+ * render_screen() then just shows it (the screen has no cursor navigation —
+ * any press returns). Two short lines fit the 64x32 OLED, ≤ 10 chars each. */
+static char s_balance_text[40];
+
 /* Items per screen. The 64x32 OLED fits 4 rows at default font size. */
 static uint8_t screen_item_count(menu_screen_t s)
 {
@@ -74,8 +82,9 @@ static uint8_t screen_item_count(menu_screen_t s)
         case SCR_MODE:          return 4;  /* MQTT / ARKIV / HTTP / Back  */
         case SCR_FACTORY_RESET: return 2;  /* Back / Wipe                 */
         case SCR_REGEN_ARKIV:   return 2;  /* Back / Regen                */
-        case SCR_ARKIV_WALLET:  return 3;  /* Address / Regen / Back      */
+        case SCR_ARKIV_WALLET:  return 4;  /* Address/Balance/Regen/Back  */
         case SCR_ARKIV_ADDR:    return 1;  /* read-only — any press = Back */
+        case SCR_ARKIV_BALANCE: return 1;  /* read-only — any press = Back */
         case SCR_HTTP_KEY:      return 2;  /* Back / New key              */
         case SCR_HTTP_REGEN:    return 2;  /* Back / Regen                */
         default:                return 0;
@@ -186,14 +195,17 @@ static void render_screen(char *out, size_t cap)
                      S.cursor == 1 ? '>' : ' ');
             break;
         case SCR_ARKIV_WALLET:
-            /* Submenu: view the fund address (read-only) or re-roll the key. */
+            /* Submenu: view the fund address (read-only), check the on-chain
+             * GLM balance, or re-roll the key. 4 items = exactly 4 OLED rows. */
             snprintf(out, cap,
                      "%cAddress\n"
+                     "%cBalance\n"
                      "%cRegen\n"
                      "%cBack",
                      S.cursor == 0 ? '>' : ' ',
                      S.cursor == 1 ? '>' : ' ',
-                     S.cursor == 2 ? '>' : ' ');
+                     S.cursor == 2 ? '>' : ' ',
+                     S.cursor == 3 ? '>' : ' ');
             break;
         case SCR_ARKIV_ADDR: {
             /* The device's own Arkiv (Braga) wallet — the owner funds THIS with
@@ -221,6 +233,12 @@ static void render_screen(char *out, size_t cap)
             snprintf(out, cap, "0x%s", hex);
             break;
         }
+        case SCR_ARKIV_BALANCE:
+            /* Read-only result of the eth_getBalance query run in activate
+             * (or the re-entry from the address page). s_balance_text already
+             * holds the two formatted lines ("BALANCE\n<n> GLM" / an error). */
+            snprintf(out, cap, "%s", s_balance_text);
+            break;
     }
 }
 
@@ -268,6 +286,37 @@ static void push_transition_screen(const char *text)
                            S.nonce,
                            text);
     vTaskDelay(pdMS_TO_TICKS(200));
+}
+
+/* Format the device wallet's cached balance into s_balance_text for
+ * SCR_ARKIV_BALANCE. Non-blocking, no RPC — reads the value the arkiv_tlm task
+ * refreshes (see arkiv_tlm_cached_balance_wei). Wei → GLM (18 decimals), 6
+ * fractional digits. Laid out on three lines — "BALANCE" / "<n>.<6>" / "GLM" —
+ * because "<n>.<6> GLM" (12 chars) overflows the 64x32 OLED's ~10-char line. */
+static void fetch_balance_text(void)
+{
+    if (!cmdauth_arkiv_ready()) {
+        snprintf(s_balance_text, sizeof s_balance_text, "No Arkiv\nwallet yet");
+        return;
+    }
+    /* Read the cached balance refreshed by the arkiv_tlm task (6 KB stack,
+     * RPC-safe). We must NOT do eth_getBalance here: this runs on the 4 KB
+     * wups_rx button task and a blocking HTTP+TLS RPC overflows its stack
+     * (the device rebooted). The cache populates after the first telemetry
+     * submit (~30 s) and refreshes every few minutes. */
+    uint64_t wei = 0;
+    if (!arkiv_tlm_cached_balance_wei(&wei)) {
+        snprintf(s_balance_text, sizeof s_balance_text, "BALANCE\nwait tlm");
+        return;
+    }
+    /* 1 GLM = 1e18 wei. Split into integer + 6-decimal fraction without
+     * floating point: micro-GLM = wei / 1e12 keeps 6 decimals exactly. */
+    const uint64_t WEI_PER_GLM   = 1000000000000000000ULL; /* 1e18 */
+    const uint64_t WEI_PER_MICRO = 1000000000000ULL;       /* 1e12 */
+    uint64_t whole = wei / WEI_PER_GLM;
+    uint64_t micro = (wei % WEI_PER_GLM) / WEI_PER_MICRO;   /* 0..999999 */
+    snprintf(s_balance_text, sizeof s_balance_text,
+             "BALANCE\n%" PRIu64 ".%06" PRIu64 "\nGLM", whole, micro);
 }
 
 /* Perform the action bound to the highlighted item. Returns true if
@@ -403,12 +452,22 @@ static bool activate_current(void)
                     S.cursor = 0;
                     push_screen();
                     break;
-                case 1:  /* Regen → re-roll confirm screen */
+                case 1:  /* Balance → query on-chain GLM, then show result.
+                          * The query is blocking (~RPC round-trip) so flash a
+                          * "checking…" screen first, exactly like the mode
+                          * switch does for its reboot wait. */
+                    push_transition_screen("BALANCE\nchecking\nplease\nwait...");
+                    fetch_balance_text();
+                    S.screen = SCR_ARKIV_BALANCE;
+                    S.cursor = 0;
+                    push_screen();
+                    break;
+                case 2:  /* Regen → re-roll confirm screen */
                     S.screen = SCR_REGEN_ARKIV;
                     S.cursor = 0;
                     push_screen();
                     break;
-                case 2:  /* Back → root, land on Wallet */
+                case 3:  /* Back → root, land on Wallet */
                     S.screen = SCR_ROOT;
                     S.cursor = 4;
                     push_screen();
@@ -419,6 +478,13 @@ static bool activate_current(void)
             /* Read-only — any select returns to the wallet submenu. */
             S.screen = SCR_ARKIV_WALLET;
             S.cursor = 0;
+            push_screen();
+            return false;
+        case SCR_ARKIV_BALANCE:
+            /* Read-only — any select returns to the wallet submenu, landing
+             * on Balance (item 1) so a re-check is one press away. */
+            S.screen = SCR_ARKIV_WALLET;
+            S.cursor = 1;
             push_screen();
             return false;
         case SCR_HTTP_KEY:
@@ -510,6 +576,16 @@ void oled_menu_on_button_event(uint8_t button, uint8_t action)
     if (S.screen == SCR_ARKIV_ADDR) {
         S.screen = SCR_ARKIV_WALLET;
         S.cursor = 0;
+        push_screen();
+        return;
+    }
+
+    /* The read-only balance result has no on-screen Back either — either
+     * button returns to the wallet submenu, landing on Balance (item 1) so a
+     * re-check is one press away (matches the activate-path behaviour). */
+    if (S.screen == SCR_ARKIV_BALANCE) {
+        S.screen = SCR_ARKIV_WALLET;
+        S.cursor = 1;
         push_screen();
         return;
     }

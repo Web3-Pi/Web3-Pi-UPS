@@ -19,6 +19,14 @@ esp_err_t arkiv_eth_block_number(uint64_t *out_block);
  * "pending" so we don't collide with our own in-flight submissions. */
 esp_err_t arkiv_eth_get_tx_count(const uint8_t addr[20], uint64_t *out_nonce);
 
+/* eth_getBalance(addr, "latest") → balance of `addr` (20 B) in wei. The node
+ * returns a 0x-hex quantity; this is the Braga native token (GLM, 18 decimals).
+ * Balances under a few GLM fit comfortably in uint64 (max ~18.44 GLM in wei);
+ * a value that overflows 64 bits returns ESP_ERR_INVALID_SIZE so the caller can
+ * surface "high" rather than a wrapped figure. Used by the OLED wallet
+ * "Balance" screen so the owner can confirm they funded the right address. */
+esp_err_t arkiv_eth_get_balance(const uint8_t addr[20], uint64_t *out_wei);
+
 /* eth_gasPrice → suggested wei. The writer applies its own floor on top. */
 esp_err_t arkiv_eth_gas_price(uint64_t *out_wei);
 
