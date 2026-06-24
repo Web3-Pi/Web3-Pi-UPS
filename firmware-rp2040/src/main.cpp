@@ -292,7 +292,10 @@ unsigned long startupEndTime = 0;
 // menu with a "No modem" notice. menu_pending_deadline_ms = 0 means no
 // hand-off in flight; non-zero is the absolute millis() to time out at.
 static uint32_t menu_pending_deadline_ms = 0;
-constexpr uint32_t MENU_RESPONSE_TIMEOUT_MS = 1500;
+// Generous so a BUSY-but-present ESP32 (mid TLS / Arkiv telemetry submit) isn't
+// falsely declared "No modem". A genuinely absent/wedged M.2 just waits this
+// long before the notice — a better trade-off than spurious "No modem" flashes.
+constexpr uint32_t MENU_RESPONSE_TIMEOUT_MS = 4000;
 
 // Convert battery voltage (2S pack, mV) to SOC percentage
 // Based on Panasonic CGR18650CH 2250mAh discharge curve
