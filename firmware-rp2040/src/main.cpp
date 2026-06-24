@@ -292,6 +292,10 @@ unsigned long startupEndTime = 0;
 // menu with a "No modem" notice. menu_pending_deadline_ms = 0 means no
 // hand-off in flight; non-zero is the absolute millis() to time out at.
 static uint32_t menu_pending_deadline_ms = 0;
+// Set while a menu (trust_ui or local) owns the buttons; on close the home
+// section swallows any still-held press until release, so the button that
+// selected "Back"/exit doesn't leak into dashboard nav (phantom screen + beep).
+static bool s_btn_release_guard = false;
 // Generous so a BUSY-but-present ESP32 (mid TLS / Arkiv telemetry submit) isn't
 // falsely declared "No modem". A genuinely absent/wedged M.2 just waits this
 // long before the notice — a better trade-off than spurious "No modem" flashes.
@@ -1537,6 +1541,7 @@ void loop() {
     // the menu closes (spurious "No modem" + a second beep + the local menu
     // reopening instead of going Home, on every menu exit).
     menu_pending_deadline_ms = 0;
+    s_btn_release_guard = true;   // swallow the lingering press on exit
     trust_ui_tick(oled,
                   digitalRead(BTN_LEFT_PIN)  == LOW,
                   digitalRead(BTN_RIGHT_PIN) == LOW);
@@ -1562,12 +1567,25 @@ void loop() {
       ctx.vbus_out_mV =
           (int)(analogRead(ADC_VBUS_OUT_PIN) * lsb_mV / VBUS_DIVIDER_RATIO + 0.5f);
     }
+    s_btn_release_guard = true;   // swallow the lingering press on exit
     local_menu_tick(oled,
                     digitalRead(BTN_LEFT_PIN)  == LOW,
                     digitalRead(BTN_RIGHT_PIN) == LOW,
                     ctx);
     delay(50);
     return;
+  }
+
+  // A button still held from a just-closed menu (the press that selected
+  // "Back"/exit) would otherwise be read by the dashboard nav as a fresh
+  // press — phantom screen change + a second beep. Swallow until both release;
+  // by the time nav runs the button reads HIGH, so no phantom edge fires.
+  if (s_btn_release_guard) {
+    if (digitalRead(BTN_LEFT_PIN) == LOW || digitalRead(BTN_RIGHT_PIN) == LOW) {
+      delay(50);
+      return;
+    }
+    s_btn_release_guard = false;
   }
 
   // ADR-0012 — system-menu activation gesture: hold LEFT for
