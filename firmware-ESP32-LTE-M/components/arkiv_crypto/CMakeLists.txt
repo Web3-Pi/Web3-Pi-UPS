@@ -11,6 +11,7 @@
 idf_component_register(
     SRCS
         "src/secp256k1.c"
+        "src/aead.c"
         "src/rlp.cpp"
         "src/brotli_store.cpp"
         "src/ops_tx_data.cpp"

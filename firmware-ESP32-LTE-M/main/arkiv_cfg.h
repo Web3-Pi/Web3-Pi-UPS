@@ -79,6 +79,12 @@
  *                       the §4.3 / §10.1 authority — verified, not trusted)
  *   stringAttributes : type="w3pups-claim", device_id=<ICCID>,
  *                      owner_pub=<128 hex: owner secp256k1 X||Y, no 04>,
+ *                      enc_pub=<128 hex: owner ENCRYPTION secp256k1 X||Y, no
+ *                          04 — the ECDH peer for telemetry confidentiality
+ *                          (ADR-0013). NOT the wallet key: derived owner-side
+ *                          from a deterministic personal_sign of a fixed
+ *                          domain string. The device ECDHs dev_priv×enc_pub;
+ *                          owner_pub stays the command/authority key>,
  *                      claim_code=<12 hex: §10.4 front-running token,
  *                          bip39_pack_top_bits(keccak(device_pub||
  *                          boot_nonce), 44) — 6 bytes, low 4 bits 0>,
@@ -88,13 +94,16 @@
  *   numericAttributes: epoch=<key_epoch the binding starts at>
  *
  * Claim binding digest (owner proves the owner key authorised binding to
- * THIS device — defence beyond the Arkiv-reported writer):
+ * THIS device — defence beyond the Arkiv-reported writer). enc_pub is bound
+ * here so a hostile gateway cannot substitute its own encryption key and read
+ * telemetry (ADR-0013):
  *
  *   bind = keccak256( "w3pups-claim\0"     (13 bytes incl. NUL)
  *            || device_id_ascii            (ICCID, no NUL)
  *            || owner_pub                  (64 bytes)
  *            || claim_code                 (6 bytes, canonical form)
- *            || epoch                      (uint32 little-endian) )
+ *            || epoch                      (uint32 little-endian)
+ *            || enc_pub                    (64 bytes) )
  *
  * Browser wallets cannot raw-sign an arbitrary hash, so the owner signs
  * `bind` via EIP-191 personal_sign and `sig` verifies against
@@ -110,6 +119,7 @@
  */
 #define ARKIV_CLAIM_ENTITY_TYPE "w3pups-claim"
 #define ARKIV_ATTR_OWNER_PUB    "owner_pub"
+#define ARKIV_ATTR_ENC_PUB      "enc_pub"        /* owner ECDH key (ADR-0013) */
 #define ARKIV_ATTR_CLAIM_CODE   "claim_code"
 #define ARKIV_CLAIM_BIND_TAG    "w3pups-claim"   /* tag + implicit NUL */
 

@@ -13,6 +13,7 @@
 
 #include "identity.h"
 #include "cmdauth_arkiv.h"
+#include "arkiv_writer.h"
 #include "arkiv_rpc.h"
 #include "wups_link.h"
 
@@ -158,11 +159,15 @@ static void owner_fingerprint(const uint8_t owner_addr[ADDR_LEN],
 
 /* §10.4 binding digest the owner signs:
  *   keccak( "w3pups-claim\0" || device_id_ascii || owner_pub[64]
- *         || claim_code[9] || epoch_LE32 ). */
+ *         || claim_code[6] || epoch_LE32 || enc_pub[64] ).
+ * enc_pub (ADR-0013) is bound so a hostile gateway cannot swap the owner's
+ * encryption key and read telemetry. MUST match WS-4 (claim.ts) byte-for-byte. */
 static void claim_binding_digest(const char *iccid,
                                  const uint8_t owner_pub[PUB_LEN],
                                  const uint8_t cc[ARKIV_CC_BYTES],
-                                 uint32_t epoch, uint8_t out[32])
+                                 uint32_t epoch,
+                                 const uint8_t enc_pub[PUB_LEN],
+                                 uint8_t out[32])
 {
     uint8_t ep[4] = { (uint8_t)(epoch & 0xFF), (uint8_t)((epoch >> 8) & 0xFF),
                       (uint8_t)((epoch >> 16) & 0xFF),
@@ -176,6 +181,7 @@ static void claim_binding_digest(const char *iccid,
     arkiv_keccak256_update(&kx, owner_pub, PUB_LEN);
     arkiv_keccak256_update(&kx, cc, ARKIV_CC_BYTES);
     arkiv_keccak256_update(&kx, ep, sizeof(ep));
+    arkiv_keccak256_update(&kx, enc_pub, PUB_LEN);
     arkiv_keccak256_finish(&kx, out);
 }
 
@@ -216,9 +222,11 @@ static bool try_candidate(const cJSON *e, const char *iccid)
 
     const char *did      = str_attr(sa, ARKIV_ATTR_DEVICE_ID);
     const char *opub_hex = str_attr(sa, ARKIV_ATTR_OWNER_PUB);
+    const char *epub_hex = str_attr(sa, ARKIV_ATTR_ENC_PUB);
     const char *cc_hex   = str_attr(sa, ARKIV_ATTR_CLAIM_CODE);
     const char *sig_hex  = str_attr(sa, ARKIV_ATTR_SIG);
-    if (!did || !opub_hex || !cc_hex || !sig_hex || !cJSON_IsString(writer))
+    if (!did || !opub_hex || !epub_hex || !cc_hex || !sig_hex ||
+        !cJSON_IsString(writer))
         return false;
 
     /* 1. device_id is ours (the query already filters, defence in depth). */
@@ -233,18 +241,28 @@ static bool try_candidate(const cJSON *e, const char *iccid)
         return false;
     }
 
-    uint8_t owner_pub[PUB_LEN], sig[SIG_LEN], writer_b[ADDR_LEN];
+    uint8_t owner_pub[PUB_LEN], enc_pub[PUB_LEN], sig[SIG_LEN], writer_b[ADDR_LEN];
     if (!decode_owner_pub(opub_hex, owner_pub)) return false;
+    if (!decode_owner_pub(epub_hex, enc_pub)) return false;
     if (hex_decode(sig_hex, sig, SIG_LEN) != SIG_LEN) return false;
     if (hex_decode(writer->valuestring, writer_b, ADDR_LEN) != ADDR_LEN)
         return false;
 
+    /* Reject an off-curve / infinity owner or encryption key before trusting
+     * it (ADR-0013): a bad enc_pub would otherwise poison every K_dir. */
+    if (arkiv_secp256k1_valid_pubkey(owner_pub) != 1 ||
+        arkiv_secp256k1_valid_pubkey(enc_pub) != 1) {
+        ESP_LOGW(TAG, "owner_pub/enc_pub not a valid secp256k1 point — ignoring");
+        return false;
+    }
+
     uint32_t epoch = (uint32_t)num_attr(na, ARKIV_ATTR_EPOCH);
 
     /* 3. The owner key itself must have signed the binding for THIS device
-     *    (so a lying RPC that forged `writer` still can't bind anyone). */
+     *    (so a lying RPC that forged `writer` still can't bind anyone). The
+     *    digest binds enc_pub too, so the encryption key can't be swapped. */
     uint8_t digest[32], signed_digest[32];
-    claim_binding_digest(iccid, owner_pub, s_local_cc, epoch, digest);
+    claim_binding_digest(iccid, owner_pub, s_local_cc, epoch, enc_pub, digest);
     eip191_wrap(digest, signed_digest);  /* owner used personal_sign (WS-4) */
     if (arkiv_secp256k1_verify(owner_pub, signed_digest, sig) != 1) {
         ESP_LOGW(TAG, "owner claim signature INVALID — ignoring");
@@ -277,12 +295,17 @@ static bool try_candidate(const cJSON *e, const char *iccid)
     }
 
     /* 6. Confirmed → bind. cmdauth_arkiv_bind_owner persists owner_pub +
-     *    epoch, resets the per-owner counter, sets ARKIV_CLAIMED. */
-    esp_err_t b = cmdauth_arkiv_bind_owner(owner_pub, epoch);
+     *    enc_pub + epoch, resets the per-owner counter, sets ARKIV_CLAIMED. */
+    esp_err_t b = cmdauth_arkiv_bind_owner(owner_pub, enc_pub, epoch);
     if (b != ESP_OK) {
         ESP_LOGE(TAG, "bind_owner failed: %s — staying UNCLAIMED",
                  esp_err_to_name(b));
         return false;
+    }
+    /* Pre-derive the payload-seal K_dir now, on this 8 KB claim task, so the
+     * first ack/event from the 4 KB wups_rx task only runs GCM (ADR-0013). */
+    if (!arkiv_writer_seal_prewarm()) {
+        ESP_LOGW(TAG, "seal prewarm failed — keys will derive lazily on first emit");
     }
     ESP_LOGI(TAG, "owner bound via OLED trust anchor (epoch=%u) — "
              "ARKIV_CLAIMED", (unsigned)epoch);

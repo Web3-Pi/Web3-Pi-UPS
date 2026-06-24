@@ -12,6 +12,8 @@
 extern "C" {
 #include "arkiv_rpc.h"
 #include "arkiv_cfg.h"
+#include "cmdauth_arkiv.h"
+#include "identity.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -25,6 +27,7 @@ extern "C" {
 #include "arkiv_crypto/ops_tx_data.h"
 #include "arkiv_crypto/tx_signer.h"
 #include "arkiv_crypto/secp256k1.h"
+#include "arkiv_crypto/aead.h"
 
 #include <string>
 #include <vector>
@@ -45,6 +48,7 @@ extern "C" {
 #define KEY_OUT_SEQ      "out_seq"
 
 #define ADDR_LEN 20
+#define PUB_LEN  64
 #define PRIV_LEN ARKIV_SECP256K1_PRIVKEY_LEN
 
 /* Gas defaults — Braga is a testnet with a sub-Gwei base fee (observed
@@ -61,8 +65,27 @@ static SemaphoreHandle_t s_lock;
 static bool              s_ready;
 static uint8_t           s_dev_priv[PRIV_LEN];
 static uint8_t           s_dev_addr[ADDR_LEN];
-static uint64_t          s_out_seq;        /* monotonic, persisted */
+/* Outbound entity seq — the AEAD nonce's uniqueness depends on this NEVER
+ * repeating, even across crashes (a repeated (key,nonce) is a catastrophic GCM
+ * break). Window-reservation: s_seq_reserved (persisted) is an exclusive upper
+ * bound on every seq that may have been handed out; in-RAM increments are issued
+ * below it, and NVS is only touched once per SEQ_RESERVE_WINDOW. */
+static uint64_t          s_seq_next;        /* next value to hand out (RAM) */
+static uint64_t          s_seq_reserved;    /* persisted high-water (exclusive) */
 static SemaphoreHandle_t s_seq_lock;
+static constexpr uint64_t SEQ_RESERVE_WINDOW = 1024;
+static constexpr uint64_t SEQ_MAX_48         = (1ULL << 48) - 1;  /* nonce carries low 48 bits */
+
+/* Payload-seal (ADR-0013) per-epoch key cache. The three K_dir are derived once
+ * (ECDH + 3×HKDF) per binding generation and reused; re-derived when cmdauth's
+ * binding_gen changes (bind / epoch bump / clear). RAM only — never persisted. */
+static SemaphoreHandle_t s_seal_lock;
+static uint32_t          s_seal_gen;
+static bool              s_seal_valid;
+static uint32_t          s_seal_epoch;
+static uint8_t           s_k_tlm[32], s_k_ack[32], s_k_event[32];
+static char              s_owner_lower[2 + ADDR_LEN * 2 + 1];  /* "0x"+40+nul */
+static char              s_devpub_lower[PUB_LEN * 2 + 1];      /* 128+nul     */
 
 /* Chain-health tracking — lets us tell "submit OK but nothing is being
  * included" apart from "submit OK and the chain is moving". Updated on
@@ -97,30 +120,50 @@ extern "C" const uint8_t *arkiv_writer_device_addr(void)
     return s_ready ? s_dev_addr : nullptr;
 }
 
+/* Persist the reservation high-water. Returns true only on a fully-committed
+ * write — the caller fails closed on false (never hands out an unreserved seq). */
+static bool persist_seq_reserved(uint64_t reserved)
+{
+    nvs_handle_t wh;
+    if (nvs_open(WRITER_NAMESPACE, NVS_READWRITE, &wh) != ESP_OK) return false;
+    esp_err_t e1 = nvs_set_u64(wh, KEY_OUT_SEQ, reserved);
+    esp_err_t e2 = nvs_commit(wh);
+    nvs_close(wh);
+    return e1 == ESP_OK && e2 == ESP_OK;
+}
+
 extern "C" uint64_t arkiv_writer_next_seq(void)
 {
-    if (!s_seq_lock) {
-        /* Pre-init call — return a sentinel that the panel will reject as
-         * non-monotonic rather than a value that could be reused. */
+    if (!s_seq_lock) return 0;   /* pre-init — 0 = "unavailable", caller drops */
+
+    xSemaphoreTake(s_seq_lock, portMAX_DELAY);
+
+    /* Refuse to approach the 48-bit nonce field wrap (astronomically far at any
+     * real cadence). Fail-closed rather than risk a wrapped, reused nonce. */
+    if (s_seq_next >= SEQ_MAX_48 - SEQ_RESERVE_WINDOW) {
+        ESP_LOGE(TAG, "out_seq near 2^48 — refusing (would risk nonce reuse)");
+        xSemaphoreGive(s_seq_lock);
         return 0;
     }
-    xSemaphoreTake(s_seq_lock, portMAX_DELAY);
-    s_out_seq++;
-    uint64_t v = s_out_seq;
-    /* Persist immediately so a crash between bump and submit doesn't
-     * replay a counter the backend already observed. NVS write is ~10 ms;
-     * fine against the entity submit latency (seconds). */
-    nvs_handle_t wh;
-    if (nvs_open(WRITER_NAMESPACE, NVS_READWRITE, &wh) == ESP_OK) {
-        nvs_set_u64(wh, KEY_OUT_SEQ, v);
-        nvs_commit(wh);
-        nvs_close(wh);
-    } else {
-        ESP_LOGW(TAG, "out_seq NVS persist failed (v=%llu)",
-                 (unsigned long long)v);
+
+    /* Extend the durable reservation when the window is exhausted. The new
+     * high-water is committed BEFORE the value is issued, so every handed-out
+     * seq is < the persisted reservation and a reboot resumes strictly above
+     * it — no (key,nonce) reuse is possible. */
+    if (s_seq_next >= s_seq_reserved) {
+        uint64_t nr = s_seq_next + SEQ_RESERVE_WINDOW;
+        if (!persist_seq_reserved(nr)) {
+            ESP_LOGE(TAG, "out_seq reservation persist failed — dropping (fail-closed)");
+            xSemaphoreGive(s_seq_lock);
+            return 0;   /* fail-closed: never seal with an undurable nonce */
+        }
+        s_seq_reserved = nr;
     }
+
+    uint64_t v = s_seq_next;   /* v < s_seq_reserved (persisted) → durable */
+    s_seq_next++;
     xSemaphoreGive(s_seq_lock);
-    return v;
+    return v;                  /* >= 1 in normal operation; 0 only signals failure */
 }
 
 static void hex_encode(const uint8_t *in, size_t n, char *out)
@@ -131,6 +174,104 @@ static void hex_encode(const uint8_t *in, size_t n, char *out)
         out[2 * i + 1] = H[in[i] & 0x0F];
     }
     out[2 * n] = '\0';
+}
+
+static void writer_secure_zero(void *p, size_t n)
+{
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (n--) *v++ = 0;
+}
+
+/* Re-derive the three per-stream K_dir if the owner binding changed. Caller
+ * holds s_seal_lock. False if UNCLAIMED (no enc_pub) or any crypto step fails. */
+static bool seal_refresh_keys_locked(void)
+{
+    const uint8_t *enc_pub    = cmdauth_arkiv_enc_pub();
+    const uint8_t *owner_addr = cmdauth_arkiv_owner_addr();
+    const uint8_t *dev_pub    = cmdauth_arkiv_device_pub();
+    if (!enc_pub || !owner_addr || !dev_pub) return false;   /* unclaimed */
+
+    uint32_t gen = cmdauth_arkiv_binding_gen();
+    if (s_seal_valid && s_seal_gen == gen) return true;       /* cache hit */
+
+    uint32_t epoch = cmdauth_arkiv_key_epoch();
+    uint8_t  shared_x[32];
+    /* ECDH peer is the owner ENCRYPTION key (ADR-0013), not owner_pub. */
+    if (arkiv_secp256k1_ecdh(s_dev_priv, enc_pub, shared_x) != 0) return false;
+
+    /* HKDF salt strings (== credentials.ts): "0x"+lower(owner_addr) | lower(dev_pub). */
+    s_owner_lower[0] = '0'; s_owner_lower[1] = 'x';
+    hex_encode(owner_addr, ADDR_LEN, s_owner_lower + 2);
+    hex_encode(dev_pub, PUB_LEN, s_devpub_lower);
+
+    bool ok =
+        arkiv_aead_derive_key(shared_x, s_owner_lower, s_devpub_lower,
+                              ARKIV_AEAD_TYPE_TELEMETRY, epoch, s_k_tlm) == 0 &&
+        arkiv_aead_derive_key(shared_x, s_owner_lower, s_devpub_lower,
+                              ARKIV_AEAD_TYPE_ACK, epoch, s_k_ack) == 0 &&
+        arkiv_aead_derive_key(shared_x, s_owner_lower, s_devpub_lower,
+                              ARKIV_AEAD_TYPE_EVENT, epoch, s_k_event) == 0;
+    writer_secure_zero(shared_x, sizeof(shared_x));
+    if (!ok) { s_seal_valid = false; return false; }
+
+    s_seal_epoch = epoch;
+    s_seal_gen   = gen;
+    s_seal_valid = true;
+    ESP_LOGI(TAG, "payload-seal keys derived (epoch=%u, gen=%u)",
+             (unsigned)epoch, (unsigned)gen);
+    return true;
+}
+
+extern "C" int arkiv_writer_payload_seal(uint8_t type_tag, uint64_t seq,
+                                         const char *entity_type,
+                                         const char *command_id_or_null,
+                                         const uint8_t *pt, size_t pt_len,
+                                         uint8_t *out, size_t out_cap,
+                                         size_t *out_len, uint32_t *out_epoch)
+{
+    if (!s_ready || !s_seal_lock) return -1;
+    if (seq == 0) return -2;                       /* next_seq() failure sentinel */
+    const char *iccid = identity_iccid();
+    if (!iccid || iccid[0] == '\0') return -3;
+
+    xSemaphoreTake(s_seal_lock, portMAX_DELAY);
+    int rc = -4;                                   /* default: unclaimed / derive fail */
+    if (seal_refresh_keys_locked()) {
+        const uint8_t *kdir = nullptr;
+        switch (type_tag) {
+            case ARKIV_AEAD_TYPE_TELEMETRY: kdir = s_k_tlm;   break;
+            case ARKIV_AEAD_TYPE_ACK:       kdir = s_k_ack;   break;
+            case ARKIV_AEAD_TYPE_EVENT:     kdir = s_k_event; break;
+            default: break;
+        }
+        if (!kdir) {
+            rc = -5;
+        } else {
+            uint32_t epoch = s_seal_epoch;
+            int sr = arkiv_aead_seal(type_tag, epoch, seq, kdir, iccid,
+                                     entity_type, command_id_or_null,
+                                     pt, pt_len, out, out_cap, out_len);
+            if (sr != 0) {
+                rc = -6;
+            } else {
+                if (out_epoch) *out_epoch = epoch;
+                rc = 0;
+            }
+        }
+    }
+    xSemaphoreGive(s_seal_lock);
+    return rc;
+}
+
+extern "C" bool arkiv_writer_seal_prewarm(void)
+{
+    if (!s_ready || !s_seal_lock) return false;
+    /* Derive the K_dir now (on the caller's stack — meant to be the 8 KB claim
+     * task) so the first ack/event from the 4 KB wups_rx task only runs GCM. */
+    xSemaphoreTake(s_seal_lock, portMAX_DELAY);
+    bool ok = seal_refresh_keys_locked();
+    xSemaphoreGive(s_seal_lock);
+    return ok;
 }
 
 extern "C" esp_err_t arkiv_writer_init(void)
@@ -145,14 +286,25 @@ extern "C" esp_err_t arkiv_writer_init(void)
         s_seq_lock = xSemaphoreCreateMutex();
         if (!s_seq_lock) return ESP_ERR_NO_MEM;
     }
+    if (!s_seal_lock) {
+        s_seal_lock = xSemaphoreCreateMutex();
+        if (!s_seal_lock) return ESP_ERR_NO_MEM;
+    }
 
-    /* Recover the persisted out-seq cursor from writable NVS. Missing key
-     * = first-ever boot of the writer; start at 0. */
+    /* Recover the persisted out-seq reservation. Resume STRICTLY ABOVE the
+     * stored value (persisted + 1): migration-proof across both the old
+     * persist-every-bump semantics (stored = last used) and the new
+     * window-reservation semantics (stored = first-unused high-water). At most
+     * one seq is skipped per reboot — harmless for a 48-bit monotonic cursor.
+     * The first next_seq() then forces a fresh durable reservation. */
+    uint64_t persisted = 0;
     nvs_handle_t wh;
     if (nvs_open(WRITER_NAMESPACE, NVS_READONLY, &wh) == ESP_OK) {
-        if (nvs_get_u64(wh, KEY_OUT_SEQ, &s_out_seq) != ESP_OK) s_out_seq = 0;
+        if (nvs_get_u64(wh, KEY_OUT_SEQ, &persisted) != ESP_OK) persisted = 0;
         nvs_close(wh);
     }
+    s_seq_next     = persisted + 1;
+    s_seq_reserved = s_seq_next;   /* == s_seq_next forces reservation on first issue */
 
     /* prov is brought up by identity_init(); this is idempotent. */
     esp_err_t err = nvs_flash_init_partition(PROV_PARTITION);

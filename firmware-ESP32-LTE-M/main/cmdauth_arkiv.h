@@ -76,6 +76,21 @@ const uint8_t *cmdauth_arkiv_device_pub(void);
  * the eth_subscribe(logs) filter — see arkiv_ws.c). */
 const uint8_t *cmdauth_arkiv_owner_addr(void);
 
+/* Owner ENCRYPTION public key (64 B X||Y) — the ECDH peer for telemetry/
+ * ack/event payload confidentiality (ADR-0013). Distinct from owner_pub:
+ * owner-derived from a deterministic wallet signature, bound at claim.
+ * Returns NULL until ARKIV_CLAIMED. */
+const uint8_t *cmdauth_arkiv_enc_pub(void);
+
+/* Current key_epoch (ratchet/revocation, §4.5). Used by the writer's payload
+ * seal to scope each per-epoch K_dir. */
+uint32_t cmdauth_arkiv_key_epoch(void);
+
+/* Monotonic counter bumped on every binding change (bind / epoch set / clear).
+ * The payload-seal key cache re-derives K_dir whenever this changes, so a
+ * re-claim (new owner/enc_pub, possibly same epoch) can never reuse a stale key. */
+uint32_t cmdauth_arkiv_binding_gen(void);
+
 /* Highest Braga block processed (replay cursor, §4.4 fromBlock). 0 = none. */
 uint64_t cmdauth_arkiv_cursor_block(void);
 
@@ -96,11 +111,14 @@ bool cmdauth_arkiv_check(const arkiv_cmd_t *cmd,
  * Takes the owner's uncompressed secp256k1 PUBLIC key (64 B, X||Y, no 0x04
  * prefix): the address for the §4.3 writer check is derived from it
  * (keccak256[12:]), and it is used to verify the owner signature over each
- * command frame (so a lying RPC cannot forge `writer`). Persists owner_pub
- * + key_epoch, resets the counter namespace (fresh per-owner, §10.6), sets
- * claim_state = ARKIV_CLAIMED.
+ * command frame (so a lying RPC cannot forge `writer`). Also takes the owner
+ * ENCRYPTION key enc_pub (64 B X||Y, ADR-0013) — the ECDH peer for telemetry
+ * confidentiality, bound in the claim digest. Both keys are validated on-curve
+ * and refused if invalid. Persists owner_pub + enc_pub + key_epoch, resets the
+ * counter namespace (fresh per-owner, §10.6), sets claim_state = ARKIV_CLAIMED.
  */
-esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_pub[64], uint32_t epoch);
+esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_pub[64],
+                                   const uint8_t enc_pub[64], uint32_t epoch);
 
 /* Accept an owner-signed epoch bump (revocation/ratchet, §4.5): monotonic
  * upward only. Caller must have verified the bump was owner-signed. */

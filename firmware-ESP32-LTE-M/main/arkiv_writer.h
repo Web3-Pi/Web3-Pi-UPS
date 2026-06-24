@@ -67,6 +67,36 @@ const uint8_t *arkiv_writer_device_addr(void);
  * is fine — the backend's per-entity-type queries naturally partition them. */
 uint64_t arkiv_writer_next_seq(void);
 
+/* Seal a device→owner payload (ADR-0013 posture B). Looks up the owner
+ * encryption key + current key_epoch from cmdauth_arkiv, computes the per-epoch
+ * per-stream K_dir = HKDF(ECDH(ak_dev_priv, enc_pub), ...) — cached in RAM and
+ * re-derived only when the binding generation changes — and writes the sealed
+ * body (0x03 | typeTag | epoch_BE32 | seq_BE48 | ciphertext | tag16) via
+ * arkiv_aead_seal(). The ICCID is taken from identity for the AAD.
+ *
+ *   type_tag : ARKIV_AEAD_TYPE_{TELEMETRY,ACK,EVENT}
+ *   seq      : from arkiv_writer_next_seq() — the SAME value the caller puts in
+ *              the plaintext `seq` attribute; 0 (its failure sentinel) is rejected
+ *   command_id_or_null : 36-char UUID for ACK (bound into AAD), NULL otherwise
+ *   out_epoch: receives the key_epoch used (caller writes it to the `epoch` attr,
+ *              guaranteeing nonce/AAD/attr agree on one epoch snapshot)
+ *
+ * Returns 0 on success (sets *out_len, *out_epoch). On ANY failure returns <0
+ * and the caller MUST drop the entity — fail-closed, NEVER fall back to
+ * plaintext on a claimed device. Notably fails when UNCLAIMED (no enc_pub). */
+int arkiv_writer_payload_seal(uint8_t type_tag, uint64_t seq,
+                              const char *entity_type,
+                              const char *command_id_or_null,
+                              const uint8_t *pt, size_t pt_len,
+                              uint8_t *out, size_t out_cap, size_t *out_len,
+                              uint32_t *out_epoch);
+
+/* Eagerly derive the payload-seal keys (ECDH + HKDF) on the CALLER's stack —
+ * call from the 8 KB claim task right after binding the owner, so the first
+ * ack/event sealed from the 4 KB wups_rx task only has to run GCM. Returns true
+ * when keys are ready (device claimed + enc_pub present), false otherwise. */
+bool arkiv_writer_seal_prewarm(void);
+
 /* Submit a single CreateOp with the given attributes and payload. Returns
  * ESP_OK iff the JSON-RPC node accepted the raw tx (HTTP 2xx + result). On
  * success `out_tx_hash` (32 B) holds the keccak of the signed RLP; the

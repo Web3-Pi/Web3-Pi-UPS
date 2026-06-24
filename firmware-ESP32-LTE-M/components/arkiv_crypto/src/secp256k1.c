@@ -32,9 +32,9 @@ static void sha256(const uint8_t* in, size_t len, uint8_t out[32])
     mbedtls_sha256_free(&ctx);
 }
 
-static void hmac_sha256(const uint8_t* key, size_t key_len,
-                        const uint8_t* msg, size_t msg_len,
-                        uint8_t out[32])
+void arkiv_hmac_sha256(const uint8_t* key, size_t key_len,
+                       const uint8_t* msg, size_t msg_len,
+                       uint8_t out[32])
 {
     uint8_t k_pad[SHA256_BLOCK];
     uint8_t tk[SHA256_LEN];
@@ -88,21 +88,21 @@ static void rfc6979_init(rfc6979_ctx* r, const uint8_t priv[32], const uint8_t h
     buf[32] = 0x00;
     memcpy(buf + 33, priv, 32);
     memcpy(buf + 65, hash_mod_n, 32);
-    hmac_sha256(r->K, 32, buf, sizeof(buf), r->K);
-    hmac_sha256(r->K, 32, r->V, 32, r->V);
+    arkiv_hmac_sha256(r->K, 32, buf, sizeof(buf), r->K);
+    arkiv_hmac_sha256(r->K, 32, r->V, 32, r->V);
 
     memcpy(buf, r->V, 32);
     buf[32] = 0x01;
     memcpy(buf + 33, priv, 32);
     memcpy(buf + 65, hash_mod_n, 32);
-    hmac_sha256(r->K, 32, buf, sizeof(buf), r->K);
-    hmac_sha256(r->K, 32, r->V, 32, r->V);
+    arkiv_hmac_sha256(r->K, 32, buf, sizeof(buf), r->K);
+    arkiv_hmac_sha256(r->K, 32, r->V, 32, r->V);
 }
 
 /* Fill t[0..31] with the next RFC 6979 candidate. Returns bytes generated (32). */
 static void rfc6979_next_t(rfc6979_ctx* r, uint8_t t[32])
 {
-    hmac_sha256(r->K, 32, r->V, 32, r->V);
+    arkiv_hmac_sha256(r->K, 32, r->V, 32, r->V);
     memcpy(t, r->V, 32);
 }
 
@@ -111,8 +111,8 @@ static void rfc6979_reseed(rfc6979_ctx* r)
     uint8_t buf[33];
     memcpy(buf, r->V, 32);
     buf[32] = 0x00;
-    hmac_sha256(r->K, 32, buf, sizeof(buf), r->K);
-    hmac_sha256(r->K, 32, r->V, 32, r->V);
+    arkiv_hmac_sha256(r->K, 32, buf, sizeof(buf), r->K);
+    arkiv_hmac_sha256(r->K, 32, r->V, 32, r->V);
 }
 
 /* ----------------------------------------------------------- helpers */
@@ -153,6 +153,34 @@ int arkiv_secp256k1_derive_address(const uint8_t priv[32], uint8_t addr_out[20])
     arkiv_keccak256(pub, 64, hash);
     memcpy(addr_out, hash + 12, 20);
     return 0;
+}
+
+/* --------------------------------------------------------------------- ECDH */
+
+int arkiv_secp256k1_ecdh(const uint8_t priv[32],
+                         const uint8_t peer_pub[64],
+                         uint8_t shared_x[32])
+{
+    uECC_Curve curve = uECC_secp256k1();
+
+    /* Fail-closed: reject an off-curve / point-at-infinity / malformed peer key
+     * before spending the scalar-mult, so a hostile owner_pub can never coerce a
+     * degenerate or attacker-predictable shared secret. */
+    if (uECC_valid_public_key(peer_pub, curve) != 1) {
+        return -1;
+    }
+
+    /* shared_x = X-coordinate of priv*peer_pub (micro-ecc writes the 32-byte BE X).
+     * Caller MUST run this through HKDF-Extract before use — never as a raw key. */
+    if (uECC_shared_secret(peer_pub, priv, shared_x, curve) != 1) {
+        return -2;
+    }
+    return 0;
+}
+
+int arkiv_secp256k1_valid_pubkey(const uint8_t pub[64])
+{
+    return uECC_valid_public_key(pub, uECC_secp256k1());
 }
 
 /* ----------------------------------------------------- sign_recoverable */
