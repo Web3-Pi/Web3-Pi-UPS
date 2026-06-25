@@ -156,6 +156,19 @@ void wups_route_frame(uint8_t inbound_port, const WupsFrame& f)
 
     if (to_self) return;
 
+    /* Command RESP bridge: a HOST command RESP coming UP from the RPi agent
+     * (service start/stop/restart, os.reboot/shutdown) has dst = the REQ's src
+     * (RPI), so the unicast rule below would route it back out the RPI port and
+     * drop it (out_port == inbound_port). Hand it to the local handler, which
+     * republishes it to MQTT cmd/response so the panel confirms the command
+     * instead of timing out. */
+    if (inbound_port == WUPS_PORT_RPI && (f.flags & WUPS_FLAG_RESP) &&
+        f.cls == WUPS_CLASS_HOST)
+    {
+        wups_on_local_frame(inbound_port, f);
+        return;
+    }
+
     uint8_t out_port = addr_to_port[f.dst];
     if (out_port != WUPS_PORT_NONE && out_port != inbound_port)
     {

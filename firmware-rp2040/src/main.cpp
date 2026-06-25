@@ -757,6 +757,7 @@ static void wupsPublishTelemetryStatus(uint8_t seq, const uint8_t* payload, uint
 static void wupsPublishHostStatus(uint8_t seq, const wups_host_status_v1_t& s);
 static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq, uint8_t code);
 static void wupsPublishEventFrame(const WupsFrame& f);
+static void wupsPublishCmdResponseFrame(const WupsFrame& f);
 
 // Cellular uplink is metered: the M.2 modem runs on a ~500 MB/mo LTE data
 // plan, sized from measured packet sizes. The CH32X pushes power.status
@@ -777,6 +778,19 @@ static bool     Last_Uplink_Pg           = false;  // input "good" at last uplin
 static uint16_t Last_Uplink_Faults       = 0;      // charger faults at last uplink
 
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
+  // Command RESP bridge: a HOST command RESP that came UP from the RPi agent
+  // (service start/stop/restart, os.reboot/shutdown) is destined back to the
+  // cloud, but its dst=RPI would route straight back out the RPI port and be
+  // dropped (out_port==inbound_port). The router hands such frames here so we
+  // republish them to MQTT cmd/response — preserving SEQ (panel Redis
+  // correlation) and payload[0] (the agent's result code). Without this the
+  // panel times out on every HOST command. (See wups_router.cpp.)
+  if (inbound_port == WUPS_PORT_RPI && (f.flags & WUPS_FLAG_RESP) &&
+      f.cls == WUPS_CLASS_HOST) {
+    wupsPublishCmdResponseFrame(f);
+    return;
+  }
+
   // power.event / host.event (op 0x10, EVENT) — alert-class state changes
   // (mains lost/restored, charger fault, host shutdown-imminent, …). The
   // ESP32 uplinks ONLY net.publish-wrapped payloads, so the raw broadcast
@@ -1361,6 +1375,22 @@ static void wupsPublishEventFrame(const WupsFrame& f) {
                             f.flags, f.seq, f.payload, f.len);
   if (n == 0) return;
   wupsRequestPublish("event", /*qos=*/1, /*retain=*/0, frame, (uint16_t)n);
+}
+
+// Republish a command RESP that arrived FROM the RPi agent (HOST service /
+// os.* commands) onto the MQTT "cmd/response" subtopic. Unlike
+// wupsPublishCmdResponse (which synthesizes a 1-byte code for RP2040-handled
+// POWER ops), this forwards the agent's own RESP verbatim — preserving SEQ
+// (the panel's Redis correlation key) and payload[0] (the agent's result
+// code: 0 = ok, non-zero = failure). The frame reaches here via the bridge in
+// wups_router.cpp → wups_on_local_frame.
+static void wupsPublishCmdResponseFrame(const WupsFrame& f) {
+  uint8_t frame[WUPS_FRAMING_BYTES + 64];
+  size_t n = wupsBuildFrame(frame, sizeof(frame),
+                            f.dst, f.src, f.cls, f.op,
+                            f.flags, f.seq, f.payload, f.len);
+  if (n == 0) return;
+  wupsRequestPublish("cmd/response", /*qos=*/1, /*retain=*/0, frame, (uint16_t)n);
 }
 
 // Send `system.hello` broadcast on boot so other nodes can discover us.
