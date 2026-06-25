@@ -374,9 +374,13 @@ Change them via UI as well if you like.
 ### Add an MQTT user
 
 EMQX → Access Control → Authentication → **Built-in Database** is
-enabled by default. Add users you'll authenticate from. We used
-`TestUpsUser` for the prototype; for production fleets you'd typically
-provision per-device credentials.
+enabled by default. Add users you'll authenticate from.
+
+> **Note:** the early prototype used a single shared `TestUpsUser`. That
+> user is **retired** — the shipping firmware authenticates per-device
+> (username = SIM ICCID, password = per-device 32-byte secret from the
+> `prov` NVS partition, ADR-0008) with a single EMQX ACL rule keyed on
+> `${username}`. Don't recreate `TestUpsUser`.
 
 ### Disable the EMQX-internal SSL/WSS listeners
 
