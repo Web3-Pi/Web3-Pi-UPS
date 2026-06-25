@@ -252,9 +252,17 @@ esp_err_t backend_mode_request_switch(wups_backend_mode_t new_mode)
 {
     if (!is_known_mode((uint8_t)new_mode)) return ESP_ERR_INVALID_ARG;
     if (new_mode == s_cur_mode) {
-        ESP_LOGI(TAG, "switch requested to current mode %s — no-op",
+        /* Deliberately re-selecting the ACTIVE mode from the OLED menu is
+         * treated as a clean "restart in this mode" — the menu already showed
+         * a "switching…" screen, so a true reboot makes that honest (and is a
+         * handy way to force a fresh reconnect). No mode change → no
+         * mode_changed, and prev_mode is left as-is (the post-switch confirm
+         * path no-ops on prev == cur, or on a stale/invalid marker). */
+        ESP_LOGW(TAG, "re-selected current mode %s — restarting in place",
                  backend_mode_name(new_mode));
-        return ESP_OK;
+        vTaskDelay(pdMS_TO_TICKS(100));   /* flush the log line over USB-CDC */
+        esp_restart();
+        return ESP_OK;  /* unreached */
     }
     ESP_LOGI(TAG, "switch %s → %s requested",
              backend_mode_name(s_cur_mode), backend_mode_name(new_mode));
