@@ -145,6 +145,8 @@ typedef enum {
     WUPS_OP_HOST_SHUTDOWN        = 0x02,
     WUPS_OP_HOST_RESET           = 0x03,
     WUPS_OP_HOST_SERVICE_RESTART = 0x04,
+    WUPS_OP_HOST_SERVICE_START   = 0x05,
+    WUPS_OP_HOST_SERVICE_STOP    = 0x06,
     WUPS_OP_HOST_EVENT           = 0x10,
 } wups_op_host_t;
 
@@ -374,9 +376,11 @@ typedef struct WUPS_PACKED {
     uint16_t delay_s;
 } wups_host_shutdown_v1_t;
 
-/* host.service_restart REQ — header followed by ASCII unit name (no NUL).
- * The host (RPi agent) enforces a whitelist; non-whitelisted units are rejected
- * with a system.log EVENT and the RESP carries a non-zero result. */
+/* host.service_{start,stop,restart} REQ — SHARED payload: header followed by
+ * ASCII unit name (no NUL). The op (SERVICE_START / SERVICE_STOP /
+ * SERVICE_RESTART) selects the systemctl verb. The host (RPi agent) enforces a
+ * whitelist; non-whitelisted units are rejected with a system.log EVENT and the
+ * RESP carries a non-zero result. */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */
     uint8_t  unit_len;       /* bytes of unit name following */
