@@ -354,7 +354,12 @@ typedef struct WUPS_PACKED {
 /* host.status — RPi -> RP2040 */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */
-    uint8_t  eth_client_state; /* 0=stopped 1=syncing 2=synced 3=error */
+    uint8_t  eth_client_state; /* packed systemd SERVICE state, 2 bits per client:
+                                *   [1:0]=execution [3:2]=consensus [5:4]=validator;
+                                *   each 0=unknown/not-installed 1=running 2=stopped 3=failed.
+                                * Repurposed from a single sync-state enum for per-client
+                                * monitoring (Web3-Pi-UPS-Service host_metrics::eth); same
+                                * 1-byte size, so the wire frame is unchanged. */
     int16_t  cpu_temp_dC;
     uint8_t  mem_used_pct;
     uint8_t  disk_used_pct;

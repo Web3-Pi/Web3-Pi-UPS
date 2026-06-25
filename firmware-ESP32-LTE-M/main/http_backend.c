@@ -446,6 +446,8 @@ static size_t build_body(char *out, size_t cap)
         wups_host_status_v1_t h;
         memcpy(&h, raw, sizeof(h));
         cJSON *o = cJSON_AddObjectToObject(root, "host");
+        /* eth_state is the packed per-client systemd service-state byte (2 bits
+         * each: execution/consensus/validator) — see common/protocol.h. */
         cJSON_AddNumberToObject(o, "eth_state",   h.eth_client_state);
         cJSON_AddNumberToObject(o, "cpu_temp_dc", h.cpu_temp_dC);
         cJSON_AddNumberToObject(o, "mem_pct",     h.mem_used_pct);
