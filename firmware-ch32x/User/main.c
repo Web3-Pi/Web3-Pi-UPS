@@ -1105,7 +1105,29 @@ int main(void)
                     } else {
                         Husb_Pick_Sel = husb238_pick_best_pdo(&Husb_Caps);
                         if (Husb_Pick_Sel != HUSB238_SEL_NONE) {
-                            if (husb238_sel_to_mV(Husb_Pick_Sel) != Husb_Data.voltage_mV) {
+                            /* Re-request unless the LIVE contract already
+                             * matches the pick in BOTH voltage AND current.
+                             * The VSET/ISET straps can land on our target
+                             * voltage but a LOWER current (this board: strap
+                             * 15V/1.75A while the source offers 15V/3A). The
+                             * old voltage-only test treated that as "already
+                             * optimal" and never issued REQUEST_PDO, so the
+                             * contract stayed pinned at the strap's 1.75A.
+                             * Only an explicit I2C request raises the
+                             * negotiated current to the PDO's advertised value
+                             * (ISET no longer applies once I2C overrides). */
+                            uint16_t pick_mV = husb238_sel_to_mV(Husb_Pick_Sel);
+                            uint16_t pick_mA = 0;
+                            for (int i = 0; i < HUSB238_PDO_COUNT; i++) {
+                                if (HUSB238_PDO_MV[i] == pick_mV) {
+                                    pick_mA = Husb_Caps.current_mA[i];
+                                    if (pick_mA > HUSB238_POLICY_I_CAP_MA)
+                                        pick_mA = HUSB238_POLICY_I_CAP_MA;
+                                    break;
+                                }
+                            }
+                            if (pick_mV != Husb_Data.voltage_mV ||
+                                Husb_Data.current_mA + 50 < pick_mA) {
                                 husb238_select_pdo(Husb_Pick_Sel);  /* renegotiate */
                             }
                             /* Latch only on a real pick — if caps came back
