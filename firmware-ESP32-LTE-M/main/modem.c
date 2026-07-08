@@ -3,6 +3,7 @@
 #include "identity.h"
 #include "backend_mode.h"
 #include "http_backend.h"
+#include "wups_link.h"
 #include "../../common/protocol.h"
 
 #include <ctype.h>
@@ -74,6 +75,60 @@ static esp_netif_t       *s_ppp_netif;
 static esp_modem_dce_t   *s_dce;
 static bool               s_iccid_known;       /* set true once AT+CCID populated identity */
 static bool               s_mqtt_started;
+
+/* --- degraded-state surfacing -------------------------------------------
+ * Cellular bring-up already self-heals (supervisor: AT retry → backoff →
+ * modem PWRKEY power-cycle). When it stays broken ACROSS repeated
+ * power-cycles we raise a visible alert on the RP2040 (OLED + buzzer) via
+ * ui.display_msg, naming the stage that failed, and clear it on the next
+ * successful IP. We never reset the ESP32 — a marginal SIM contact / weak
+ * antenna is not fixable by any reset, so we alert the human and keep
+ * retrying slowly (auto-recovers when the contact/signal comes back). */
+/* Surface the visible alert after this many consecutive bring-up failures
+ * (~a minute at the per-attempt timings below) — fast enough that a no-SIM /
+ * no-signal unit tells the user quickly, high enough that a 1-2 s transient
+ * doesn't false-alarm. Modem PWRKEY power-cycle recovery runs in parallel;
+ * a successful IP clears the alert. */
+#define MODEM_FAILS_BEFORE_ALERT  4
+
+typedef enum {
+    MODEM_FAIL_NONE = 0,
+    MODEM_FAIL_AT,     /* modem never answered AT                    */
+    MODEM_FAIL_SIM,    /* AT ok, but no SIM/ICCID (CPIN/CCID failed) */
+    MODEM_FAIL_NET,    /* SIM ok, but no registration / no PPP IP    */
+} modem_fail_t;
+
+static modem_fail_t s_fail_stage;
+static int          s_fails_since_ok;   /* consecutive bring-up failures; 0 on IP */
+static bool         s_alert_active;
+
+static const char *modem_fail_msg(modem_fail_t f)
+{
+    switch (f) {
+    case MODEM_FAIL_SIM: return "SIM ERROR";
+    case MODEM_FAIL_NET: return "NO NETWORK";
+    case MODEM_FAIL_AT:  /* fallthrough */
+    default:             return "MODEM FAIL";
+    }
+}
+
+/* Push a short alert string to the RP2040 OLED/buzzer (ui.display_msg).
+ * text_len==0 is the CLEAR sentinel. Sent over UART2 (wups_link), which is
+ * a separate link from the modem UART1 and is mutex-protected, so calling
+ * this from the supervisor task is safe. */
+static void modem_ui_alert(const char *msg)
+{
+    /* wups_ui_display_msg_v1_hdr_t { u8 ver=1, u8 line, u8 text_len, u8 rsv } + text */
+    uint8_t buf[4 + 24];
+    size_t tl = msg ? strlen(msg) : 0;
+    if (tl > 24) tl = 24;
+    buf[0] = 1; buf[1] = 0; buf[2] = (uint8_t)tl; buf[3] = 0;
+    if (tl) memcpy(buf + 4, msg, tl);
+    wups_link_send(WUPS_ADDR_RP2040, WUPS_CLASS_UI, WUPS_OP_UI_DISPLAY_MSG,
+                   WUPS_FLAG_REQ, buf, (uint16_t)(4 + tl));
+}
+
+static void modem_ui_alert_clear(void) { modem_ui_alert(NULL); }
 
 esp_err_t modem_init(void)
 {
@@ -363,7 +418,16 @@ static esp_err_t ppp_bringup_dce(void)
     }
     if (!synced) {
         ESP_LOGE(MODEM_TAG, "modem did not respond to AT after 20 tries");
+        s_fail_stage = MODEM_FAIL_AT;
         return ESP_ERR_TIMEOUT;
+    }
+
+    /* Verbose CME error reporting, so AT+CPIN?/AT+CCID failures below log the
+     * actual cause ("SIM not inserted" vs "SIM busy" vs a wedged modem)
+     * instead of a bare rc=-1. Best-effort — ignore the result. */
+    {
+        char cmee[64] = {0};
+        esp_modem_at(s_dce, "AT+CMEE=2", cmee, 1000);
     }
 
     /* A few sanity-check at-level reads before going to data mode. */
@@ -388,8 +452,43 @@ static esp_err_t ppp_bringup_dce(void)
     if (s_iccid_known) {
         ESP_LOGI(MODEM_TAG, "ICCID already known: %s", identity_iccid());
     } else {
+        /* Wait for the SIM stack to report READY before reading ICCID. AT
+         * answers several seconds before "+CPIN: READY" on a cold or
+         * re-seated SIM, and a single AT+CCID shot then loses the race —
+         * that was the intermittent bench failure. Poll CPIN for ~6 s. */
+        bool sim_ready = false;
+        for (int i = 0; i < 12 && !sim_ready; i++) {
+            char pin[64] = {0};
+            if (esp_modem_at(s_dce, "AT+CPIN?", pin, 2000) == ESP_OK &&
+                strstr(pin, "READY")) {
+                ESP_LOGI(MODEM_TAG, "SIM ready (CPIN READY after %d polls)", i);
+                sim_ready = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        if (!sim_ready) {
+            ESP_LOGW(MODEM_TAG, "CPIN not READY after ~6s "
+                                "(SIM not inserted / bad contact?) — trying CCID anyway");
+        }
+
+        /* Read ICCID with retries: CPIN can flip READY a beat before the
+         * EF-ICCID file is readable, and SIM7080G FW revisions differ on
+         * AT+CCID vs AT+CICCID — so retry and try the alias once. */
         char at_out[128] = {0};
-        esp_err_t at_err = esp_modem_at(s_dce, "AT+CCID", at_out, 3000);
+        esp_err_t at_err = ESP_FAIL;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            at_out[0] = '\0';
+            at_err = esp_modem_at(s_dce, "AT+CCID", at_out, 3000);
+            if (at_err == ESP_OK && at_out[0]) break;
+            if (attempt == 2) {                 /* mid-way: try the alias once */
+                at_out[0] = '\0';
+                at_err = esp_modem_at(s_dce, "AT+CICCID", at_out, 3000);
+                if (at_err == ESP_OK && at_out[0]) break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
         if (at_err == ESP_OK && at_out[0]) {
             ESP_LOGI(MODEM_TAG, "AT+CCID raw: %s", at_out);
             char iccid[24] = {0};
@@ -401,17 +500,13 @@ static esp_err_t ppp_bringup_dce(void)
                     iccid[out_idx++] = c;
                     started = true;
                 } else if (started) {
-                    /* Stop at the first non-digit after we found digits, so
-                     * we don't slurp the trailing "OK". */
-                    break;
+                    break;   /* stop at first non-digit so we don't slurp "OK" */
                 }
             }
             iccid[out_idx] = '\0';
             /* ICCID can be 19 or 20 digits — the 20th (when present) is a
-             * Luhn check digit per ISO/IEC 7812. SIM7080G/SIM7070 AT+CCID
-             * returns the 20-digit form; 1NCE's portal (and our panel,
-             * via convention) uses the 19-digit form. Strip the Luhn so
-             * what the panel claims matches what the device publishes. */
+             * Luhn check digit; strip it so what the panel claims matches
+             * what the device publishes (1NCE/panel use the 19-digit form). */
             if (out_idx == 20) {
                 ESP_LOGI(MODEM_TAG, "trimming Luhn check digit: %s -> %.*s",
                          iccid, 19, iccid);
@@ -421,8 +516,15 @@ static esp_err_t ppp_bringup_dce(void)
                 s_iccid_known = true;
             }
         } else {
-            ESP_LOGE(MODEM_TAG, "AT+CCID failed: rc=%d (no SIM? hung modem?)",
-                     (int)at_err);
+            /* Persistent SIM read failure. Fail the whole bring-up so the
+             * supervisor counts it (toward the power-cycle + degraded alert)
+             * and retries — instead of racing on to PPP, which needs the SIM
+             * anyway and would just time out silently. */
+            ESP_LOGE(MODEM_TAG,
+                     "AT+CCID failed after retries: rc=%d out='%s' "
+                     "(SIM not inserted / bad contact?)", (int)at_err, at_out);
+            s_fail_stage = MODEM_FAIL_SIM;
+            return ESP_FAIL;
         }
     }
 
@@ -505,6 +607,13 @@ static void ppp_supervisor_task(void *arg)
                 ESP_LOGI(MODEM_TAG, "PPP up — TCP/IP stack is on the cellular interface");
                 consecutive_fails = 0;
                 backoff_ms = PPP_BACKOFF_MIN_MS;
+                s_fails_since_ok = 0;
+                s_fail_stage = MODEM_FAIL_NONE;
+                if (s_alert_active) {
+                    s_alert_active = false;
+                    modem_ui_alert_clear();
+                    ESP_LOGI(MODEM_TAG, "modem recovered — clearing OLED/buzzer alert");
+                }
 
                 if (!s_mqtt_started) {
                     /* Wall-clock time, needed by TLS cert validity check. */
@@ -555,21 +664,31 @@ static void ppp_supervisor_task(void *arg)
                 ESP_LOGW(MODEM_TAG, "PPP link lost — tearing down DCE");
             } else if (bits & EVT_PPP_FAIL) {
                 ESP_LOGE(MODEM_TAG, "PPP setup failed");
+                s_fail_stage = MODEM_FAIL_NET;   /* ICCID was read; radio/network side */
                 consecutive_fails++;
+                s_fails_since_ok++;
             } else {
                 ESP_LOGE(MODEM_TAG, "PPP setup timed out (%d ms)",
                          PPP_GOT_IP_TIMEOUT_MS);
+                s_fail_stage = MODEM_FAIL_NET;
                 consecutive_fails++;
+                s_fails_since_ok++;
             }
         } else {
             consecutive_fails++;
+            s_fails_since_ok++;
         }
 
         ppp_teardown_dce();
 
-        if (consecutive_fails >= PPP_FAILS_BEFORE_PWRCYCLE) {
+        /* When degraded, power-cycle the modem more often: a hot-inserted SIM
+         * or restored signal is only picked up on a modem re-init, so frequent
+         * cycles make recovery-after-fix fast (~a minute) instead of waiting
+         * out the full backoff. */
+        int pwrcycle_thresh = s_alert_active ? 2 : PPP_FAILS_BEFORE_PWRCYCLE;
+        if (consecutive_fails >= pwrcycle_thresh) {
             ESP_LOGW(MODEM_TAG,
-                     "%d consecutive bring-up failures — power-cycling modem",
+                     "%d bring-up failures — power-cycling modem",
                      consecutive_fails);
             /* PWRKEY pulse on a powered modem toggles it off, then on again.
              * The 8-second post-PWRKEY boot delay matches main.c's initial
@@ -579,11 +698,32 @@ static void ppp_supervisor_task(void *arg)
             consecutive_fails = 0;
         }
 
+        /* Surface / re-assert the visible alert once we've failed enough
+         * times in a row — independent of the power-cycle cadence above, so
+         * the operator is told in ~a minute rather than after several slow
+         * cycles. The modem power-cycle recovery keeps running in parallel;
+         * a successful IP clears the alert. Re-sent each round so a rebooted
+         * RP2040 re-shows it. */
+        if (s_fails_since_ok >= MODEM_FAILS_BEFORE_ALERT) {
+            const char *m = modem_fail_msg(s_fail_stage);
+            if (!s_alert_active) {
+                s_alert_active = true;
+                ESP_LOGE(MODEM_TAG,
+                         "modem DEGRADED (%d fails) — surfacing '%s' on OLED/buzzer",
+                         s_fails_since_ok, m);
+            }
+            modem_ui_alert(m);
+        }
+
+        /* Cap the backoff short while degraded so we keep retrying (and
+         * re-cycling) frequently until the fault clears; normal cap otherwise. */
+        uint32_t backoff_cap = s_alert_active ? 10000u : PPP_BACKOFF_MAX_MS;
+        if (backoff_ms > backoff_cap) backoff_ms = backoff_cap;
         ESP_LOGI(MODEM_TAG, "backing off %u ms before retry",
                  (unsigned)backoff_ms);
         vTaskDelay(pdMS_TO_TICKS(backoff_ms));
         backoff_ms *= 2;
-        if (backoff_ms > PPP_BACKOFF_MAX_MS) backoff_ms = PPP_BACKOFF_MAX_MS;
+        if (backoff_ms > backoff_cap) backoff_ms = backoff_cap;
     }
 }
 

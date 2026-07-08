@@ -194,6 +194,18 @@ unsigned long lastReminderTime = 0;
 bool previousPowerGood = false;     // Initialized after startup stabilization
 bool powerLossAlertPlayed = false;  // Prevent repeated alerts
 
+// --- ESP32-driven modem/network alert -------------------------------------
+// The ESP32 modem supervisor sends ui.display_msg when cellular bring-up
+// stays broken across power-cycles (e.g. marginal SIM contact / weak
+// antenna). We render it as an OLED override (like BAD PSU) with a 10 s
+// reminder beep, so a silent-in-panel unit is visible + audible on the bench.
+// Cleared by an empty-text ui.display_msg (modem recovered) or by an ESP32
+// reboot (system.hello) — the ESP32 re-raises it if still degraded.
+char netAlertText[24] = {0};
+bool netAlertActive = false;
+bool netAlertBeeped = false;              // rising-edge error-sound guard
+unsigned long netAlertLastReminder = 0;
+
 // --- Low battery warning state ---
 unsigned long lastLowBatteryBeep = 0;
 
@@ -1125,6 +1137,7 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     if (trust_ui_active()) trust_ui_force_close();
     currentScreen = 0;
     lastInteractionTime = millis();
+    netAlertActive = false;   // ESP32 rebooted — drop stale alert; it re-raises if still degraded
     return;
   }
 
@@ -1205,6 +1218,31 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     ui_settings_reset_defaults();
     ui_settings_apply_brightness(oled);   // push the restored brightness now
     ui_settings_beep(1500, 40);           // short confirm (sound now default-on)
+    return;
+  }
+
+  // ui.display_msg — the ESP32 (modem supervisor) raises/clears a persistent
+  // alert banner on the OLED (+ buzzer via the render loop). text_len == 0 is
+  // the CLEAR sentinel (modem recovered). We are a dumb renderer: store the
+  // string; the render loop draws it as an override and drives the buzzer.
+  if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_DISPLAY_MSG &&
+      f.len >= sizeof(wups_ui_display_msg_v1_hdr_t)) {
+    wups_ui_display_msg_v1_hdr_t h;
+    memcpy(&h, f.payload, sizeof(h));
+    if (h.version == 1) {
+      uint8_t avail = (uint8_t)(f.len - sizeof(h));   // text bytes actually present
+      uint8_t tl = h.text_len < avail ? h.text_len : avail;
+      if (tl > sizeof(netAlertText) - 1) tl = sizeof(netAlertText) - 1;
+      if (tl == 0) {
+        netAlertActive = false;
+        netAlertText[0] = '\0';
+      } else {
+        memcpy(netAlertText, f.payload + sizeof(h), tl);
+        netAlertText[tl] = '\0';
+        if (!netAlertActive) netAlertBeeped = false;  // rising edge → error sound
+        netAlertActive = true;
+      }
+    }
     return;
   }
 
@@ -1889,6 +1927,32 @@ void loop() {
     oled.print(F("Need PD"));
     oled.setCursor(0, 22);
     oled.print(F("26W min"));
+  } else if (netAlertActive) {
+    // Modem/network alert from the ESP32 — overrides all dashboard screens
+    // (below BAD PSU: power problems win). Same buzzer cadence as BAD PSU:
+    // error sound once on the rising edge, reminder beep every 10 s.
+    unsigned long now = millis();
+    if (!netAlertBeeped) {
+      playErrorSound();
+      netAlertBeeped = true;
+      netAlertLastReminder = now;
+    } else if (now - netAlertLastReminder >= BAD_PSU_REMINDER_INTERVAL_MS) {
+      playReminderBeep();
+      netAlertLastReminder = now;
+    }
+
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    if ((animPhase / 8) % 2 == 0) {   // flashing "!"
+      oled.setCursor(0, 0);
+      oled.print(F("!"));
+    }
+    oled.setCursor(10, 0);
+    oled.print(F("MODEM"));
+    oled.setCursor(0, 12);
+    oled.print(netAlertText);         // e.g. "SIM ERROR" / "NO NETWORK"
+    oled.setCursor(0, 22);
+    oled.print(F("no uplink"));
   } else {
     // Reset alert state when charger is OK or disconnected
     badChargerAlertPlayed = false;
