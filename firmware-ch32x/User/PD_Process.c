@@ -157,7 +157,11 @@ void USBPD_IRQHandler(void)
     {
         USBPD->STATUS |= IF_RX_RESET;
         PD_SINK_Init( );
-        printf("IF_RX_RESET\r\n");
+        /* NO printf here: this is the highest-priority ISR and printf
+         * blocks on USART2 (shared with the WUPS binary stream) via an
+         * unbounded TC spin — the exact pattern that wedged the 2026-07-11
+         * soak units. Hard-reset visibility comes from the PD state
+         * telemetry instead. */
     }
 }
 
@@ -535,8 +539,19 @@ void PD_Phy_SendPack( UINT8 mode, UINT8 *pbuf, UINT8 len, UINT8 sop )
     /* Determine if you need to wait for the send to complete */
     if( mode )
     {
-        /* Wait for the send to complete, this will definitely complete, no need to do a timeout */
-        while( (USBPD->STATUS & IF_TX_END) == 0 );
+        /* Bounded wait for TX complete. "This will definitely complete"
+         * holds only for a healthy PHY — a disturbance mid-transmission
+         * (supply transient, CC glitch) can abort the BMC engine without
+         * IF_TX_END ever setting, and an unbounded spin here wedges the
+         * main loop permanently (2026-07-11 soak failure class). Guard
+         * ≈25-40 ms measured from the compiled loop (~6-10 cycles/iter
+         * @48 MHz) >> ~1-3 ms worst-case legitimate TX; on expiry fall
+         * through to the RX cleanup — the peer's SenderResponse timeout
+         * and PD_Send_Handle()'s retry logic cover the lost frame. */
+        {
+            UINT32 tx_guard = 200000;
+            while( ((USBPD->STATUS & IF_TX_END) == 0) && --tx_guard );
+        }
         USBPD->STATUS |= IF_TX_END;
         if((USBPD->CONFIG & CC_SEL) == CC_SEL )
         {
@@ -874,10 +889,18 @@ void PD_Main_Proc( )
             break;
 
         case STA_TX_HRST:
-            /* Sending a hard reset */
+            /* Sending a hard reset. Disable the USBPD IRQ around the
+             * blocking (mode=1) send — same pattern as PD_Send_Handle():
+             * with the IRQ enabled the ISR's TX_END branch W1C-clears
+             * IF_TX_END before our wait loop sees it (burning the full
+             * guard) and sets a spurious Msg_Recvd that would re-dispatch
+             * the STALE PD_Rx_Buf right after the Hard Reset, overriding
+             * the STA_IDLE recovery state. */
             PD_Ctl.Flag.Bit.Stop_Det_Chk = 1;
+            NVIC_DisableIRQ( USBPD_IRQn );
             PD_Phy_SendPack( 0x01, NULL, 0, UPD_HARD_RESET );                   /* send HRST */
-            PD_Rx_Mode( );                                                      /* switch to rx mode */
+            PD_Ctl.Flag.Bit.Msg_Recvd = 0;                                      /* drop any stale RX */
+            PD_Rx_Mode( );                                                      /* switch to rx mode (re-enables IRQ) */
             PD_Ctl.PD_State = STA_IDLE;
             PD_Ctl.PD_Comm_Timer = 0;
             break;

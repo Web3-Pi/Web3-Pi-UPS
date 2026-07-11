@@ -288,7 +288,11 @@ void wups_router_drain(void)
     {
         Stream* s = port_streams[p];
         if (!s) continue;
-        int budget = 256;  /* don't starve other ports if one floods */
+        int budget = 1024; /* must cover a full mains-transition burst from the
+                            * CH32X (event+status+diag logs) within one loop
+                            * pass — a lagging drain lets the SW ring hit its
+                            * full-boundary corruption bug (2026-07-11). Still
+                            * bounded so one port can't starve the others. */
         while (budget-- > 0 && s->available())
         {
             rx_byte(p, port_rx[p], (uint8_t)s->read());

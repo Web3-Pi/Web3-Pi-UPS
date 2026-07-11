@@ -206,6 +206,53 @@ bool netAlertActive = false;
 bool netAlertBeeped = false;              // rising-edge error-sound guard
 unsigned long netAlertLastReminder = 0;
 
+// UPS-data staleness alert. CH32X pushes power.status at 1 Hz; when that
+// stream dies the cached ui.* values FREEZE and everything downstream
+// (OLED, alarms, uplink-on-change) silently runs on dead data — exactly
+// what masked the 2026-07-11 CH32X wedge for 8 h (frozen "4.6 V" looked
+// live on the OLED and panel, and produced a false BAD PSU). Detected
+// here and surfaced as the HIGHEST-priority OLED override (above BAD PSU,
+// which is computed FROM the frozen data and is meaningless when stale),
+// plus a one-shot system.log to the RPi agent (journald evidence).
+static const uint32_t UPS_STALE_MS            = 5000;   // 5 missed 1 Hz frames
+static const uint32_t UPS_STALE_BOOT_GRACE_MS = 8000;   // never-seen-a-frame case
+static const uint32_t UPS_STALE_REMINDER_MS   = 30000;  // beep cadence while stale
+bool upsStaleActive = false;
+bool upsStaleBeeped = false;              // rising-edge error-sound guard
+unsigned long upsStaleLastReminder = 0;
+
+// Deaf-RX auto-recovery. Field-verified failure (2026-07-11, 2/3 soak
+// units): a garbage burst on UART0 during a mains transient (CH32X AWD-ISR
+// printf ASCII shredding the frame stream — fixed at the source in
+// firmware-ch32x) can wedge the Arduino-core Serial1 RX path: the UART IRQ
+// keeps draining the HW FIFO (FR shows RXFE=1, no overruns) but
+// available() returns 0 forever — ring state desync. loop() stays healthy,
+// so the watchdog can't catch it; a Serial1 re-init clears it (verified:
+// an RP2040 reset restored live telemetry with CH32X untouched). After
+// UPS_RX_REINIT_AFTER_MS of staleness, re-init Serial1 and retry every
+// UPS_RX_REINIT_RETRY_MS while the stream stays dead.
+static const uint32_t UPS_RX_REINIT_AFTER_MS = 10000;
+static const uint32_t UPS_RX_REINIT_RETRY_MS = 30000;
+
+// BAD PSU debounce: display passes (~50 ms each) of continuous violation
+// before the alert engages — ~3 s. See the badCharger comment in the
+// display path.
+static const uint8_t BAD_PSU_DEBOUNCE_PASSES = 60;
+static uint8_t badChargerDebounce = 0;
+unsigned long upsStaleSinceMs = 0;
+unsigned long upsRxReinitLastMs = 0;
+uint16_t upsRxReinitCount = 0;
+
+static void reinitCh32xUart() {
+  // Mirror the exact setup() sequence (pins, FIFO, baud). Same Serial1
+  // object — the router's cached Stream* stays valid.
+  Serial1.end();
+  Serial1.setRX(UART0_RX_PIN);
+  Serial1.setTX(GPIO16_PIN);
+  Serial1.setFIFOSize(1024);
+  Serial1.begin(921600);
+}
+
 // --- Low battery warning state ---
 unsigned long lastLowBatteryBeep = 0;
 
@@ -788,6 +835,22 @@ static uint32_t Last_Telemetry_Uplink_Ms = 0;
 static bool     Telemetry_Uplink_Primed  = false;  // first frame after boot?
 static bool     Last_Uplink_Pg           = false;  // input "good" at last uplink
 static uint16_t Last_Uplink_Faults       = 0;      // charger faults at last uplink
+
+// Send a system.log line to the RPi agent (shows up in journald as
+// "remote log: ..."). Payload layout per protocol.h wups_sys_log_v1_hdr_t:
+// {version=1, level, text_len, reserved} + ASCII text (no NUL).
+// Used for RP2040-local state transitions the panel can't otherwise see.
+static void wupsSendLogToHost(uint8_t level, const char* text) {
+  uint8_t pl[4 + 64];
+  uint8_t tl = 0;
+  while (text[tl] && tl < 64) { pl[4 + tl] = (uint8_t)text[tl]; tl++; }
+  pl[0] = 1;
+  pl[1] = level;   // 1=warn 2=info (agent logs both at info)
+  pl[2] = tl;
+  pl[3] = 0;
+  wups_send(WUPS_PORT_RPI, WUPS_ADDR_RPI, WUPS_CLASS_SYSTEM, WUPS_OP_SYS_LOG,
+            WUPS_FLAG_EVENT, pl, (uint16_t)(4 + tl));
+}
 
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   // Command RESP bridge: a HOST command RESP that came UP from the RPi agent
@@ -1549,7 +1612,13 @@ void setup() {
   // UART0 to CH32X: RX on GPIO17, TX on GPIO16, binary protocol v1.
   Serial1.setRX(UART0_RX_PIN);
   Serial1.setTX(GPIO16_PIN);
-  Serial1.setFIFOSize(256);  // Increase RX buffer (default is 32)
+  // 1 KB: a mains-transition burst from the CH32X (power.event + status +
+  // diag logs back-to-back) overflowed the old 256 B ring, and the
+  // earlephilhower ring-full path corrupts its indices — available()/read()
+  // then return a permanently mangled stream (every frame fails checksum)
+  // while pristine bytes keep landing in the buffer. Field-diagnosed via
+  // SWD on 2026-07-11: valid consecutive frames in the queue, zero parsed.
+  Serial1.setFIFOSize(1024);
   Serial1.begin(921600);
   // Bump GPIO16 drive 4 mA -> 12 mA + slewfast for cleaner edges through patch wire.
   // PADS reg layout: [0]=SLEWFAST, [1]=SCHMITT, [2]=PDE, [3]=PUE, [5:4]=DRIVE, [6]=IE, [7]=OD
@@ -1612,9 +1681,23 @@ void setup() {
 
   // Start stabilization timer - suppress alerts until ADC/EMA settle
   startupEndTime = millis() + STARTUP_STABILIZE_MS;
+
+  // Hardware watchdog — recover from any RP2040 firmware wedge by reset
+  // (same defence class as the CH32X IWDG added after the 2026-07-11 soak
+  // failure). A reset here is benign for the product: the power path is
+  // owned by CH32X + autonomous chips, USB-CDC re-enumerates and the RPi
+  // agent auto-reconnects, OLED blips once. 8 s >> the ~50 ms loop cadence.
+  // NOTE: in-circuit flashing of the M.2 ESP32 can hold UART1 CTS long
+  // enough to block an uplink write and trip this — an RP2040 reset during
+  // ESP32 flashing is expected and harmless.
+  rp2040.wdt_begin(8000);
 }
 
 void loop() {
+  // Watchdog kick — first thing every iteration; if loop() ever stops
+  // making rounds for >8 s the hardware resets us (see setup()).
+  rp2040.wdt_reset();
+
   // Drain commands from the host service (USB-CDC) and the Probe UART (J350)
   // and forward both to CH32X. Each source has its own framing state.
   // Drain USB-CDC, UART0 (CH32X) and UART1 (ESP32) into per-port deframers,
@@ -1890,13 +1973,106 @@ void loop() {
 
   oled.clearDisplay();
 
+  // UPS-data staleness — evaluate FIRST: ui.pg / ui.vi below are frozen
+  // leftovers when the CH32X stream is dead, so every alert derived from
+  // them (incl. BAD PSU) is meaningless. Boot grace covers the
+  // never-received case; both windows exceed STARTUP_STABILIZE_MS.
+  {
+    unsigned long nowMs = millis();
+    bool upsStale = Last_Power_Status_Ms
+        ? ((uint32_t)(nowMs - Last_Power_Status_Ms) > UPS_STALE_MS)
+        : (nowMs > UPS_STALE_BOOT_GRACE_MS);
+    if (upsStale != upsStaleActive) {
+      upsStaleActive = upsStale;
+      if (upsStale) {
+        upsStaleBeeped = false;
+        upsStaleSinceMs = nowMs;
+        upsRxReinitLastMs = 0;
+        wupsSendLogToHost(1, "RP2040: power data STALE (no power.status from CH32X)");
+      } else {
+        wupsSendLogToHost(2, "RP2040: power data restored");
+      }
+    }
+
+    // Deaf-RX auto-recovery ladder:
+    //   10 s stale  -> Serial1 re-init (cheap; covers simple cases)
+    //   30 s stale  -> full RP2040 self-reboot. Field-proven cure: the
+    //                  2026-07-11 wedge left PRISTINE frames in the RX ring
+    //                  with available()/read() permanently desynced — soft
+    //                  re-init did NOT fix it, a manual RP2040 reset did,
+    //                  every time. A reboot is benign: power path is
+    //                  CH32X-owned, USB re-enumerates, agent reconnects.
+    // Reboot only if we HAVE seen frames this boot — if CH32X was never
+    // heard at all, rebooting ourselves won't conjure it and would just
+    // cycle USB every 40 s.
+    if (upsStaleActive &&
+        (uint32_t)(nowMs - upsStaleSinceMs) >= UPS_RX_REINIT_AFTER_MS &&
+        (upsRxReinitLastMs == 0 ||
+         (uint32_t)(nowMs - upsRxReinitLastMs) >= UPS_RX_REINIT_RETRY_MS)) {
+      reinitCh32xUart();
+      upsRxReinitLastMs = nowMs;
+      upsRxReinitCount++;
+      wupsSendLogToHost(1, "RP2040: reinit UART0 RX (power data stale)");
+    }
+    if (upsStaleActive && Last_Power_Status_Ms != 0 &&
+        (uint32_t)(nowMs - upsStaleSinceMs) >= 30000) {
+      wupsSendLogToHost(1, "RP2040: rebooting self (UART0 RX wedged, reinit failed)");
+      delay(100);          // let the log frame drain to the agent
+      rp2040.reboot();
+    }
+  }
+
   // Check for invalid charger: power connected but voltage too low or garbage
   // pg=1 means power is present
   // vi < 8000 means ~5V (non-PD or PD at 5V only - not enough for 26W)
   // vi > 21000 means garbage/saturated ADC (charger not working properly)
-  bool badCharger = (ui.pg == 1 && (ui.vi < 8000 || ui.vi > 21000));
+  //
+  // Debounced: every mains unplug/replug sweeps Vin through the 5-8 V band
+  // for a frame or two, which used to flash a spurious BAD PSU + error-beep
+  // burst on each power cycle. A genuinely bad PSU (5 V-only charger) sits
+  // in the band permanently, so requiring ~3 s of continuous violation
+  // filters the transits without delaying real detection meaningfully.
+  {
+    bool badChargerRaw = (ui.pg == 1 && (ui.vi < 8000 || ui.vi > 21000));
+    if (badChargerRaw) {
+      if (badChargerDebounce < 255) badChargerDebounce++;
+    } else {
+      badChargerDebounce = 0;
+    }
+  }
+  bool badCharger = (badChargerDebounce >= BAD_PSU_DEBOUNCE_PASSES);
 
-  if (badCharger) {
+  if (upsStaleActive) {
+    // Dead power-telemetry stream — the one alert that must outrank all
+    // others (they all consume the frozen data). Same sound pattern as
+    // BAD PSU but a gentler 30 s reminder cadence: this state can persist
+    // for hours and the box itself still powers the Pi fine.
+    unsigned long now = millis();
+    if (!upsStaleBeeped) {
+      playErrorSound();
+      upsStaleBeeped = true;
+      upsStaleLastReminder = now;
+    } else if (now - upsStaleLastReminder >= UPS_STALE_REMINDER_MS) {
+      playReminderBeep();
+      upsStaleLastReminder = now;
+    }
+
+    oled.setTextSize(1);
+    oled.setTextColor(SSD1306_WHITE);
+    if ((animPhase / 8) % 2 == 0) {   // flashing "!"
+      oled.setCursor(0, 0);
+      oled.print(F("!"));
+    }
+    oled.setCursor(10, 0);
+    oled.print(F("NO UPS"));
+    oled.setCursor(0, 12);
+    oled.print(F("pwr data"));
+    oled.setCursor(0, 22);
+    oled.print(F("lost "));
+    // Seconds since the last accepted power.status (or since boot if none).
+    oled.print((uint32_t)(millis() - Last_Power_Status_Ms) / 1000);
+    oled.print(F("s"));
+  } else if (badCharger) {
     // Buzzer alert logic
     unsigned long now = millis();
     if (!badChargerAlertPlayed) {

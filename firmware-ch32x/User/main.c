@@ -63,6 +63,12 @@
 /* #define DIAG_FORCE_5V_5A_NO_PD */
 
 void TIM1_UP_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+/* CRITICAL: every IRQ handler MUST carry the WCH interrupt attribute. The
+ * 2026-07-11 soak failure (2/3 units, main loop dead after a mains dip) was
+ * this handler compiled as a plain function: it returned with `ret` instead
+ * of `mret`, destroying the interrupted thread context. See also the AWD
+ * removal in ADC_Function_Init(). */
+void ADC1_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
 void ADC_Function_Init(void);
 u16 Get_ADC_Val(u8 ch);
 void USART2_Init(uint32_t baudrate);
@@ -70,11 +76,13 @@ void USART2_SendString(const char *s);
 static void Usart2_Dma_Rx_Init(void);
 static void wups_send_power_status(uint8_t dst, uint8_t flags, uint8_t seq);
 static void wups_send_hello_bcast(void);
-#if(Wake_up_mode==USBPDWake_up)
+/* Both wake handlers are DEFINED unconditionally below, so both MUST carry
+ * the interrupt attribute unconditionally — a handler compiled as a plain
+ * function returns with `ret` instead of `mret` and destroys the interrupted
+ * context (the 2026-07-11 ADC1 failure class). Previously these were #if'd
+ * on Wake_up_mode, leaving the inactive one attribute-less. */
 void USBPDWakeUp_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-#elif(Wake_up_mode==GPIOWake_up)
 void EXTI15_8_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
-#endif
 volatile UINT8  Tim_Ms_Cnt = 0x00;
 volatile UINT8  Led_Cnt = 0x00;
 volatile UINT32 Uptime_Sec = 0;
@@ -84,6 +92,9 @@ static UINT16   DC_Inp_Voltage_mV = 0;
 volatile u16    Vbat_ADC_Val = 0;
 static UINT16   Vbat_Voltage_mV = 0;
 static UINT16   Vbus_Out_Voltage_mV = 0;   /* PA0 ADC, same 27.4k/5.1k divider as PA1 */
+volatile u16    Vbus_Out_ADC_Val = 0;      /* PA0 raw counts, sampled in TIM1 ISR */
+static volatile u16 Adc_RR_Cnt = 0;        /* TIM1 ISR round-robin tick (ISR-only) */
+#define ADC_VAL_INVALID 0xFFFFu            /* Get_ADC_Val guard-expiry marker */
 static UINT16   Json_Timer_Ms = 0;
 static UINT16   Temp_Timer_Ms = 0;
 static UINT16   Chg_Timer_Ms = 0;
@@ -368,7 +379,10 @@ void USART2_SendString(const char *s)
 {
     while (*s)
     {
-        while (USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET);
+        /* Bounded TC wait — same rationale as Usart2_Send_Bytes(). */
+        u32 guard = 50000;
+        while ((USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET) && --guard);
+        if (!guard) return;
         USART_SendData(USART2, *s++);
     }
 }
@@ -454,11 +468,43 @@ static UINT16 Powercycle_Timer_Ms = 0;
  * main thread, so they serialize at byte granularity. ASCII bytes
  * appearing between binary frames are harmless: the receiver state
  * machine stays in SYNC1 until the next 0xAA 0x55 sequence. */
+/* Consecutive TC-guard expiries across sends. A brownout during a rapid
+ * mains cycle can corrupt USART2 config (TE cleared / BRR trashed) while
+ * the CPU keeps running: every send then times out and gets dropped, the
+ * main loop stays healthy, the IWDG keeps getting kicked — a silent,
+ * permanent mute (observed on …136967 during bring-up, 2026-07-11: stream
+ * dead, no IWDG reset, PB0 still actively driven). Self-heal: after
+ * USART2_TX_REINIT_AFTER consecutive expiries, fully re-init USART2 +
+ * the RX DMA ring. */
+#define USART2_TX_REINIT_AFTER 8
+static uint8_t Usart2_Tc_Timeouts = 0;
+
 static void Usart2_Send_Bytes(const uint8_t *buf, uint32_t len)
 {
     for (uint32_t i = 0; i < len; ++i)
     {
-        while (USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET);
+        /* Bounded TC wait: ~11 µs/byte @921600 normally; guard ≈ 25-30 ms
+         * (50k polls through the SPL call). If the UART ever wedges, drop
+         * the rest of the frame instead of hanging the main loop — the
+         * receiver's checksum discards the partial frame and the next
+         * 1 Hz push retries naturally. (Known cost: a fire-once
+         * power.event landing in a drop window is lost.) */
+        u32 guard = 50000;
+        while ((USART_GetFlagStatus(USART2, USART_FLAG_TC) == RESET) && --guard);
+        if (!guard)
+        {
+            if (++Usart2_Tc_Timeouts >= USART2_TX_REINIT_AFTER)
+            {
+                Usart2_Tc_Timeouts = 0;
+                /* Full re-init: RCC clocks, PA2/PA3 GPIO mux, USART regs,
+                 * RX DMA ring + request routing, USART enable — covers
+                 * every register-corruption variant observed. */
+                USART2_Init(921600);
+                Dma_Rx_Tail = 0;   /* DMA head restarts at buffer[0] — resync the drain */
+            }
+            return;
+        }
+        Usart2_Tc_Timeouts = 0;
         USART_SendData(USART2, buf[i]);
     }
 }
@@ -975,6 +1021,37 @@ int main(void)
      * track which nodes are alive. Sent once; not retried. */
     wups_send_hello_bcast();
 
+    /* Surface the reset cause (once, then clear) — a watchdog recovery in
+     * the field must be distinguishable from a power loss: without this a
+     * wedge→reset loop looks like random brownouts on the panel. */
+    if (RCC_GetFlagStatus(RCC_FLAG_IWDGRST) == SET) {
+        wups_send_log(1 /* warn */, "boot: IWDG watchdog reset (main loop wedged before reboot)");
+    } else if (RCC_GetFlagStatus(RCC_FLAG_SFTRST) == SET) {
+        wups_send_log(2 /* info */, "boot: software reset (ups.reset)");
+    }
+    RCC_ClearFlag();
+
+    /* Independent watchdog — last line of defence for the 2026-07-11
+     * failure class (main loop wedged, ISRs alive, no recovery path).
+     * CH32X035 has NO LSI: per RM V1.9 §5 the IWDG clock is HSI/1024 =
+     * 46.875 kHz. /64 → 732.4 Hz, reload 2930 → 4.00 s window; kicked
+     * once per second in the 1 Hz status block (worst legitimate
+     * inter-kick path audited ≈1.1 s → ≥3.6× margin).
+     *
+     * ⚠ On HWv3 a watchdog reset DOES power-cycle the Pi: PDS_EN (PB0)
+     * has a 5.1 kΩ pull-down (R522), so during MCU reset the pin floats
+     * low and the TPS55289 shuts down regardless of firmware. That is
+     * still strictly better than a permanently brain-dead controller
+     * (which cannot coordinate shutdown in the NEXT real outage and
+     * kills the Pi uncleanly anyway). A future PCB rev can make resets
+     * glitch-free with a pull-UP on PDS_EN — tps55289_init() already
+     * contains the adopt-running-output logic for that day. */
+    IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
+    IWDG_SetPrescaler(IWDG_Prescaler_64);
+    IWDG_SetReload(2930);
+    IWDG_ReloadCounter();
+    IWDG_Enable();
+
     while(1)
     {
         /* Get the calculated timing interval value */
@@ -1212,8 +1289,8 @@ int main(void)
              * power.status text line every time. */
             EMIT_STR(" Tboard=");
             {
-                int16_t v = Board_Temp_c10;
-                if (v < 0) { buf[p++] = '-'; v = (int16_t)(-v); }
+                int32_t v = Board_Temp_c10;   /* int32: negating INT16_MIN overflows */
+                if (v < 0) { buf[p++] = '-'; v = -v; }
                 int whole = v / 10;
                 int frac  = v % 10;
                 if (whole >= 100) buf[p++] = (char)('0' + whole / 100);
@@ -1224,9 +1301,13 @@ int main(void)
                 buf[p++] = 'C';
             }
             EMIT_STR(" TJ=");
-            {
-                int16_t v = Chg_Data.tjunc_c10;
-                if (v < 0) { buf[p++] = '-'; v = (int16_t)(-v); }
+            if (Chg_Data.tjunc_c10 == -32768) {
+                /* MP2762A-unpowered sentinel; negating INT16_MIN overflowed
+                 * and printed garbage ("TJ=-*.(C" in the 2026-07-11 ring). */
+                EMIT_STR("NA");
+            } else {
+                int32_t v = Chg_Data.tjunc_c10;
+                if (v < 0) { buf[p++] = '-'; v = -v; }
                 int whole = v / 10;
                 int frac  = v % 10;
                 if (whole >= 100) buf[p++] = (char)('0' + whole / 100);
@@ -1306,21 +1387,27 @@ int main(void)
         {
             Json_Timer_Ms = 0;
 
+            /* Watchdog kick — deliberately INSIDE the 1 Hz block: if the
+             * main loop stops making it here, the MCU resets in ~4 s. */
+            IWDG_ReloadCounter();
+
             /* DC input voltage from cached PA1 ADC: Vin = ADC * 3300 * (27.4+5.1) / 5.1 / 4096. */
             DC_Inp_Voltage_mV = (UINT16)((UINT32)DC_Inp_ADC_Val * 21029 / 4096);
 
             /* Battery voltage from PA5 ADC: VBAT = ADC * 3300 * (100+47) / 47 / 4096
-             * ≈ ADC * 10322 / 4096. Sampled here (1 Hz) because the WUPS frame
-             * consumer is also 1 Hz; no benefit from higher rate. This is the
-             * authoritative VBAT source — MP2762A's VBAT register reads 0 when
-             * the chip is unpowered (mains absent), which is the normal "on
-             * battery" state, so we cannot rely on it. */
-            Vbat_ADC_Val = Get_ADC_Val(ADC_Channel_5);
+             * ≈ ADC * 10322 / 4096. Raw counts come from the TIM1 ISR
+             * round-robin cache (≤512 ms old — the WUPS consumer is 1 Hz).
+             * The thread must NOT touch the ADC itself: a thread-side
+             * conversion races the ISR's 1 kHz read and can strand the
+             * thread in the EOC spin forever. This is the authoritative
+             * VBAT source — MP2762A's VBAT register reads 0 when the chip
+             * is unpowered (mains absent), the normal "on battery" state. */
             Vbat_Voltage_mV = (UINT16)((UINT32)Vbat_ADC_Val * 10322u / 4096u);
 
-            /* Output rail from PA0 ADC: same 27.4k/5.1k divider as PA1, so the
-             * same 21029/4096 scale. Independent of the TPS55289 readback. */
-            Vbus_Out_Voltage_mV = (UINT16)((UINT32)Get_ADC_Val(ADC_Channel_0) * 21029 / 4096);
+            /* Output rail from PA0 ADC (ISR cache): same 27.4k/5.1k divider
+             * as PA1, so the same 21029/4096 scale. Independent of the
+             * TPS55289 readback. */
+            Vbus_Out_Voltage_mV = (UINT16)((UINT32)Vbus_Out_ADC_Val * 21029 / 4096);
 
             /* Edge detector first — it reads the same fault latch the
              * status send below clears after packing. */
@@ -1349,9 +1436,29 @@ void TIM1_UP_IRQHandler(void)
 
         Led_Cnt++;
 
-        u16 ADC_val;
-        ADC_val = Get_ADC_Val(ADC_Channel_1);
-        DC_Inp_ADC_Val = ADC_val;
+        /* ADC OWNERSHIP: this ISR is the ONLY Get_ADC_Val caller. The main
+         * loop used to sample ch5/ch0 from thread context, racing this
+         * ISR's 1 kHz ch1 read on the same ADC with an unbounded EOC spin
+         * (2026-07-11 soak wedge class). Round-robin here instead: ch1
+         * (DC input) on ~510/512 ticks for the PA6/LED logic, ch5 (VBAT)
+         * and ch0 (VBUS_OUT) once per 512 ms each — same freshness the
+         * 1 Hz telemetry consumer had. Thread reads the cached volatiles. */
+        Adc_RR_Cnt++;
+        {
+            u16 adc_new;
+            if ((Adc_RR_Cnt & 0x1FF) == 1) {
+                adc_new = Get_ADC_Val(ADC_Channel_5);
+                if (adc_new != ADC_VAL_INVALID) Vbat_ADC_Val = adc_new;
+            } else if ((Adc_RR_Cnt & 0x1FF) == 257) {
+                adc_new = Get_ADC_Val(ADC_Channel_0);
+                if (adc_new != ADC_VAL_INVALID) Vbus_Out_ADC_Val = adc_new;
+            } else {
+                adc_new = Get_ADC_Val(ADC_Channel_1);
+                if (adc_new != ADC_VAL_INVALID) DC_Inp_ADC_Val = adc_new;
+            }
+        }
+
+        u16 ADC_val = DC_Inp_ADC_Val;   /* ≤2 ms stale on ch5/ch0 ticks — fine */
         //Vin >= 10V
         if (ADC_val >= 0x793)
         {
@@ -1420,12 +1527,13 @@ void EXTI15_8_IRQHandler(void)
  *
  * @return  none
  */
-void ADC1_IRQHandler()
+void ADC1_IRQHandler(void)
 {
-    if(ADC_GetITStatus( ADC1, ADC_IT_AWD)){
-        printf( "Enter AnalogWatchdog Interrupt\r\n" );
-    }
-
+    /* AWD is no longer armed (see ADC_Function_Init) — this is a safety
+     * net in case it ever gets re-enabled. NO printf here: printf blocks
+     * on USART2 (shared with the WUPS binary stream) and an ISR must
+     * never do that. Handler carries the WCH interrupt attribute (see
+     * declaration at the top of this file) so it returns with mret. */
     ADC_ClearITPendingBit( ADC1, ADC_IT_AWD);
 }
 
@@ -1440,12 +1548,26 @@ void ADC1_IRQHandler()
  */
 u16 Get_ADC_Val(u8 ch)
 {
+    /* ISR-CONTEXT ONLY (TIM1_UP_IRQHandler round-robin). Single owner —
+     * never call from the main loop: a thread-side conversion races the
+     * ISR and the loser waits for an EOC that never comes.
+     *
+     * Returns ADC_VAL_INVALID (0xFFFF) on guard expiry — DATAR would
+     * hold the PREVIOUS (different-channel!) conversion, so the caller
+     * must keep its last good cached value instead. The ClearFlag up
+     * front drops any EOC left by a timed-out conversion that completed
+     * late, which would otherwise skew every subsequent read by one
+     * channel permanently. */
     u16 val;
+    u32 guard = 200;    /* poll ≈ 0.3-0.5 µs/iter → ~60-100 µs cap on the
+                         * ISR; a healthy conversion is ~3 µs @ ADCCLK/6 */
 
+    ADC_ClearFlag(ADC1, ADC_FLAG_EOC);
     ADC_RegularChannelConfig(ADC1, ch, 1, ADC_SampleTime_11Cycles);
     ADC_SoftwareStartConvCmd(ADC1, ENABLE);
 
-    while(!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC));
+    while(!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC) && --guard);
+    if (!guard) return ADC_VAL_INVALID;
 
     val = ADC_GetConversionValue(ADC1);
 
@@ -1463,7 +1585,6 @@ void ADC_Function_Init(void)
 {
     ADC_InitTypeDef  ADC_InitStructure = {0};
     GPIO_InitTypeDef GPIO_InitStructure = {0};
-    NVIC_InitTypeDef NVIC_InitStructure = {0};
 
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE);
@@ -1499,21 +1620,17 @@ void ADC_Function_Init(void)
 
     //ADC_Channel_1 = PA1
     ADC_RegularChannelConfig(ADC1, ADC_Channel_1, 1, ADC_SampleTime_11Cycles);
-    ADC_AnalogWatchdogSingleChannelConfig(ADC1, ADC_Channel_1);
-    ADC_AnalogWatchdogCmd(ADC1, ADC_AnalogWatchdog_SingleRegEnable);
 
-    /* Higher Threshold:3500, Lower Threshold:2000 */
-    ADC_AnalogWatchdogThresholdsConfig(ADC1, 3500, 2000);
-
-    ADC_AnalogWatchdogResetCmd(ADC1, ADC_AnalogWatchdog_0_RST_EN, DISABLE);
-
-    NVIC_InitStructure.NVIC_IRQChannel = ADC1_IRQn;
-    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
-    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
-    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
-    NVIC_Init(&NVIC_InitStructure);
-
-    ADC_ITConfig(ADC1, ADC_IT_AWD, ENABLE);
+    /* Analog Watchdog REMOVED (2026-07-11 soak root cause). The AWD was
+     * armed on ch1 (mains input) with a 2000..3500-count window (~10.3 V
+     * .. ~18.0 V) — WCH template leftovers nothing consumed. Every mains
+     * dip below ~10.3 V fired ADC1_IRQHandler at up to 1 kHz; the handler
+     * lacked the WCH interrupt attribute (ret, not mret) and printf'd to
+     * the shared USART2, shredding the thread context and the WUPS frame
+     * stream — two soak units wedged permanently. Nothing in this product
+     * needs AWD: mains presence is handled by wups_power_event_tick()
+     * hysteresis. Do NOT re-arm without an attributed, printf-free
+     * handler and a consumer for the event. */
     ADC_Cmd(ADC1, ENABLE);
 }
 

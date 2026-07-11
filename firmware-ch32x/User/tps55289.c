@@ -47,7 +47,27 @@ void tps55289_init(void)
      */
     tps55289_write_byte(REG_VOUT_SR, (0x01 << 4) | 0x01);
     tps55289_set_cdc_compensation(CDC_COMP_0V7);  // Enable max cable droop compensation
-    tps55289_enable_output(0);
+
+    /* Adopt a running output instead of cutting it on a warm MCU restart
+     * (IWDG recovery, ups.reset).
+     *
+     * ⚠ On HWv3 this is LATENT/dead code: PDS_EN (PB0) has a 5.1 kΩ
+     * pull-down (R522), so during any MCU reset the pin floats low and
+     * the TPS shuts down + reverts to defaults (OE clear) before this
+     * code runs — the read below then takes the cold path, identical to
+     * the old behaviour. It becomes live if a future PCB rev pulls
+     * PDS_EN up to survive MCU resets. Two caveats for that day:
+     * (1) an unpowered/absent TPS reads 0xFF over the ACK-less bit-bang
+     *     bus and would look like "OE set" — harmless today (setpoint
+     *     caches stay 0, PD FSM reconfigures on sink detect), but do not
+     *     trust the adopted state for anything stronger;
+     * (2) the re-detect path calls VBUS_set_5V() (3 A limit) while a
+     *     5 A contract may be live — seed the current limit from the
+     *     running hardware before relying on adoption under load. */
+    if ((I2C_read_reg(TPS55289_I2C_ADDR, REG_MODE) & MODE_OE_BIT) == 0)
+    {
+        tps55289_enable_output(0);
+    }
 }
 // -----------------------------------------------------------------------------
 //  CDC Cable Voltage Droop Compensation (0-7)
