@@ -126,7 +126,9 @@ void mp2762a_factory_reset(void);
 void mp2762a_kick_watchdog(void);
 
 // Battery presence detection (BATTFET-toggle probe when VIN present)
-void mp2762a_poll_battery(void);          // Call every 500ms - probes BATT_UVLO with BATTFET toggle
+void mp2762a_poll_battery(uint16_t vbat_ext_mv); // Call every 500ms; vbat_ext_mv = CH32X PA5 VBAT
+                                                 // reading, disambiguates "full pack, charging
+                                                 // inhibited by OVP" from "no battery" (2026-07-12)
 uint8_t mp2762a_is_battery_present(void); // Returns cached debounced state (no I2C)
 uint8_t mp2762a_battery_inserted(void);   // Returns 1 once on insertion edge, clears flag
 

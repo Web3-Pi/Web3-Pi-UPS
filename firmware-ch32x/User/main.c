@@ -1226,7 +1226,7 @@ int main(void)
         if (Bat_Timer_Ms >= BAT_INTERVAL_MS)
         {
             Bat_Timer_Ms = 0;
-            mp2762a_poll_battery();
+            mp2762a_poll_battery(Vbat_Voltage_mV);
             if (mp2762a_battery_inserted()) {
                 mp2762a_restart_charging();
             }

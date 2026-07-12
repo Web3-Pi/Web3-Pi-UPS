@@ -22,6 +22,11 @@ static uint8_t g_bat_inserted_flag = 0;
 static uint8_t g_stuck_counter = 0;
 #define STUCK_RESTART_COUNT 6  // 6 * 500ms = 3s
 
+// PA5-divider battery-present threshold for the ambiguous ACOK+NOT_CHARGING
+// +0mA case (see mp2762a_poll_battery). Well below any real 2S pack voltage
+// (UVLO ~6.0-6.6 V) and far above the grounded-divider no-battery reading.
+#define BAT_PRESENT_EXT_MIN_MV 5500
+
 // Initialize MP2762A for 2S Li-ion battery
 void mp2762a_init(void) {
   // Read fault register to clear latched faults
@@ -214,7 +219,7 @@ uint8_t mp2762a_is_battery_uvlo(void) {
 //   - cs=NOT_CHARGING(0) → no battery (charger not running)
 //
 // When VIN is absent, BATT_UVLO is reliable (no back-feed from VSYS).
-void mp2762a_poll_battery(void) {
+void mp2762a_poll_battery(uint16_t vbat_ext_mv) {
   uint8_t status = mp2762a_read_reg(MP2762A_REG_STATUS);
   uint8_t raw_present;
 
@@ -230,8 +235,19 @@ void mp2762a_poll_battery(void) {
       // Significant charge current flowing = real battery
       raw_present = 1;
     } else {
-      // FAST with phantom current on caps, or NOT_CHARGING = no battery
-      raw_present = 0;
+      // FAST with phantom current on caps, or NOT_CHARGING. This state is
+      // AMBIGUOUS: it is also what a FULL pack sitting above the 8.1 V
+      // charge target looks like — the charger refuses to charge (battery
+      // OVP, REG14h bit3) and reports NOT_CHARGING at 0 mA. Treating that
+      // as "no battery" (pre-2026-07-12 behaviour) produced a false
+      // "no battery" indication plus a periodic unstick-restart loop that
+      // kept re-tripping OVP (seen on 2/3 soak units whose packs came in
+      // fuller than the target after external charging / no-battery boot).
+      // Disambiguate with the CH32X's OWN VBAT sense (PA5 divider): the
+      // divider pulls the BAT+ node to ground when no pack is connected,
+      // so a real voltage there = battery physically present, whatever
+      // the charger thinks about charging it.
+      raw_present = (vbat_ext_mv > BAT_PRESENT_EXT_MIN_MV) ? 1 : 0;
     }
   } else {
     // No VIN - BATT_UVLO is reliable directly
