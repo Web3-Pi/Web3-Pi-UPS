@@ -26,11 +26,11 @@ jobs:
     name: RP2040 (PlatformIO / arduino-pico 5.6.1)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.platformio
@@ -40,7 +40,7 @@ jobs:
         run: pip install platformio
       - name: Build
         run: pio run -d firmware-rp2040 -e pico
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rp2040-firmware
           path: |
@@ -51,14 +51,14 @@ jobs:
     name: ESP32-S3 (ESP-IDF v6.0)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: v6.0
           target: esp32s3
           path: firmware-ESP32-LTE-M
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: esp32-firmware
           path: |
@@ -75,8 +75,8 @@ jobs:
       # release of the same tarball for reliability.
       TOOLCHAIN_URL: https://github.com/ch32-riscv-ug/MounRiver_Studio_Community_miror/releases/download/1.92-toolchain/MRS_Toolchain_Linux_x64_V1.92.tar.xz
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
         id: toolchain-cache
         with:
           path: ~/wch-toolchain
@@ -97,7 +97,7 @@ jobs:
         run: |
           riscv-none-embed-gcc --version | head -1
           make -C firmware-ch32x -j"$(nproc)"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ch32x-firmware
           path: |
