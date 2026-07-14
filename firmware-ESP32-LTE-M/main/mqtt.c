@@ -11,7 +11,7 @@
 #include "freertos/task.h"
 #include "mqtt_client.h"
 
-#include "secrets.h"
+#include "endpoints.h"
 
 #define TAG "mqtt"
 
@@ -21,6 +21,10 @@
 #define TOPIC_BUF_LEN 48
 
 static esp_mqtt_client_handle_t s_client;
+
+/* MISC-9: link state drives publish-vs-enqueue in mqtt_publish_raw(). Set
+ * from the esp-mqtt event task; read from the wups_link task. */
+static volatile bool s_connected;
 
 static char s_topic_status[TOPIC_BUF_LEN];     /* t/{iccid}/status     (LWT + online retained) */
 static char s_topic_identify[TOPIC_BUF_LEN];   /* t/{iccid}/identify   (retained on connect) */
@@ -71,6 +75,7 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
         ESP_LOGI(TAG, "BEFORE_CONNECT");
         break;
     case MQTT_EVENT_CONNECTED:
+        s_connected = true;
         ESP_LOGI(TAG, "CONNECTED to %s as %s", MQTT_BROKER_URI, identity_iccid());
 
         /* Subscribe to the per-device downlink command topic. The broker
@@ -90,6 +95,7 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
         break;
 
     case MQTT_EVENT_DISCONNECTED:
+        s_connected = false;
         ESP_LOGW(TAG, "DISCONNECTED");
         break;
 
@@ -191,6 +197,11 @@ esp_err_t mqtt_client_start(void)
         },
         .session.keepalive   = 60,
         .network.timeout_ms  = 15000,
+        /* MISC-9: bound the RAM outbox that buffers uplinks across LTE/MQTT
+         * outages (see mqtt_publish_raw). WUPS frames are tens of bytes, so
+         * 32 KB holds several hundred parked messages; when full, enqueue
+         * returns -2 and the frame is dropped (bounded memory wins). */
+        .outbox.limit        = 32 * 1024,
         /* 12 KB for mbedTLS X509 chain validation headroom (default 6 KB
          * triggers stack-corruption errors during the LE handshake). */
         .task.stack_size     = 12 * 1024,
@@ -219,9 +230,32 @@ int mqtt_publish_raw(const char *topic, const void *payload, size_t payload_len,
     if (!s_client) {
         return -1;
     }
-    return esp_mqtt_client_publish(s_client, topic,
-                                   (const char *)payload, (int)payload_len,
-                                   qos, retain);
+    if (s_connected) {
+        int rc = esp_mqtt_client_publish(s_client, topic,
+                                         (const char *)payload, (int)payload_len,
+                                         qos, retain);
+        if (rc >= 0) {
+            return rc;
+        }
+        /* Race: DISCONNECTED landed between the flag check and the publish —
+         * fall through and park the frame in the outbox instead. */
+    }
+    /* MISC-9: link down — enqueue into the esp-mqtt RAM outbox (store=true)
+     * so the client flushes it on reconnect instead of dropping. Bounded by
+     * .outbox.limit; entries expire after CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS.
+     * Covers telemetry/events/cmd-responses generated during LTE dips. */
+    int rc = esp_mqtt_client_enqueue(s_client, topic,
+                                     (const char *)payload, (int)payload_len,
+                                     qos, retain, /*store=*/true);
+    if (rc >= 0) {
+        ESP_LOGI(TAG, "link down — parked in outbox: %s len=%u (msg_id=%d)",
+                 topic, (unsigned)payload_len, rc);
+    } else {
+        ESP_LOGW(TAG, "outbox enqueue failed rc=%d (%s): %s len=%u",
+                 rc, rc == -2 ? "outbox full" : "error",
+                 topic, (unsigned)payload_len);
+    }
+    return rc;
 }
 
 void mqtt_set_data_handler(mqtt_data_cb_t cb)

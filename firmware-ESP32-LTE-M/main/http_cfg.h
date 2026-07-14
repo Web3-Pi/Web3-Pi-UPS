@@ -9,7 +9,7 @@
  * writable `nvs` partition. This avoids re-flashing a fielded ESP32 (whose USB
  * may not be accessible in the enclosure).
  *
- * A compile-time default (HTTP_ENDPOINT_BASE in secrets.h) is used only as a
+ * A compile-time default (HTTP_ENDPOINT_BASE in endpoints.h) is used only as a
  * fallback when NVS has no value yet, which keeps bench/dev bring-up simple.
  *
  * Storage: namespace `w3http` in the default `nvs` partition:
@@ -45,7 +45,7 @@ extern "C" {
 
 /* Copy the configured base URL into out[cap]. Order of precedence:
  *   1. NVS `w3http/url` if present and non-empty.
- *   2. Compile-time HTTP_ENDPOINT_BASE (secrets.h) if defined non-empty.
+ *   2. Compile-time HTTP_ENDPOINT_BASE (endpoints.h) if defined non-empty.
  * Returns ESP_OK on a value, ESP_ERR_NOT_FOUND if neither is set,
  * ESP_ERR_INVALID_SIZE if the value doesn't fit. */
 esp_err_t http_cfg_get_url(char *out, size_t cap);

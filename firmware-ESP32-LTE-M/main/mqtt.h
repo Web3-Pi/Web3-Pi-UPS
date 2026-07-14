@@ -10,18 +10,23 @@
  * Call exactly once, AFTER esp_netif has a PPP IP. The client runs in its
  * own task spawned by esp-mqtt; this function returns immediately.
  *
- * Connection parameters (broker URI, username, password) live in
- * main/secrets.h — see secrets.h.example for the template. TLS verification
- * uses the certificate bundle baked into the firmware (LE-issued cert on
- * the broker side is covered).
+ * The broker URI is a compile-time constant in main/endpoints.h (public,
+ * tracked in git). Per-device credentials — username = ICCID, password =
+ * the per-device 32-byte secret — are read from the `prov` NVS partition
+ * via identity.c (ADR-0008); nothing credential-like is compiled in. TLS
+ * verification uses the certificate bundle baked into the firmware
+ * (LE-issued cert on the broker side is covered).
  */
 esp_err_t mqtt_client_start(void);
 
 /*
- * Publish a message via the active client. Wraps esp_mqtt_client_publish.
- * Returns the broker-assigned msg_id on success (>= 0), -1 if the client
- * isn't connected yet, or any other negative esp-mqtt error code. The
- * payload is opaque bytes — caller chooses the encoding.
+ * Publish a message via the active client. Wraps esp_mqtt_client_publish
+ * while connected; when the link is down (or the publish loses a race with
+ * a disconnect) the frame is parked in the esp-mqtt RAM outbox instead
+ * (MISC-9) and flushed automatically on reconnect. The outbox is bounded
+ * (32 KB) and entries expire after CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS.
+ * Returns msg_id (>= 0) on publish or park, -1 on error, -2 outbox full.
+ * The payload is opaque bytes — caller chooses the encoding.
  */
 int mqtt_publish_raw(const char *topic, const void *payload, size_t payload_len,
                      int qos, int retain);

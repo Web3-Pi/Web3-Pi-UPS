@@ -221,9 +221,9 @@ python3 send_config.py --url http://<your-vps-ip>:8080
 > `w3p-ups set-http-url <url>` subcommand routing a `net.config` frame on the
 > port it already owns) — see "Open / follow-ups" in the HTTP-2 evidence note.
 
-A compile-time default (`HTTP_ENDPOINT_BASE` in `secrets.h`, see
-`secrets.h.example`) is honoured only when NVS has no `url` yet — convenient
-for bench/dev. The runtime `net.config` value always takes precedence.
+A compile-time default (`HTTP_ENDPOINT_BASE` in `main/endpoints.h`) is
+honoured only when NVS has no `url` yet — convenient for bench/dev. The
+runtime `net.config` value always takes precedence.
 
 Switching the device into HTTP mode itself is done from the **OLED menu**
 (ADR-0012: MQTT / Arkiv / HTTP), which reboots into the selected backend.

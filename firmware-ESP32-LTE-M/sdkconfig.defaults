@@ -34,3 +34,10 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # Without this the per-task stack must be huge to fit a TLS 1.2/1.3
 # handshake, which manifests as an X509 fatal error during connect.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# --- MISC-9: buffer uplinks across LTE/MQTT outages in the esp-mqtt RAM
+#     outbox (mqtt_publish_raw enqueues with store=true when disconnected).
+#     Default expiry is 30 s — far too short for a modem reattach; raise to
+#     10 min. The outbox is additionally size-bounded in code (32 KB). ---
+CONFIG_MQTT_USE_CUSTOM_CONFIG=y
+CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS=600000

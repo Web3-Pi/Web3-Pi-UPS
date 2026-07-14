@@ -562,7 +562,7 @@ static int post_once(void)
 
     if (http_cfg_get_url(base, sizeof(base)) != ESP_OK) {
         ESP_LOGW(TAG, "no HTTP endpoint configured — set it from the host "
-                      "(net.config) or HTTP_ENDPOINT_BASE in secrets.h");
+                      "(net.config) or HTTP_ENDPOINT_BASE in endpoints.h");
         return -1;
     }
     if (http_cfg_get_device_id(devid, sizeof(devid)) != ESP_OK) {

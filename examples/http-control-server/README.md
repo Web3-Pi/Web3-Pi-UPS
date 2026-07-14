@@ -134,8 +134,8 @@ The device appends `/api/v1/devices/{device_id}/telemetry` itself.
 `send_config.py --device-id …` if your server keys devices differently.
 
 For a bench/dev build you can instead bake a default into the firmware via
-`HTTP_ENDPOINT_BASE` in `secrets.h` (see `secrets.h.example`) — but the
-runtime `net.config` value always wins.
+`HTTP_ENDPOINT_BASE` in `main/endpoints.h` — but the runtime `net.config`
+value always wins.
 
 ## Optional: TLS
 

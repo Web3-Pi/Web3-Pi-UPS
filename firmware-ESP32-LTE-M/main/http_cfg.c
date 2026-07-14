@@ -11,7 +11,7 @@
 #include "esp_random.h"
 #include "nvs.h"
 
-#include "secrets.h"
+#include "endpoints.h"
 
 #define TAG "http_cfg"
 
@@ -23,7 +23,7 @@
 /* Crockford base32 — excludes I, L, O, U to avoid hand-transcription mistakes. */
 static const char SECRET_ALPHABET[] = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/* Compile-time fallback. secrets.h.example documents this; absent → "". */
+/* Compile-time fallback. endpoints.h documents this; absent → "". */
 #ifndef HTTP_ENDPOINT_BASE
 #define HTTP_ENDPOINT_BASE ""
 #endif

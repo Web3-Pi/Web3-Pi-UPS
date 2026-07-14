@@ -1,11 +1,11 @@
 #pragma once
 
 /*
- * Local secrets file — copy to secrets.h and fill in. secrets.h is
- * gitignored so credentials never end up in the repo.
- *
- *   cp main/secrets.h.example main/secrets.h
- *   $EDITOR main/secrets.h
+ * Compile-time network endpoints — tracked in git; nothing in here is
+ * secret. (This replaces the old gitignored main/secrets.h: the retired
+ * MASTER_SECRET is no longer part of the firmware — per-device credentials
+ * are read at boot from the read-only `prov` NVS partition, see identity.c
+ * / ADR-0008 — and the broker URI is public.)
  */
 
 /* MQTT broker URI.
@@ -17,15 +17,6 @@
  * overhead). wss:// is the fallback for restrictive networks where only
  * 443 is reachable. */
 #define MQTT_BROKER_URI    "mqtts://broker.w3p.ovh:8883"
-
-/*
- * Track 0 / WS-10 (supersedes ADR-0005): there is NO MASTER_SECRET in the
- * firmware any more. The per-device MQTT password is a random 32-byte secret
- * read at boot from the read-only `prov` NVS partition (see identity.c),
- * provisioned per unit at production via tools/make-nvs-blob. It is NOT
- * compiled in and NOT derived from the ICCID. This file now only carries the
- * broker URI.
- */
 
 /*
  * HTTP-2 (§4.18a) — OPTIONAL compile-time default for the HTTP control-mode
