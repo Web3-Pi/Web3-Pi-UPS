@@ -1,0 +1,106 @@
+# DEVOPS-1: build all three firmware images on every push/PR.
+# Build-only (artifacts, no flashing, no hardware tests).
+
+name: firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firmware-rp2040/**'
+      - 'firmware-ESP32-LTE-M/**'
+      - 'firmware-ch32x/**'
+      - 'common/**'
+      - '.github/workflows/firmware-ci.yml'
+  pull_request:
+    paths:
+      - 'firmware-rp2040/**'
+      - 'firmware-ESP32-LTE-M/**'
+      - 'firmware-ch32x/**'
+      - 'common/**'
+      - '.github/workflows/firmware-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  rp2040:
+    name: RP2040 (PlatformIO / arduino-pico 5.6.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware-rp2040/platformio.ini') }}
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build
+        run: pio run -d firmware-rp2040 -e pico
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rp2040-firmware
+          path: |
+            firmware-rp2040/.pio/build/pico/firmware.uf2
+            firmware-rp2040/.pio/build/pico/firmware.elf
+
+  esp32:
+    name: ESP32-S3 (ESP-IDF v6.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0
+          target: esp32s3
+          path: firmware-ESP32-LTE-M
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware
+          path: |
+            firmware-ESP32-LTE-M/build/firmware-ESP32-LTE-M.bin
+            firmware-ESP32-LTE-M/build/bootloader/bootloader.bin
+            firmware-ESP32-LTE-M/build/partition_table/partition-table.bin
+
+  ch32x:
+    name: CH32X035 (WCH riscv-none-embed-gcc 8.2)
+    runs-on: ubuntu-latest
+    env:
+      # WCH's GCC fork is required (-march=rv32imacxw + WCH-Interrupt-fast).
+      # Official source is file.mounriver.com; CI pulls the GitHub mirror
+      # release of the same tarball for reliability.
+      TOOLCHAIN_URL: https://github.com/ch32-riscv-ug/MounRiver_Studio_Community_miror/releases/download/1.92-toolchain/MRS_Toolchain_Linux_x64_V1.92.tar.xz
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        id: toolchain-cache
+        with:
+          path: ~/wch-toolchain
+          key: mrs-toolchain-linux-x64-v1.92
+      - name: Download WCH toolchain
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/wch-toolchain"
+          curl -fsSL "$TOOLCHAIN_URL" -o /tmp/mrs-toolchain.tar.xz
+          tar -xJf /tmp/mrs-toolchain.tar.xz -C "$HOME/wch-toolchain" --strip-components=1
+      - name: Add toolchain to PATH
+        run: |
+          GCC_PATH=$(find "$HOME/wch-toolchain" -name riscv-none-embed-gcc -type f | head -1)
+          test -n "$GCC_PATH" || { echo "riscv-none-embed-gcc not found in toolchain tree"; find "$HOME/wch-toolchain" -maxdepth 2; exit 1; }
+          chmod +x "$(dirname "$GCC_PATH")"/* || true
+          dirname "$GCC_PATH" >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          riscv-none-embed-gcc --version | head -1
+          make -C firmware-ch32x -j"$(nproc)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ch32x-firmware
+          path: |
+            firmware-ch32x/build/USB-PD.hex
+            firmware-ch32x/build/USB-PD.elf
+            firmware-ch32x/build/USB-PD.map

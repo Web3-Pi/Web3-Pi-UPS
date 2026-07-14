@@ -1,5 +1,6 @@
-# Build output directory
+# Build output directories (obj/ = MRS2 IDE build, build/ = Makefile/CI build)
 obj/
+build/
 
 # OS generated files
 .DS_Store
