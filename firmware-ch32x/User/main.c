@@ -195,6 +195,12 @@ void VBUS_set_5V(void)
 static void Power_Output_Restart(void)
 {
 	VBUS_set_5V();
+	/* The sink saw VBUS drop and treats what follows as a fresh attach
+	 * with default roles — a data role swapped by DR_Swap in the previous
+	 * session (laptop-as-host) must not leak into the new negotiation:
+	 * SRC_CAP would advertise UFP and GoodCRC 0x41 to a partner that
+	 * just reset to defaults. */
+	PD_DataRole_Reset();
 	PD_Ctl.PD_State = STA_SINK_CONNECT;
 	PD_Ctl.PD_Comm_Timer = 0;
 	PD_Ctl.Src_Cap_Cnt = 0;
@@ -651,6 +657,110 @@ static void wups_send_log(uint8_t level, const char *text)
                     WUPS_FLAG_EVENT, Wups_Tx_Seq++, buf, (uint16_t)(4 + text_len));
 }
 
+#ifndef DIAG_FORCE_5V_5A_NO_PD
+/* Run the PD FSM with correct time accounting for multiple calls per
+ * loop iteration. PD_Main_Proc advances its timers by the global
+ * Tmr_Ms_Dlt; calling it several times with the loop-top delta would
+ * multiply-count time (the 159 ms attach dwell would fire ~4x early —
+ * a Pi-path regression). PD_Service keeps its own "last seen" ms stamp,
+ * feeds PD_Main_Proc exactly the real time elapsed since the previous
+ * PD_Service call, and restores Tmr_Ms_Dlt so the main-loop telemetry
+ * timers (which also consume it) are unaffected. */
+static void PD_Service(void)
+{
+    UINT8 saved = Tmr_Ms_Dlt;
+    static UINT8 last_ms = 0;
+    UINT8 now = Tim_Ms_Cnt;
+    Tmr_Ms_Dlt = (UINT8)(now - last_ms);
+    last_ms = now;
+    PD_Main_Proc();
+    Tmr_Ms_Dlt = saved;
+}
+#endif
+
+/* Drain the PD event trace ring (PD_Process.c) into system.log frames.
+ * At most ONE frame per >=4 ms tick: the RP2040 debug forwarder drops a
+ * 3rd back-to-back frame, and a negotiation burst (attach -> contract ->
+ * DR_Swap) queues 5+ events at once. The ring is 16 deep, so a burst
+ * drains within ~64 ms — fine for diagnostics (timestamps are 1 s
+ * resolution at the capture side anyway). Runs in main-loop context,
+ * same as the ring writers — no locking. */
+static uint16_t Pd_Evt_Timer_Ms = 0;
+static void PD_Evt_Drain(void)
+{
+    static uint8_t rd = 0;
+    if (rd == PD_Evt_W) return;
+    if (Pd_Evt_Timer_Ms < 4) return;
+    Pd_Evt_Timer_Ms = 0;
+
+    uint16_t e   = PD_Evt_Buf[rd & 0x0F]; rd++;
+    uint8_t code = e & 0x0F;
+    uint8_t arg  = (e >> 4) & 0x0F;
+    uint8_t ext  = (uint8_t)(e >> 8);
+    char buf[32];
+    const char *s = 0;
+    switch (code) {
+    case PD_EVT_CONNECT:     s = "PD: CC connect";        break;
+    case PD_EVT_SRC_CAP_TX:  s = "PD: SRC_CAP sent";      break;
+    case PD_EVT_REQ_RX: {
+        int p = 0;
+        const char *t = "PD: REQUEST pdo=";
+        while (*t) buf[p++] = *t++;
+        buf[p++] = (char)('0' + arg); buf[p] = 0;
+        s = buf;
+    } break;
+    case PD_EVT_ACCEPT_TX:   s = "PD: ACCEPT sent";       break;
+    case PD_EVT_PS_RDY_TX:   s = "PD: PS_RDY sent";       break;
+    case PD_EVT_VDM_RPI_TX:  s = "PD: VDM RPi-id sent";   break;
+    case PD_EVT_DRSWAP_RX:
+        s = (arg == 1) ? "PD: DR_Swap RX (dup)" :
+            (arg == 2) ? "PD: DR_Swap RX (busy->Wait)" :
+                         "PD: DR_Swap RX";
+        break;
+    case PD_EVT_DRSWAP_ACC:
+        s = arg ? "PD: DR_Swap ACC, now DFP" : "PD: DR_Swap ACC, now UFP";
+        break;
+    case PD_EVT_DRSWAP_FAIL: s = "PD: DR_Swap TXfail->HRST"; break;
+    case PD_EVT_SOFTRST_RX:  s = "PD: Soft_Reset RX";     break;
+    case PD_EVT_SOFTRST_TX:  s = "PD: Soft_Reset TX";     break;
+    case PD_EVT_HRST_TX:     s = "PD: HardReset TX";      break;
+    case PD_EVT_DISCONNECT:  s = "PD: disconnect";        break;
+    case PD_EVT_PROTO_REPLY:
+        if (arg == 2) {
+            /* "PD: NotSupp t=XX c|d" — raw 5-bit type in hex, then
+             * c=control / d=data message. This is the line that tells
+             * the bench exactly what the partner asked for. */
+            const char hex[] = "0123456789ABCDEF";
+            int p = 0;
+            const char *t = "PD: NotSupp t=";
+            while (*t) buf[p++] = *t++;
+            buf[p++] = hex[(ext >> 4) & 0x07];
+            buf[p++] = hex[ext & 0xF];
+            buf[p++] = ' ';
+            buf[p++] = (ext & 0x80) ? 'd' : 'c';
+            buf[p] = 0;
+            s = buf;
+        } else {
+            s = (arg == 1) ? "PD: VDM NAK sent" :
+                (arg == 3) ? "PD: GetSrcCap answered" :
+                (arg == 4) ? "PD: VCONN_Swap Reject" :
+                (arg == 5) ? "PD: UFP identity ACK sent" : "PD: reply?";
+        }
+        break;
+    case PD_EVT_ENTER_USB: {
+        int p = 0;
+        const char *t = arg ? "PD: Enter_USB mode=" : "PD: Enter_USB REJ mode=";
+        while (*t) buf[p++] = *t++;
+        buf[p++] = (char)('0' + (ext & 0x07));
+        if (arg) { buf[p++] = ' '; buf[p++] = 'A'; buf[p++] = 'C'; buf[p++] = 'C'; }
+        buf[p] = 0;
+        s = buf;
+    } break;
+    default: break;
+    }
+    if (s) wups_send_log(2, s);
+}
+
 /* system.hello broadcast — emitted once at boot. */
 static void wups_send_hello_bcast(void)
 {
@@ -1090,8 +1200,10 @@ int main(void)
             PD_Ctl.Det_Timer = 0;
             PD_Det_Proc( );
         }
-        PD_Main_Proc( );
+        PD_Service( );
 #endif
+        Pd_Evt_Timer_Ms += Tmr_Ms_Dlt;
+        PD_Evt_Drain();
 
         /* Periodic temperature reading from LM75B every 5s */
         Temp_Timer_Ms += Tmr_Ms_Dlt;
@@ -1149,6 +1261,16 @@ int main(void)
             }
 #endif
         }
+
+        /* Latency relief: the TPS block above costs a few ms of bit-bang
+         * I2C; when the 2 s/5 s timers align, one loop iteration exceeds
+         * tSenderResponse (~30 ms) and a PD reply (DR_Swap Accept, Request
+         * handling) misses its window. Servicing the PD FSM between the
+         * heavy blocks caps dispatch latency at a single block instead of
+         * their sum. Cheap when idle. */
+#ifndef DIAG_FORCE_5V_5A_NO_PD
+        PD_Service( );
+#endif
 
         /* Read MP2762A charger status every 2s + kick watchdog */
         Chg_Timer_Ms += Tmr_Ms_Dlt;
@@ -1220,6 +1342,12 @@ int main(void)
                 Husb_Caps.detected_mask = 0;
             }
         }
+
+        /* Latency relief after the charger/HUSB bit-bang block — see the
+         * note above the MP2762A block. */
+#ifndef DIAG_FORCE_5V_5A_NO_PD
+        PD_Service( );
+#endif
 
         /* Check battery insertion/removal every 500ms */
         Bat_Timer_Ms += Tmr_Ms_Dlt;
@@ -1379,6 +1507,13 @@ int main(void)
                 cbuf[cp] = 0;
                 wups_send_log(2 /* info */, cbuf);
             }
+
+            /* Latency relief after the 5 s diag burst (12 bit-bang reads
+             * + up to 2 blocking system.log frames) — see the note above
+             * the MP2762A block. */
+#ifndef DIAG_FORCE_5V_5A_NO_PD
+            PD_Service( );
+#endif
         }
 
         /* Periodic power.status push to RP2040 (1 Hz, EVENT flag). */
