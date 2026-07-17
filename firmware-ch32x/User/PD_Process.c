@@ -20,6 +20,16 @@
 *                          race; the old WCH STA_SRC_CONNECT branch was a
 *                          sink-style "wait for incoming SRC_CAP" leftover
 *                          that left TPS uninitialized in this scenario).
+*                        - DR_Swap Accept (data-role swap to UFP) so a
+*                          laptop attached to the output port can take the
+*                          USB host role and enumerate the RP2040 CDC while
+*                          being powered (dock-style behavior). PDO #1 has
+*                          advertised Dual-Role Data since day one; until
+*                          this change a DR_Swap got GoodCRC + dead air.
+*                        - Spec-complete Soft_Reset handling (MessageID
+*                          counter reset + SRC_CAP re-send after Accept);
+*                          previously the sink's only way out was a
+*                          SinkWaitCap timeout -> Hard Reset -> VBUS drop.
 *                      USB-C INPUT PD is owned entirely by HUSB238 (U150);
 *                      this firmware never acts as a sink, so dual-role and
 *                      SINK FSM from earlier forks have been removed.
@@ -58,6 +68,30 @@ __IO UINT8  Tmr_Ms_Dlt;                                                         
 PD_CONTROL PD_Ctl;                                                              /* PD Control Related Structures */
 UINT8  Adapter_SrcCap[ 30 ];                                                    /* Contents of the SrcCap message for the adapter */
 
+/* MessageID of the last DR_Swap we processed. A retransmitted DR_Swap
+ * (our GoodCRC lost on the wire) carries the same MessageID; processing
+ * it twice would toggle PD_Role back and desynchronize the data roles.
+ * 0xFF = none seen; reset wherever the spec resets MessageID counters
+ * (attach/detach via PD_PHY_Reset, Soft_Reset, Hard Reset). */
+static UINT8 DRSwap_Last_MsgID = 0xFF;
+
+/* PD event trace ring. printf on USART2 is invisible remotely (the
+ * RP2040 deframer discards non-WUPS bytes), so ms-scale PD events
+ * (DR_Swap, Soft_Reset, HRST) were unobservable on the bench — the
+ * 2026-07-17 Mac DR_Swap debugging went blind because of it. Writers
+ * here only record a byte (event | arg<<4); main.c drains the ring and
+ * emits system.log frames OUTSIDE the PD dispatch path, so tracing adds
+ * zero latency to tSenderResponse-critical replies. Main-loop context
+ * only (PD_Main_Proc / PD_Det_Proc) — no ISR writers, no locking needed.
+ * 16 deep; on overflow oldest entries are overwritten (diag only). */
+volatile UINT16 PD_Evt_Buf[ 16 ];
+volatile UINT8 PD_Evt_W = 0;
+static void PD_Evt( UINT16 code_arg )
+{
+    PD_Evt_Buf[ PD_Evt_W & 0x0F ] = code_arg;
+    PD_Evt_W++;
+}
+
 __IO UINT8  PDO_Len;
 
 /* SrcCap Table — v3 advertises four fixed PDOs so Pi5 (and any
@@ -70,7 +104,13 @@ __IO UINT8  PDO_Len;
  * format with dual-role + externally-powered flags set). */
 UINT8 SrcCap_5V5A_Tab[ 16 ] =
 {
-    0xF4, 0x91, 0x01, 0x0A,   /* 5V 5A   */
+    /* PDO#1 byte3 0x0E (was 0x0A): adds bit26 USB Communications Capable.
+     * The port genuinely carries USB data (RP2040 CDC on D+/D-), and a
+     * post-DR_Swap macOS host appears to gate its USB bring-up on this
+     * declaration — without it the device flashed for a fraction of a
+     * second and was torn down (bench 2026-07-17). Pi 5 regression run
+     * REQUIRED before this reaches production units (Tier B gate). */
+    0xF4, 0x91, 0x01, 0x0E,   /* 5V 5A   */
     0x2C, 0xD1, 0x02, 0x00,   /* 9V 3A   */
     0xE1, 0xC0, 0x03, 0x00,   /* 12V 2.25A */
     0xB4, 0xB0, 0x04, 0x00,   /* 15V 1.8A */
@@ -88,6 +128,27 @@ UINT8 VDM_RPI_TX_Tab[ 20 ] =
     0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x0f, 0x00,
     0x01, 0x00, 0x80, 0x20,
+};
+
+/* Discover Identity ACK sent when WE are UFP (post-DR_Swap, host asking).
+ * Honest identity — NOT the RPi-27W-PSU one (that is a DFP/source-side
+ * spoof for the Pi5 5A unlock). Five VDOs:
+ *   VDM hdr : SVID FF00, SVDM 2.0, ACK, cmd=Discover Identity
+ *   ID hdr  : USB Device Capable (bit30) + Product Type UFP=Peripheral
+ *             (bits29:27=010) + USB-C receptacle (bits22:21=10b) +
+ *             VID 0x2E8A (Raspberry Pi — matches the RP2040 CDC behind
+ *             this port). The bit30 declaration is what a host's policy
+ *             wants to see before bringing up USB data.
+ *   Cert    : XID 0
+ *   Product : PID/bcdDevice (cosmetic)
+ *   UFP VDO : USB2.0 device capability, highest speed USB2.0 */
+UINT8 VDM_UFP_ID_ACK_Tab[ 20 ] =
+{
+    0x41, 0xA0, 0x00, 0xFF,
+    0x8A, 0x2E, 0x40, 0x50,
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x0A, 0x00,
+    0x00, 0x00, 0x00, 0x21,
 };
 
 /* SrcCap Table */
@@ -134,7 +195,13 @@ void USBPD_IRQHandler(void)
                 if( ( USBPD->BMC_BYTE_CNT != 6 ) || ( ( PD_Rx_Buf[ 0 ] & 0x1F ) != DEF_TYPE_GOODCRC ) )
                 {
                     Delay_Us(30);                       /* Delay 30us, answer GoodCRC */
-                    PD_Ack_Buf[ 0 ] = 0x61;
+                    /* GoodCRC header byte0 carries our current Port Data
+                     * Role in bit5 — after a DR_Swap we are UFP (0x41),
+                     * before it DFP (0x61). Revision stays hardcoded 2.0
+                     * as upstream shipped it (Pi-proven; conscious quirk).
+                     * Single flag read, no printf — ISR rules per the
+                     * 2026-07-11 soak findings. */
+                    PD_Ack_Buf[ 0 ] = PD_Ctl.Flag.Bit.PD_Role ? 0x61 : 0x41;
                     PD_Ack_Buf[ 1 ] = ( PD_Rx_Buf[ 1 ] & 0x0E ) | PD_Ctl.Flag.Bit.Auto_Ack_PRRole;
                     USBPD->CONFIG |= IE_TX_END ;
                     PD_Phy_SendPack( 0, PD_Ack_Buf, 2, UPD_SOP0 );
@@ -215,6 +282,27 @@ void PD_SINK_Init( )
 }
 
 /*********************************************************************
+ * @fn      PD_DataRole_Reset
+ *
+ * @brief   Restore the default Port Data Role (DFP for a source) and
+ *          invalidate the DR_Swap dedup latch. For negotiation restarts
+ *          that bypass PD_PHY_Reset — Power_Output_Restart's VBUS cycle
+ *          (ups.power.cycle / enable-after-disable): the partner treats
+ *          the VBUS drop as a fresh attach with default roles, so a role
+ *          swapped in the previous session must not leak into the new
+ *          one. Flag word is shared with the ISR — guard the RMW.
+ *
+ * @return  none
+ */
+void PD_DataRole_Reset( void )
+{
+    NVIC_DisableIRQ( USBPD_IRQn );
+    PD_Ctl.Flag.Bit.PD_Role = 1;
+    NVIC_EnableIRQ( USBPD_IRQn );
+    DRSwap_Last_MsgID = 0xFF;
+}
+
+/*********************************************************************
  * @fn      PD_PHY_Reset
  *
  * @brief   This function uses to reset PD PHY.
@@ -232,6 +320,7 @@ void PD_PHY_Reset( void )
     PD_Ctl.PD_BusIdle_Timer = 0;
     PD_Ctl.Mode_Try_Cnt = 0x80;
     PD_Ctl.Flag.Bit.PD_Role = 1;
+    DRSwap_Last_MsgID = 0xFF;
     PD_Ctl.Flag.Bit.Stop_Det_Chk = 0;
     PD_Ctl.PD_State = STA_IDLE;
     PD_Ctl.Flag.Bit.PD_Comm_Succ = 0;
@@ -496,6 +585,7 @@ void PD_Det_Proc( void )
                  * Skipping VBUS_set_5V is the cold-boot bug we shipped
                  * before this refactor — see commit history. */
                 PD_Ctl.PD_State = STA_SINK_CONNECT;
+                PD_Evt( PD_EVT_CONNECT );
                 printf("CC%d Connect (CC_PD=%lu)\r\n", status,
                        (unsigned long)(((USBPD->PORT_CC1 & CC_PD) ||
                                         (USBPD->PORT_CC2 & CC_PD)) ? 1 : 0));
@@ -730,6 +820,7 @@ void PD_Main_Proc( )
     switch( PD_Ctl.PD_State )
     {
         case STA_DISCONNECT:
+            PD_Evt( PD_EVT_DISCONNECT );
             printf("Disconnect\r\n");
             /* Sink detached (CC open for >=5 detect ticks). Return VBUS_OUT
              * to vSafe0V *before* anything else: clears the TPS55289 output
@@ -794,6 +885,7 @@ void PD_Main_Proc( )
                 if( status == DEF_PD_TX_OK )
                 {
                     PD_Ctl.PD_State = STA_RX_REQ_WAIT;
+                    PD_Evt( PD_EVT_SRC_CAP_TX );
                     printf("Send Source Cap Successfully\r\n");
                 }
                 PD_Ctl.PD_Comm_Timer = 0;
@@ -804,7 +896,18 @@ void PD_Main_Proc( )
             PD_Ctl.PD_Comm_Timer += Tmr_Ms_Dlt;
             if( PD_Ctl.PD_Comm_Timer > 29 )
             {
-                PD_Ctl.PD_State = STA_TX_HRST;
+                /* Don't fire the timeout when a received message already
+                 * sits in the buffer awaiting dispatch: a single main-loop
+                 * iteration with the 2 s/5 s telemetry blocks can exceed
+                 * 29 ms, and this switch runs BEFORE the RX dispatch — so
+                 * a Request that arrived in time would get pre-empted by
+                 * our own latency. HRSTing then is doubly harmful since
+                 * the HRST path resets the data role and tears down a
+                 * just-established DR_Swap session. */
+                if( PD_Ctl.Flag.Bit.Msg_Recvd == 0 )
+                {
+                    PD_Ctl.PD_State = STA_TX_HRST;
+                }
             }
             break;
 
@@ -816,6 +919,7 @@ void PD_Main_Proc( )
                 status = PD_Send_Handle( NULL, 0 );
                 if( status == DEF_PD_TX_OK )
                 {
+                    PD_Evt( PD_EVT_ACCEPT_TX );
                     printf("Accept\r\n");
                     /* Reconfigure TPS55289 to match the PDO the sink
                      * asked for. ReqPDO_Idx is 1..4 per our SrcCap;
@@ -860,6 +964,7 @@ void PD_Main_Proc( )
                 status = PD_Send_Handle( NULL, 0 );
                 if( status == DEF_PD_TX_OK )
                 {
+                    PD_Evt( PD_EVT_PS_RDY_TX );
                     printf("PS ready\r\n");
                     PD_Ctl.PD_State = STA_IDLE;
                     PD_Ctl.PD_Comm_Timer = 0;
@@ -874,6 +979,10 @@ void PD_Main_Proc( )
 
         case STA_TX_SOFTRST:
             /* Send soft reset, if sent successfully, mode unchanged, count +1 for retry */
+            /* Soft_Reset restarts the partner's MessageID counter, so a
+             * DR_Swap MessageID latched before it is meaningless after. */
+            DRSwap_Last_MsgID = 0xFF;
+            PD_Evt( PD_EVT_SOFTRST_TX );
             PD_Load_Header( 0x00, DEF_TYPE_SOFT_RESET );
             status = PD_Send_Handle( NULL, 0 );
             if( status == DEF_PD_TX_OK )
@@ -897,9 +1006,16 @@ void PD_Main_Proc( )
              * the STALE PD_Rx_Buf right after the Hard Reset, overriding
              * the STA_IDLE recovery state. */
             PD_Ctl.Flag.Bit.Stop_Det_Chk = 1;
+            PD_Evt( PD_EVT_HRST_TX );
             NVIC_DisableIRQ( USBPD_IRQn );
             PD_Phy_SendPack( 0x01, NULL, 0, UPD_HARD_RESET );                   /* send HRST */
             PD_Ctl.Flag.Bit.Msg_Recvd = 0;                                      /* drop any stale RX */
+            /* Hard Reset returns the port to its default data role (DFP
+             * for a source) and resets the MessageID counters — matters
+             * only if a DR_Swap happened earlier in this session; both
+             * writes sit inside the IRQ-off window above. */
+            PD_Ctl.Flag.Bit.PD_Role = 1;
+            DRSwap_Last_MsgID = 0xFF;
             PD_Rx_Mode( );                                                      /* switch to rx mode (re-enables IRQ) */
             PD_Ctl.PD_State = STA_IDLE;
             PD_Ctl.PD_Comm_Timer = 0;
@@ -914,6 +1030,7 @@ void PD_Main_Proc( )
             {
                 PD_Load_Header( 0x00, DEF_TYPE_VENDOR_DEFINED );
                 (void)PD_Send_Handle(VDM_RPI_TX_Tab, 20);
+                PD_Evt( PD_EVT_VDM_RPI_TX );
                 PD_Ctl.PD_Comm_Timer = 0;
                 PD_Ctl.PD_State = STA_IDLE;
             }
@@ -929,6 +1046,15 @@ void PD_Main_Proc( )
         /* Adapter communication idle timing */
         PD_Ctl.Adapter_Idle_Cnt = 0x00;
         pd_header = PD_Rx_Buf[ 0 ] & 0x1F;
+        /* Any dispatched non-DR_Swap message proves the DR_Swap dedup
+         * latch stale: a true retransmission arrives back-to-back before
+         * anything else gets processed, while the 3-bit MessageID space
+         * wraps and would otherwise alias a fresh swap-back into
+         * "duplicate" forever (~1-in-8 swap-backs swallowed). */
+        if( pd_header != DEF_TYPE_DR_SWAP )
+        {
+            DRSwap_Last_MsgID = 0xFF;
+        }
         switch( pd_header )
         {
             case DEF_TYPE_ACCEPT:
@@ -944,6 +1070,7 @@ void PD_Main_Proc( )
                 printf("Handle Request\r\n");
                 Delay_Ms( 2 );
                 PD_Ctl.ReqPDO_Idx =  ( PD_Rx_Buf[ 5 ] & 0x70 ) >> 4;
+                PD_Evt( PD_EVT_REQ_RX | (UINT8)( PD_Ctl.ReqPDO_Idx << 4 ) );
                 printf("  Request:\r\n  PDO_Idx:%d\r\n",PD_Ctl.ReqPDO_Idx);
                 /* v3 advertises 4 PDOs (see SrcCap_5V5A_Tab). Reject
                  * anything outside that range — upstream allowed up to
@@ -979,26 +1106,231 @@ void PD_Main_Proc( )
                 break;
 
             case DEF_TYPE_SOFT_RESET:
+                /* Spec-complete Soft_Reset (PD3.0 §6.3.13/§6.7.1): reset
+                 * the MessageID counter BEFORE loading the Accept header
+                 * (the Accept itself must carry MessageID 0), then re-send
+                 * Source_Capabilities via STA_TX_SRC_CAP. Previously we
+                 * Accepted and went silent — the sink's only recovery was
+                 * a SinkWaitCap timeout -> Hard Reset -> full VBUS drop.
+                 * The 160 ms STA_TX_SRC_CAP lead-in sits comfortably inside
+                 * the sink's tTypeCSinkWaitCap window (min 310 ms). */
+                PD_Ctl.Msg_ID = 0;
+                DRSwap_Last_MsgID = 0xFF;
+                PD_Evt( PD_EVT_SOFTRST_RX );
                 Delay_Ms( 1 );
                 PD_Load_Header( 0x00, DEF_TYPE_ACCEPT );
                 PD_Send_Handle( NULL, 0 );
+                PD_Ctl.PD_State = STA_TX_SRC_CAP;
+                PD_Ctl.PD_Comm_Timer = 0;
+                break;
+
+            case DEF_TYPE_DR_SWAP:
+                /* Data Role Swap request. Control message only: type 0x09
+                 * with NumDO!=0 is PD3.1 EPR_REQUEST — not for us. */
+                if( ( PD_Rx_Buf[ 1 ] & 0x70 ) == 0x00 )
+                {
+                    if( PD_Ctl.PD_State == STA_IDLE )
+                    {
+                        /* Same MessageID as the last processed DR_Swap =
+                         * retransmission (our GoodCRC was lost); the ISR
+                         * has re-acked it, do not toggle the role again. */
+                        UINT8 rx_msgid = ( PD_Rx_Buf[ 1 ] >> 1 ) & 0x07;
+                        if( DRSwap_Last_MsgID != rx_msgid )
+                        {
+                            PD_Evt( PD_EVT_DRSWAP_RX );
+                            /* printf BEFORE the Accept, not after: post-
+                             * Accept the partner's next message can arrive
+                             * within ms, and every us of straight-line code
+                             * before the dispatch tail's PD_Rx_Mode widens
+                             * the GoodCRC'd-then-dropped window. Here the
+                             * IRQ is still off (no RX possible) and the
+                             * ~0.4 ms is peanuts vs tSenderResponse. */
+                            printf("DR_Swap: Accepting\r\n");
+                            Delay_Ms( 1 );
+                            PD_Load_Header( 0x00, DEF_TYPE_ACCEPT );
+                            if( PD_Send_Handle( NULL, 0 ) == DEF_PD_TX_OK )
+                            {
+                                DRSwap_Last_MsgID = rx_msgid;
+                                /* Roles change once the Accept is GoodCRC'd.
+                                 * Toggle (not force-0): a second DR_Swap
+                                 * legally swaps back. Flag word is shared
+                                 * with the ISR (Msg_Recvd) and PD_Send_Handle
+                                 * re-enabled the IRQ, so guard the RMW. */
+                                NVIC_DisableIRQ( USBPD_IRQn );
+                                PD_Ctl.Flag.Bit.PD_Role ^= 1;
+                                NVIC_EnableIRQ( USBPD_IRQn );
+                                PD_Evt( PD_EVT_DRSWAP_ACC |
+                                        (UINT8)( PD_Ctl.Flag.Bit.PD_Role << 4 ) );
+                            }
+                            else
+                            {
+                                PD_Evt( PD_EVT_DRSWAP_FAIL );
+                                /* Accept may have been DELIVERED with all
+                                 * three GoodCRCs back to us lost — partner
+                                 * swapped, we did not. Ambiguous roles are
+                                 * worse than a reset: Hard Reset restores
+                                 * default data roles on both ends (and our
+                                 * STA_TX_HRST now re-arms PD_Role/latch). */
+                                PD_Ctl.PD_State = STA_TX_HRST;
+                            }
+                        }
+                        else
+                        {
+                            PD_Evt( PD_EVT_DRSWAP_RX | ( 1 << 4 ) );    /* dup-skip */
+                        }
+                    }
+                    else
+                    {
+                        /* Mid-negotiation — tell the partner to retry
+                         * instead of the old GoodCRC-then-silence, which
+                         * is a protocol error that invites Soft_Reset. */
+                        PD_Evt( PD_EVT_DRSWAP_RX | ( 2 << 4 ) );        /* busy -> Wait */
+                        Delay_Ms( 1 );
+                        PD_Load_Header( 0x00, DEF_TYPE_WAIT );
+                        PD_Send_Handle( NULL, 0 );
+                    }
+                }
                 break;
 
             case DEF_TYPE_VENDOR_DEFINED:
                 /* Pi5 sends a VDM discovery 0xFF, 0xA0, 0x00, 0x01 over
                  * PD. Match that exact prefix in the VDM header bytes
                  * and queue the canned VDM reply (STA_TX_VDM_RPI).
-                 * Other VDM senders are ignored (we just print a note). */
-                if((PD_Rx_Buf[2] == 0x01) && (PD_Rx_Buf[3] == 0xA0) &&
+                 * Other VDM senders are ignored (we just print a note).
+                 * Gated on PD_Role: a post-DR_Swap host (Mac/PC as DFP)
+                 * sends a byte-identical SVDM-2.0 Discover Identity and
+                 * must NOT be told we are a Raspberry Pi 27W PSU
+                 * (VID 0x2E8A) — the Pi path always queries while we
+                 * are still DFP, so it is unaffected. */
+                if((PD_Ctl.Flag.Bit.PD_Role == 1) &&
+                   (PD_Rx_Buf[2] == 0x01) && (PD_Rx_Buf[3] == 0xA0) &&
                    (PD_Rx_Buf[4] == 0x00) && (PD_Rx_Buf[5] == 0xFF))
                 {
                     PD_Ctl.PD_State = STA_TX_VDM_RPI;
                     PD_Ctl.PD_Comm_Timer = 0;
                 }
+                else if( ( PD_Ctl.Flag.Bit.PD_Role == 0 ) &&
+                         ( ( PD_Rx_Buf[ 3 ] & 0x80 ) == 0x80 ) &&
+                         ( ( PD_Rx_Buf[ 2 ] & 0xC0 ) == 0x00 ) )
+                {
+                    /* We are UFP (post-DR_Swap) and this is a Structured
+                     * VDM REQuest (initiator, cmd-type=00). PD3.0 requires
+                     * a UFP to answer Discover Identity/SVIDs/Modes with
+                     * ACK or NAK — GoodCRC-then-silence is a protocol
+                     * error that sends macOS into a Soft_Reset -> re-swap
+                     * loop (bench 2026-07-17, first flapping session).
+                     * Discover Identity gets the honest UFP ACK — the
+                     * "USB Device Capable" bit in it is host-policy food;
+                     * a NAK here left macOS assuming no USB data and it
+                     * tore the port down right after electrical attach.
+                     * Everything else (Discover SVIDs/Modes — we have no
+                     * alternate modes) gets a NAK echo. */
+                    if( ( PD_Rx_Buf[ 2 ] & 0x1F ) == 0x01 )
+                    {
+                        Delay_Ms( 1 );
+                        PD_Load_Header( 0x00, DEF_TYPE_VENDOR_DEFINED );
+                        PD_Send_Handle( VDM_UFP_ID_ACK_Tab, 20 );
+                        PD_Evt( PD_EVT_PROTO_REPLY | ( 5 << 4 ) );      /* UFP ID ACK */
+                    }
+                    else
+                    {
+                        UINT8 vdm_nak[ 4 ];
+                        vdm_nak[ 0 ] = ( PD_Rx_Buf[ 2 ] & 0x1F ) | 0x80;    /* same command, cmd-type=NAK */
+                        vdm_nak[ 1 ] = PD_Rx_Buf[ 3 ];                      /* same SVDM version/obj-pos */
+                        vdm_nak[ 2 ] = PD_Rx_Buf[ 4 ];                      /* same SVID */
+                        vdm_nak[ 3 ] = PD_Rx_Buf[ 5 ];
+                        Delay_Ms( 1 );
+                        PD_Load_Header( 0x00, DEF_TYPE_VENDOR_DEFINED );
+                        PD_Send_Handle( vdm_nak, 4 );
+                        PD_Evt( PD_EVT_PROTO_REPLY | ( 1 << 4 ) );          /* VDM NAK */
+                    }
+                }
                 printf("VDM Command\r\n");
                 break;
 
+            case DEF_TYPE_GET_SRC_CAP:
+                /* Answer inline: the STA_TX_SRC_CAP state has a 160 ms
+                 * lead-in dwell (attach pacing), far beyond tSenderResponse
+                 * (~30 ms) — routing through it would time the asker out. */
+                Delay_Ms( 1 );
+                PD_Load_Header( 0x00, DEF_TYPE_SRC_CAP );
+                PD_Send_Handle( SrcCap_5V5A_Tab, 16 );
+                PD_Evt( PD_EVT_PROTO_REPLY | ( 3 << 4 ) );              /* GetSrcCap answered */
+                break;
+
+            case DEF_TYPE_GET_SNK_CAP:
+                /* Type 0x08 is TWO different messages: control Get_Sink_Cap
+                 * and PD3.1 DATA message Enter_USB (1 EUDO). */
+                if( ( PD_Rx_Buf[ 1 ] & 0x70 ) != 0x00 )
+                {
+                    /* Enter_USB: the post-DR_Swap DFP (Mac) asks to
+                     * establish the USB data path. EUDO bits 30:28 =
+                     * USB mode: 0=USB2, 1=USB3.2, 2=USB4. The RP2040 CDC
+                     * behind our D+/D- is USB2-only: Accept USB2, Reject
+                     * higher modes. Not_Supported here told macOS "no USB
+                     * data at all" and it kept the host path disabled —
+                     * observed 2026-07-17 as "device never appears". */
+                    UINT8 usb_mode = ( PD_Rx_Buf[ 5 ] >> 4 ) & 0x07;
+                    Delay_Ms( 1 );
+                    if( usb_mode == 0 )
+                    {
+                        PD_Load_Header( 0x00, DEF_TYPE_ACCEPT );
+                        PD_Send_Handle( NULL, 0 );
+                        PD_Evt( PD_EVT_ENTER_USB | ( 1 << 4 ) |
+                                ( (UINT16)usb_mode << 8 ) );
+                    }
+                    else
+                    {
+                        PD_Load_Header( 0x00, DEF_TYPE_REJECT );
+                        PD_Send_Handle( NULL, 0 );
+                        PD_Evt( PD_EVT_ENTER_USB | ( 0 << 4 ) |
+                                ( (UINT16)usb_mode << 8 ) );
+                    }
+                }
+                else
+                {
+                    /* Get_Sink_Cap: source-only port, no sink capability. */
+                    Delay_Ms( 1 );
+                    PD_Load_Header( 0x00, PD_Ctl.Flag.Bit.PD_Version ?
+                                    DEF_TYPE_NOT_SUPPORT : DEF_TYPE_REJECT );
+                    PD_Send_Handle( NULL, 0 );
+                    PD_Evt( PD_EVT_PROTO_REPLY | ( 2 << 4 ) |
+                            ( (UINT16)DEF_TYPE_GET_SNK_CAP << 8 ) );
+                }
+                break;
+
+            case DEF_TYPE_VCONN_SWAP:
+                /* This board never sources VCONN (no e-marker support,
+                 * zero VCONN circuitry) — Reject is the honest answer;
+                 * silence would be a PD3 protocol error. */
+                Delay_Ms( 1 );
+                PD_Load_Header( 0x00, DEF_TYPE_REJECT );
+                PD_Send_Handle( NULL, 0 );
+                PD_Evt( PD_EVT_PROTO_REPLY | ( 4 << 4 ) );              /* VCONN Reject */
+                break;
+
             default:
+                /* PD3.0 requires Not_Supported for recognized-but-
+                 * unsupported and unrecognized messages; GoodCRC-then-
+                 * silence makes a strict partner (macOS post-DR_Swap)
+                 * escalate: tSenderResponse timeout -> Soft_Reset ->
+                 * renegotiate -> re-swap -> ... an endless data-role
+                 * ping-pong with the power contract staying up (bench
+                 * 2026-07-17). Under PD2.0 ignoring stays legal and is
+                 * the shipped Pi-proven behavior, so gate on the
+                 * negotiated revision. */
+                if( PD_Ctl.Flag.Bit.PD_Version )
+                {
+                    Delay_Ms( 1 );
+                    PD_Load_Header( 0x00, DEF_TYPE_NOT_SUPPORT );
+                    PD_Send_Handle( NULL, 0 );
+                    /* ext byte: raw 5-bit type, bit7 set when it was a
+                     * DATA message — tells the bench WHAT the partner
+                     * asked for that we don't handle. */
+                    PD_Evt( PD_EVT_PROTO_REPLY | ( 2 << 4 ) |
+                            ( (UINT16)( ( PD_Rx_Buf[ 0 ] & 0x1F ) |
+                              ( ( PD_Rx_Buf[ 1 ] & 0x70 ) ? 0x80 : 0x00 ) ) << 8 ) );
+                }
                 printf("Unsupported Command\r\n");
                 break;
         }

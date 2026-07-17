@@ -36,6 +36,29 @@
 
 
 /******************************************************************************/
+/* PD event trace ring (see PD_Process.c). Byte layout: low nibble = event
+ * code, high nibble = argument. Drained by main.c into system.log frames. */
+#define PD_EVT_CONNECT       0x01                    /* CC attach -> STA_SINK_CONNECT */
+#define PD_EVT_SRC_CAP_TX    0x02                    /* Source_Capabilities sent OK */
+#define PD_EVT_REQ_RX        0x03                    /* arg = requested PDO index */
+#define PD_EVT_ACCEPT_TX     0x04                    /* contract Accept sent OK */
+#define PD_EVT_PS_RDY_TX     0x05                    /* PS_RDY sent OK */
+#define PD_EVT_VDM_RPI_TX    0x06                    /* RPi 27W identity VDM sent */
+#define PD_EVT_DRSWAP_RX     0x07                    /* arg: 0=processing 1=dup-skip 2=busy-Wait */
+#define PD_EVT_DRSWAP_ACC    0x08                    /* Accept OK; arg = new PD_Role (0=UFP) */
+#define PD_EVT_DRSWAP_FAIL   0x09                    /* Accept TX fail -> HRST */
+#define PD_EVT_SOFTRST_RX    0x0A                    /* Soft_Reset received */
+#define PD_EVT_SOFTRST_TX    0x0B                    /* Soft_Reset sent by us */
+#define PD_EVT_HRST_TX       0x0C                    /* Hard Reset sent by us */
+#define PD_EVT_DISCONNECT    0x0D                    /* STA_DISCONNECT (detach) */
+#define PD_EVT_PROTO_REPLY   0x0E                    /* arg: 1=VDM-NAK 2=Not_Supported 3=GetSrcCap-answered 4=VCONN-Reject; ext byte = raw msg type (|0x80 when data msg) */
+#define PD_EVT_ENTER_USB     0x0F                    /* arg: 1=Accepted 0=Rejected; ext byte = requested USB mode */
+
+/* Entry layout: [3:0] code, [7:4] small arg, [15:8] extended arg byte. */
+extern volatile UINT16 PD_Evt_Buf[ 16 ];
+extern volatile UINT8 PD_Evt_W;
+
+/******************************************************************************/
 /* Variable extents */
 extern __IO UINT8  Tmr_Ms_Cnt_Last;
 extern __IO UINT8  Tmr_Ms_Dlt;
@@ -57,6 +80,7 @@ extern void PD_Rx_Mode( void );
 extern void PD_SRC_Init( void );
 extern void PD_SINK_Init( void );
 extern void PD_PHY_Reset( void );
+extern void PD_DataRole_Reset( void );
 extern void PD_Init( void );
 extern UINT8 PD_Detect( void );
 extern void PD_Det_Proc( void );
