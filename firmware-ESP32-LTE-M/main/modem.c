@@ -26,6 +26,8 @@
 #include "esp_netif.h"
 #include "esp_netif_defaults.h"
 #include "esp_netif_ppp.h"
+#include "esp_netif_net_stack.h" /* esp_netif_get_netif_impl */
+#include "lwip/netif.h"          /* mib2_counters for net.status byte counts */
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -286,7 +288,18 @@ static void emit_net_status(uint8_t state, int8_t rssi_dbm,
     if (s_ppp_netif && esp_netif_get_ip_info(s_ppp_netif, &ip) == ESP_OK) {
         st.ip_addr = ip.ip.addr;            /* already network byte order */
     }
-    /* errors / bytes_tx / bytes_rx left 0 — not tracked on this side. */
+#if MIB2_STATS
+    /* Per-netif octet counters maintained by lwIP PPP (ifinoctets in ppp.c,
+     * ifoutoctets in pppos.c) — cumulative for the lifetime of the esp_netif,
+     * i.e. since boot, surviving PPP re-dials. TX includes PPP/HDLC framing. */
+    struct netif *lwip_netif =
+        s_ppp_netif ? (struct netif *)esp_netif_get_netif_impl(s_ppp_netif) : NULL;
+    if (lwip_netif) {
+        st.bytes_tx = lwip_netif->mib2_counters.ifoutoctets;
+        st.bytes_rx = lwip_netif->mib2_counters.ifinoctets;
+    }
+#endif
+    /* errors left 0 — not tracked on this side. */
 
     uint8_t frame[WUPS_FRAMING_BYTES + sizeof(st)];
     uint16_t flen = wups_link_render_frame(frame, sizeof(frame),

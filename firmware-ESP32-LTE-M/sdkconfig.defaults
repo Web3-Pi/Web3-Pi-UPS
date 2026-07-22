@@ -41,3 +41,8 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 #     10 min. The outbox is additionally size-bounded in code (32 KB). ---
 CONFIG_MQTT_USE_CUSTOM_CONFIG=y
 CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS=600000
+
+# --- net.status byte counters: lwIP statistics must be on so opt.h doesn't
+#     force-define MIB2_STATS 0 (the MIB2_STATS=1 itself comes from a global
+#     compile option in CMakeLists.txt — it changes struct netif layout). ---
+CONFIG_LWIP_STATS=y
