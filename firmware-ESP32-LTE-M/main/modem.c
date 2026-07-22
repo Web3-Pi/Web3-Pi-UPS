@@ -90,6 +90,16 @@
  * PWRKEY "again" powers the freshly booting modem straight back off (seen
  * on bench 2026-07-22). */
 #define MODEM_BOOT_PROBE_MS      25000
+
+/* How long a booted modem gets to register to the network (CEREG/CGREG)
+ * before the bring-up round is failed. Cat-M network search after a cold
+ * boot routinely runs tens of seconds. */
+#define MODEM_REG_WAIT_MS        90000
+
+/* While bring-up keeps failing on registration timeout, power-cycle only
+ * after this many consecutive timeouts (instead of the fast 2/5 threshold):
+ * each cycle restarts the search from scratch. */
+#define REG_TIMEOUT_PWRCYCLE_EVERY   5
 /* After the off-pulse, let the modem finish its power-down sequence
  * (Toff ~1.8 s per HW design) before pulsing it back on. */
 #define MODEM_PWROFF_SETTLE_MS   5000
@@ -662,22 +672,30 @@ static void run_http_get_test(void)
 
 /* --- DCE bring-up / teardown -------------------------------------------- */
 
-/* True when the modem reports EPS/GPRS registration (home or roaming) — i.e.
- * the ATD*99# dial inside the mode switch can be expected to succeed.
- * "+CEREG: <n>,<stat>": stat 1 = registered home, 5 = registered roaming. */
-static bool modem_is_registered(void)
+/* EPS/GPRS registration status — "+CEREG: <n>,<stat>": 1 = registered home,
+ * 5 = registered roaming, 2 = searching, 3 = denied, 0 = idle; -1 = no
+ * parsable answer. Registration means the ATD*99# dial inside the mode
+ * switch can be expected to succeed. */
+static int modem_reg_stat(void)
 {
     static const char *cmds[] = { "AT+CEREG?", "AT+CGREG?" };
+    int stat = -1;
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         char out[128] = {0};   /* >= CONFIG_ESP_MODEM_C_API_STR_MAX */
         if (esp_modem_at(s_dce, cmds[i], out, 3000) != ESP_OK) continue;
         const char *comma = strchr(out, ',');
         if (!comma) continue;
-        int stat = atoi(comma + 1);
-        if (stat == 1 || stat == 5) return true;
+        stat = atoi(comma + 1);
+        if (stat == 1 || stat == 5) return stat;
     }
-    return false;
+    return stat;
 }
+
+/* Consecutive bring-up failures caused by a registration timeout — used to
+ * exempt them from the fast power-cycle threshold (a PWRKEY cycle restarts
+ * the modem's network search from scratch, so cycling every 2 failures
+ * mid-search loops forever; seen on bench 2026-07-22). */
+static int s_reg_timeout_streak = 0;
 
 /* Create the DCE, sync at AT level, log identity, and switch to data (PPP)
  * mode. On success the DCE is owned by `s_dce` and the PPP layer is racing
@@ -863,13 +881,39 @@ static esp_err_t ppp_bringup_dce(void)
         /* The CMUX transition ends in the ATD*99# dial, which fails whenever
          * the modem isn't network-registered — a routine LTE outage, not a
          * CMUX defect. Gate on registration so only failures of a registered
-         * modem count toward the DATA fallback; an unregistered one is just
-         * a normal MODEM_FAIL_NET bring-up failure (backoff + retry). */
-        if (!modem_is_registered()) {
-            ESP_LOGW(MODEM_TAG, "not network-registered (CEREG/CGREG) — "
-                                "failing bring-up before the mode switch");
-            s_fail_stage = MODEM_FAIL_NET;
-            return ESP_FAIL;
+         * modem count toward the DATA fallback. Crucially: WAIT for it. A
+         * freshly booted modem needs tens of seconds of UNINTERRUPTED Cat-M
+         * network search; failing fast here fed the 2-fail power-cycle,
+         * which restarted the search every ~45 s and looped forever
+         * (bench 2026-07-22). */
+        {
+            const int64_t reg_deadline =
+                esp_timer_get_time() + (int64_t)MODEM_REG_WAIT_MS * 1000;
+            int stat = -1, poll = 0;
+            bool registered = false;
+            for (;;) {
+                stat = modem_reg_stat();
+                registered = (stat == 1 || stat == 5);
+                if (registered || esp_timer_get_time() >= reg_deadline) break;
+                if ((poll++ % 3) == 0) {
+                    int csq = 99, ber = 99;
+                    (void)esp_modem_get_signal_quality(s_dce, &csq, &ber);
+                    ESP_LOGI(MODEM_TAG,
+                             "waiting for network registration (stat=%d rssi=%d)...",
+                             stat, csq);
+                }
+                vTaskDelay(pdMS_TO_TICKS(3000));
+            }
+            if (!registered) {
+                ESP_LOGW(MODEM_TAG, "no network registration within %d s "
+                                    "(last stat=%d) — failing bring-up before "
+                                    "the mode switch",
+                         MODEM_REG_WAIT_MS / 1000, stat);
+                s_fail_stage = MODEM_FAIL_NET;
+                s_reg_timeout_streak++;
+                return ESP_FAIL;
+            }
+            s_reg_timeout_streak = 0;
         }
         ESP_LOGI(MODEM_TAG, "switching modem to CMUX mode (PPP + AT channel)...");
         err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_CMUX);
@@ -1282,6 +1326,13 @@ static void ppp_supervisor_task(void *arg)
          * cycles make recovery-after-fix fast (~a minute) instead of waiting
          * out the full backoff. */
         int pwrcycle_thresh = s_alert_active ? 2 : PPP_FAILS_BEFORE_PWRCYCLE;
+        if (s_reg_timeout_streak > 0) {
+            /* Failing on registration timeout: a power-cycle would restart
+             * the modem's network search from scratch, so it is almost
+             * always counterproductive — keep it only as a rare last resort
+             * against a wedged radio stack. */
+            pwrcycle_thresh = REG_TIMEOUT_PWRCYCLE_EVERY;
+        }
         if (consecutive_fails >= pwrcycle_thresh) {
             ESP_LOGW(MODEM_TAG,
                      "%d bring-up failures — power-cycling modem",
@@ -1290,6 +1341,7 @@ static void ppp_supervisor_task(void *arg)
              * whatever state it wedged in (incl. boot delays). */
             modem_power_cycle(false);
             consecutive_fails = 0;
+            s_reg_timeout_streak = 0;   /* fresh boot = fresh search budget */
         }
 
         /* Surface / re-assert the visible alert once we've failed enough
