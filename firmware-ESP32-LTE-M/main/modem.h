@@ -21,8 +21,10 @@
 
 esp_err_t modem_init(void);
 
-/* Pulse PWRKEY for ~1 second to power the modem on. After return, give the
- * modem ~7 seconds to finish booting before sending AT commands. */
+/* Pulse PWRKEY for ~1.3 s to power the modem on. The hold satisfies both the
+ * SIM7080G power-ON (>= 1.0 s) and power-OFF (>= 1.2 s) specs, so the same
+ * pulse powers a RUNNING modem off (PWRKEY is a toggle). After return, give
+ * the modem ~7 seconds to finish booting before sending AT commands. */
 esp_err_t modem_power_on(void);
 
 /* Ensure the modem is powered on WITHOUT toggling an already-running one.

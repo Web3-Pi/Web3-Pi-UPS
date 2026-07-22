@@ -1,6 +1,8 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -30,6 +32,16 @@ esp_err_t mqtt_client_start(void);
  */
 int mqtt_publish_raw(const char *topic, const void *payload, size_t payload_len,
                      int qos, int retain);
+
+/*
+ * Uplink-health accessors for the modem's post-PPP watchdog (modem.c).
+ * mqtt_is_connected() mirrors MQTT_EVENT_CONNECTED/DISCONNECTED;
+ * mqtt_last_connected_s() is the esp_timer second the last CONNECTED
+ * landed (0 = never this boot). Both are lock-free single-word reads,
+ * safe from any task.
+ */
+bool mqtt_is_connected(void);
+uint32_t mqtt_last_connected_s(void);
 
 /*
  * Callback type for incoming MQTT messages. Topic and payload pointers

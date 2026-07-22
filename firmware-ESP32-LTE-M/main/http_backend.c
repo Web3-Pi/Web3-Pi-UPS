@@ -77,6 +77,20 @@ static char   s_resp[HTTP_RESP_MAX];
 static size_t s_resp_len;
 static char   s_resp_sig[65];   /* X-W3PUPS-Sig from the response, if any */
 
+/* esp_timer second of the last 2xx POST — see http_backend_last_success_s(). */
+static volatile uint32_t s_last_success_s;
+
+uint32_t http_backend_last_success_s(void)
+{
+    return s_last_success_s;
+}
+
+bool http_backend_is_configured(void)
+{
+    char base[HTTP_CFG_URL_MAX + 1];
+    return http_cfg_get_url(base, sizeof(base)) == ESP_OK;
+}
+
 /* --- telemetry snoop --------------------------------------------------- */
 
 static slot_t *slot_for(uint8_t cls, uint8_t op)
@@ -649,6 +663,7 @@ static int post_once(void)
 
     /* 2xx: the server accepted the acks we carried; drop them. Then apply any
      * commands it returned (verified against the request nonce + secret). */
+    s_last_success_s = (uint32_t)(esp_timer_get_time() / 1000000);
     handle_response(s_resp, s_resp_len, key, key_len, nonce_hex, s_resp_sig);
     return acks_in_body;
 }

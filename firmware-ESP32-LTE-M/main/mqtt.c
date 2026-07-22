@@ -7,6 +7,7 @@
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mqtt_client.h"
@@ -25,6 +26,10 @@ static esp_mqtt_client_handle_t s_client;
 /* MISC-9: link state drives publish-vs-enqueue in mqtt_publish_raw(). Set
  * from the esp-mqtt event task; read from the wups_link task. */
 static volatile bool s_connected;
+
+/* esp_timer second of the last CONNECTED event — uplink-health telemetry for
+ * the modem's post-PPP watchdog (u32 so the cross-task read is atomic). */
+static volatile uint32_t s_last_connected_s;
 
 static char s_topic_status[TOPIC_BUF_LEN];     /* t/{iccid}/status     (LWT + online retained) */
 static char s_topic_identify[TOPIC_BUF_LEN];   /* t/{iccid}/identify   (retained on connect) */
@@ -47,6 +52,10 @@ const char *mqtt_topic_telemetry(void)   { return s_topic_telemetry; }
 const char *mqtt_topic_event(void)       { return s_topic_event; }
 const char *mqtt_topic_cmd_response(void){ return s_topic_cmd_resp; }
 const char *mqtt_topic_cmd_request(void) { return s_topic_cmd_req; }
+
+/* Uplink-health accessors — see mqtt.h. */
+bool mqtt_is_connected(void)         { return s_connected; }
+uint32_t mqtt_last_connected_s(void) { return s_last_connected_s; }
 
 static void publish_identify(void)
 {
@@ -76,6 +85,7 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
         break;
     case MQTT_EVENT_CONNECTED:
         s_connected = true;
+        s_last_connected_s = (uint32_t)(esp_timer_get_time() / 1000000);
         ESP_LOGI(TAG, "CONNECTED to %s as %s", MQTT_BROKER_URI, identity_iccid());
 
         /* Subscribe to the per-device downlink command topic. The broker

@@ -28,6 +28,7 @@
  * are validated against the bundled CA store.
  */
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -45,6 +46,18 @@ void http_backend_start(void);
  * net.status are cached, others are ignored. Mirrors arkiv_tlm_observe_frame.
  * Safe to call from the wups_link RX task context. */
 void http_backend_observe_telemetry_frame(const uint8_t *frame, uint16_t frame_len);
+
+/* esp_timer second of the last successful (2xx) telemetry POST exchange;
+ * 0 = none yet this boot. Uplink-health source for the modem's post-PPP
+ * watchdog in HTTP mode. Lock-free single-word read, safe from any task. */
+uint32_t http_backend_last_success_s(void);
+
+/* True when an endpoint base URL is configured (NVS `w3http/url` or the
+ * compile-time HTTP_ENDPOINT_BASE) — i.e. the backend can actually POST.
+ * The modem's uplink watchdog treats an unconfigured endpoint as "nothing
+ * to supervise" (same posture as unclaimed Arkiv), so a device awaiting its
+ * guided VPS setup is never reset-looped on a healthy network. */
+bool http_backend_is_configured(void);
 
 #ifdef __cplusplus
 }

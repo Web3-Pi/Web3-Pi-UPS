@@ -171,6 +171,38 @@ void wups_link_send(uint8_t dst, uint8_t cls, uint8_t op, uint8_t flags,
                     payload, payload_len);
 }
 
+uint16_t wups_link_render_frame(uint8_t *out, size_t cap,
+                                uint8_t dst, uint8_t cls, uint8_t op,
+                                uint8_t flags,
+                                const void *payload, uint16_t payload_len)
+{
+    if (!out || payload_len > WUPS_MAX_PAYLOAD) return 0;
+    const uint16_t total = (uint16_t)(WUPS_FRAMING_BYTES + payload_len);
+    if (cap < total) return 0;
+
+    out[0] = WUPS_SYNC1;
+    out[1] = WUPS_SYNC2;
+    out[2] = dst;
+    out[3] = WUPS_ADDR_ESP32;
+    out[4] = cls;
+    out[5] = op;
+    out[6] = flags;
+    out[7] = s_tx_seq++;   /* same benign race as wups_link_send */
+    out[8] = (uint8_t)(payload_len & 0xFFu);
+    out[9] = (uint8_t)((payload_len >> 8) & 0xFFu);
+    if (payload_len) memcpy(out + WUPS_HEADER_BYTES, payload, payload_len);
+
+    /* Fletcher-8 over DST..LEN_H..payload — sync and end marker excluded,
+     * exactly as send_frame_full computes it. */
+    uint8_t a, b;
+    wups_fletcher8(out + 2, (size_t)(8 + payload_len), &a, &b);
+    out[WUPS_HEADER_BYTES + payload_len + 0] = a;
+    out[WUPS_HEADER_BYTES + payload_len + 1] = b;
+    out[WUPS_HEADER_BYTES + payload_len + 2] = WUPS_END1;
+    out[WUPS_HEADER_BYTES + payload_len + 3] = WUPS_END2;
+    return total;
+}
+
 /* --- trust-anchor (Track 2 / ADR-0011 §10.1/§10.4) --------------------- */
 
 void wups_link_trust_prompt(uint8_t mode, uint8_t confirm_secs,

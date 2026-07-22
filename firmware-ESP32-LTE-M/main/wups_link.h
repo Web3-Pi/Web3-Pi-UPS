@@ -42,6 +42,17 @@ void wups_link_send_seq(uint8_t dst, uint8_t cls, uint8_t op,
                         uint8_t flags, uint8_t seq,
                         const void *payload, uint16_t payload_len);
 
+/* Render a complete frame (SYNC..END, SRC=ESP32, auto-assigned SEQ) into
+ * out[cap] instead of putting it on UART2. For self-originated frames that
+ * ride inside another transport — e.g. the modem's net.status EVENT
+ * published raw on the MQTT telemetry topic, byte-identical to the frames
+ * the RP2040 relays via net.publish. Returns the total frame length, or 0
+ * if it doesn't fit. */
+uint16_t wups_link_render_frame(uint8_t *out, size_t cap,
+                                uint8_t dst, uint8_t cls, uint8_t op,
+                                uint8_t flags,
+                                const void *payload, uint16_t payload_len);
+
 /* Diagnostic — log frame and byte counts at INFO level. Useful to call
  * from a periodic heartbeat to confirm the UART2 link is actually live. */
 void wups_link_log_stats(void);
