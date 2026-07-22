@@ -1,18 +1,42 @@
-# ESP-IDF partition table — Web3-Pi-UPS ESP32-LTE-M (16 MB, ESP32-S3).
+# ESP-IDF partition table — Web3-Pi-UPS ESP32-LTE-M (4 MB, ESP32-S3FH4R2).
 #
-# Track 0 / WS-10: adds `prov`, a dedicated NVS data partition holding the
-# per-device MQTT secret (random 32 B, provisioned at production via
-# nvs_partition_gen). It is SEPARATE from `nvs` on purpose:
+# OTA-1: canonical two-OTA layout so the ESP32 can update itself over LTE
+# (esp_https_ota into the passive slot + otadata flip + bootloader rollback).
+# Replaces the old single 3 MB `factory` slot: the app (~0.9 MB) now lives in
+# ota_0/ota_1 (1.5 MB each — plenty of headroom).
+#
+# Track 0 / WS-10: `prov` is a dedicated NVS data partition holding the
+# per-device MQTT secret (random 32 B) + WS-9/Arkiv keys, provisioned at
+# production via nvs_partition_gen. It is SEPARATE from `nvs` on purpose:
 #   - app/runtime state lives in `nvs`; a state wipe / factory-reset of `nvs`
 #     never destroys the provisioned device identity;
 #   - the provisioning blob is flashed independently of the app image, so the
 #     firmware binary stays identical across all 50 units (only this small
 #     partition differs per unit).
+# `prov` MUST stay at 0x310000/0x4000 — tools/make-nvs-blob and the
+# provisioning runbook flash it by absolute address.
 #
-# `factory` is 3 MB (current image ~0.8 MB; headroom for WS-9 crypto).
+# `nvs` shrank 0x6000 → 0x4000 (4 sectors, ≥ the 3-sector NVS minimum) to
+# make room for `otadata`; its contents are small (cmdauth counters,
+# backend_mode, http cfg).
+#
+# ⚠ One-time USB migration from the old factory layout: `idf.py flash`
+# writes bootloader/table/otadata/app but never touches 0x9000-0xCFFF, so
+# on an already-flashed unit the old 6-sector wear-leveled `nvs` gets
+# truncated in place — NVS can then silently resurrect a STALE cmdauth
+# last_ctr (reopening the WS-9
+# replay window) or hit ESP_ERR_NVS_NO_FREE_PAGES (main.c auto-erases ALL
+# runtime state, incl. backend_mode). The old `nvs` range MUST be erased
+# when first flashing this table on such a unit:
+#   esptool.py --port <port> erase_region 0x9000 0x6000
+# NEVER use erase_flash on a provisioned unit — it destroys `prov`. After
+# the erase_region, cmdauth reseeds cur_epoch from `prov` and last_ctr=0
+# (the panel's counter is monotonically higher); no re-provisioning needed.
 #
 # Name,     Type, SubType, Offset,    Size,     Flags
-nvs,        data, nvs,     0x9000,    0x6000,
+nvs,        data, nvs,     0x9000,    0x4000,
+otadata,    data, ota,     0xd000,    0x2000,
 phy_init,   data, phy,     0xf000,    0x1000,
-factory,    app,  factory, 0x10000,   0x300000,
+ota_0,      app,  ota_0,   0x10000,   0x180000,
+ota_1,      app,  ota_1,   0x190000,  0x180000,
 prov,       data, nvs,     0x310000,  0x4000,

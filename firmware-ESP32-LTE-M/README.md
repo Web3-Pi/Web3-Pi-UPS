@@ -61,6 +61,27 @@ If you have a stale `sdkconfig` from before `sdkconfig.defaults` landed
 (symptom: `flash=2 MB` in the boot banner instead of 16 MB), delete it
 and run `tools/idf reconfigure` to regenerate it from the defaults.
 
+### One-time migration to the two-OTA partition table (OTA-1)
+
+The first flash of the OTA-1 layout (`ota_0`/`ota_1` + `otadata`) on a unit
+that ran the old single-`factory` table **must erase the old `nvs` region
+first**: the partition shrank 0x6000 → 0x4000 in place and `idf.py flash`
+never touches it, so a truncated wear-leveled NVS can silently resurrect a
+stale WS-9 anti-replay counter (`last_ctr`) or trip
+`ESP_ERR_NVS_NO_FREE_PAGES`, which auto-erases all runtime state (including
+`backend_mode`). With the serial monitor stopped (or yielded):
+
+```sh
+esptool.py --port /dev/cu.usbmodem1101 erase_region 0x9000 0x6000
+tools/idf -p /dev/cu.usbmodem1101 flash
+```
+
+**Never** use `erase_flash` on a provisioned unit — it wipes the per-device
+`prov` partition at 0x310000. After the `erase_region`, cmdauth reseeds
+`cur_epoch` from `prov` and `last_ctr` restarts at 0 (the panel's counter is
+monotonically higher), so no re-provisioning is needed. This jump cannot be
+taken over the air; fielded factory-layout devices need this USB flash once.
+
 Reset without reflashing (e.g. after a menuconfig change that affects hardware setup):
 
 ```sh

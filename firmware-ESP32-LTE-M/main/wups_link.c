@@ -4,6 +4,7 @@
 #include "identity.h"
 #include "cmdauth.h"
 #include "cmdauth_arkiv.h"
+#include "fw_ota.h"
 #include "arkiv_ack.h"
 #include "arkiv_tlm.h"
 #include "arkiv_event.h"
@@ -661,6 +662,14 @@ static void on_mqtt_data(const char *topic, size_t topic_len,
     }
     payload = frame;
     payload_len = frame_len;
+
+    /* OTA-1 — fw.update (net.fw_update) is the one WS-9 command the ESP32
+     * executes itself: intercept it AFTER envelope verification and never
+     * forward it to the RP2040. The hook validates, ACKs on cmd/response
+     * and kicks off the download task; true = frame consumed. */
+    if (fw_ota_try_handle_downlink((const uint8_t *)payload, payload_len)) {
+        return;
+    }
 
     size_t total = sizeof(wups_net_downlink_v1_hdr_t) + topic_len + payload_len;
     if (total > WUPS_MAX_PAYLOAD) {

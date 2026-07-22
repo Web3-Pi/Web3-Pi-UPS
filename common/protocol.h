@@ -131,6 +131,16 @@ typedef enum {
        result (0 = ok). RP2040 routes RPi→ESP32 frames unchanged, so this
        needs no RP2040 firmware change. Payload: wups_net_config_v1_hdr_t. */
     WUPS_OP_NET_CONFIG        = 0x21,
+    /* OTA-1 — LTE OTA firmware update of the ESP32 itself. Arrives as a
+       WS-9-authenticated downlink command (panel → c/{iccid}/cmd/request);
+       unlike every other downlink op it is handled ON the ESP32 and never
+       forwarded to the RP2040. The payload carries an https:// URL plus the
+       expected SHA-256 and byte length of the new app image; the ESP32
+       streams the image into the passive OTA slot, verifies the digest,
+       flips the boot partition and reboots. The REQ is ACKed with a RESP
+       whose payload is a single result byte (see WUPS_FW_UPDATE_RESULT_*).
+       Payload: wups_net_fw_update_v1_hdr_t. */
+    WUPS_OP_NET_FW_UPDATE     = 0x22,
 } wups_op_net_t;
 
 /* net.config items (the `item` field of wups_net_config_v1_hdr_t). */
@@ -352,6 +362,29 @@ typedef struct WUPS_PACKED {
     uint8_t  result;         /* 0 = ok, non-zero = error */
     uint8_t  reserved;
 } wups_net_config_result_v1_t;
+
+/* net.fw_update REQ (panel -> ESP32, inside the WS-9 envelope). Header
+ * followed by `url_len` ASCII bytes (no NUL) of an https:// URL to the new
+ * app image. `sha256_hex` is the ASCII hex digest of the exact image bytes
+ * (no NUL); `image_len` is its size in bytes. The RESP echoes the SEQ and
+ * carries a single result byte at payload[0] (the panel's cmd/response
+ * convention: 0 = ok / accepted, non-zero = failure). */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 1 */
+    uint8_t  url_len;        /* bytes of ASCII URL following the header */
+    uint16_t reserved;
+    uint32_t image_len;      /* expected app image size in bytes */
+    char     sha256_hex[64]; /* ASCII hex SHA-256 of the image, no NUL */
+    /* char url[url_len] follows */
+} wups_net_fw_update_v1_hdr_t;
+
+/* net.fw_update RESP result codes (single byte at payload[0]). "OK" only
+ * means the download was accepted and started — completion/failure is
+ * reported asynchronously via fw_update JSON events on t/{iccid}/event. */
+#define WUPS_FW_UPDATE_RESULT_OK       0u  /* accepted, download started    */
+#define WUPS_FW_UPDATE_RESULT_BAD_REQ  1u  /* malformed / failed validation */
+#define WUPS_FW_UPDATE_RESULT_BUSY     2u  /* an update is already running  */
+#define WUPS_FW_UPDATE_RESULT_NO_NET   3u  /* PPP link is down              */
 
 /* host.status — RPi -> RP2040 */
 typedef struct WUPS_PACKED {

@@ -7,6 +7,7 @@
 #include "cmdauth_arkiv.h"
 #include "arkiv_tlm.h"
 #include "arkiv_ws.h"
+#include "fw_ota.h"
 #include "../../common/protocol.h"
 
 #include <ctype.h>
@@ -140,6 +141,12 @@ static esp_netif_t       *s_ppp_netif;
 static esp_modem_dce_t   *s_dce;
 static bool               s_iccid_known;       /* set true once AT+CCID populated identity */
 static bool               s_mqtt_started;
+
+/* PPP holds an IP right now — single-word read, safe from any task. Used by
+ * fw_ota to refuse an update with no link (OTA-1). */
+static volatile bool      s_ppp_up;
+
+bool modem_ppp_is_up(void) { return s_ppp_up; }
 
 /* CMUX session state. `s_cmux_active` = the current DCE runs PPP + AT
  * multiplexed (so we may poll AT while data flows). `s_cmux_dirty` = a CMUX
@@ -520,11 +527,13 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
         if (esp_netif_get_dns_info(s_ppp_netif, ESP_NETIF_DNS_BACKUP, &dns) == ESP_OK) {
             ESP_LOGI(MODEM_TAG, "PPP DNS backup: " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
         }
+        s_ppp_up = true;
         xEventGroupSetBits(s_modem_evt, EVT_GOT_IP);
         break;
     }
     case IP_EVENT_PPP_LOST_IP:
         ESP_LOGW(MODEM_TAG, "PPP lost IP");
+        s_ppp_up = false;
         xEventGroupSetBits(s_modem_evt, EVT_LOST_IP);
         break;
     default:
@@ -905,6 +914,7 @@ static esp_err_t ppp_bringup_dce(void)
  * dead too, escalate to a PWRKEY power-cycle. */
 static void ppp_teardown_dce(teardown_action_t action)
 {
+    s_ppp_up = false;
     bool fresh_boot_wait = false;               /* modem rebooting after CFUN=1,1 */
     bool pwrcycle = (action == TEARDOWN_PWRCYCLE);
     bool was_cmux = s_cmux_active;
@@ -1037,11 +1047,24 @@ static teardown_action_t supervise_uplink(void)
             return TEARDOWN_NORMAL;
         }
 
+        /* OTA-1 — while a firmware download runs, the uplink is deliberately
+         * busy (MQTT may go quiet under the TLS transfer) and a watchdog
+         * teardown would kill it. Freeze the watchdog timer, count no trips,
+         * escalate nothing; genuine PPP loss (the EVT bits above) still ends
+         * the session and fails the download on its own. */
+        if (fw_ota_in_progress()) {
+            last_healthy_s = now_s();
+            continue;
+        }
+
         bool uplink_up = false, wd_healthy = false;
         uplink_health(&uplink_up, &wd_healthy);
         uint32_t now = now_s();
         if (wd_healthy) {
             last_healthy_s = now;
+            /* OTA-1 rollback — first demonstrably healthy uplink marks a
+             * pending-verify OTA image valid (one-shot, no-op otherwise). */
+            fw_ota_mark_uplink_healthy();
             if (s_uplink_trips != 0) {
                 /* Deferred recovery bookkeeping (see the GOT_IP branch):
                  * only a demonstrably healthy uplink ends an escalation. */

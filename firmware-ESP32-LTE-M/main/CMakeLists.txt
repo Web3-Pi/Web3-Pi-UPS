@@ -10,6 +10,7 @@ idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "mqtt.c"
                             "http_backend.c"
                             "oled_menu.c"
                             "bip39.c"
+                            "fw_ota.c"
                        PRIV_REQUIRES spi_flash esp_timer esp_hw_support
                                      esp_driver_i2c esp_driver_gpio
                                      esp_driver_uart
@@ -19,4 +20,5 @@ idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "mqtt.c"
                                      espressif__esp_websocket_client
                                      mbedtls microecc arkiv_crypto
                                      espressif__cjson
+                                     esp_https_ota app_update esp_partition
                        INCLUDE_DIRS "")

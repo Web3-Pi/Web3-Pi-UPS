@@ -38,6 +38,7 @@
 #include "arkiv_tlm.h"
 #include "arkiv_ws.h"
 #include "backend_mode.h"
+#include "fw_ota.h"
 #include "modem.h"
 #include "pmu.h"
 #include "wups_link.h"
@@ -83,6 +84,11 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "app_main entered");
     log_boot_banner();
+
+    /* OTA-1 — log which OTA slot we run from (visible proof on serial that
+     * an update actually switched slots) and latch pending-verify state for
+     * the rollback machinery (see fw_ota.h). */
+    fw_ota_boot_log();
 
 #if ARKIV_CRYPTO_SELFTEST
     /* ADR-0013: confirm the on-device crypto path (mbedtls + HW AES) is
@@ -226,6 +232,13 @@ void app_main(void)
              * the first ~minute of boot. */
             if (tick > 12) mode_confirm_armed = false;
         }
+
+        /* OTA-1 rollback safety net: a pending-verify image that never got
+         * a healthy uplink rolls itself back after 10 min. No-op otherwise.
+         * Lives on the heartbeat (not the modem task) so a wedged modem
+         * bring-up can't starve it. */
+        fw_ota_rollback_tick();
+
         int64_t uptime_us = esp_timer_get_time();
         uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
         uint32_t free_heap = (uint32_t)esp_get_free_heap_size();

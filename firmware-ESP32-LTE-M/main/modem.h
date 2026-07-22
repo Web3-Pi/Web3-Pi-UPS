@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 /*
@@ -32,6 +34,11 @@ esp_err_t modem_power_on(void);
  * switch a healthy modem OFF. This probes AT on a temporary raw UART first and
  * only pulses PWRKEY (then waits for boot) if the modem is silent. */
 void modem_ensure_on(void);
+
+/* True while PPP holds an IP (cleared on lost-IP and at DCE teardown).
+ * Single-word read, safe from any task. Used by fw_ota (OTA-1) to refuse a
+ * firmware download with no link. */
+bool modem_ppp_is_up(void);
 
 /* Spawn two FreeRTOS tasks that bridge USB-CDC stdio ↔ modem UART:
  *   - bytes typed on the host console go to the modem

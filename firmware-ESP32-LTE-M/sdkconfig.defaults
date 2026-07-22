@@ -19,10 +19,18 @@ CONFIG_LWIP_PPP_NOTIFY_PHASE_SUPPORT=y
 # --- Flash size (M.2 card's ESP32-S3FH4R2 has 4 MB in-package flash) ---
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
-# --- Custom partition table (Track 0 / WS-10): adds the `prov` NVS
+# --- Custom partition table (Track 0 / WS-10 + OTA-1): two-OTA layout
+#     (ota_0/ota_1 + otadata) for LTE OTA self-update, plus the `prov` NVS
 #     partition for the per-device MQTT secret. See partitions.csv. ---
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- OTA rollback (OTA-1): a freshly OTA'd image boots as
+#     ESP_OTA_IMG_PENDING_VERIFY; fw_ota.c marks it valid on the first
+#     healthy uplink (hooked into modem.c's supervision loop) and rolls it
+#     back after 10 min without one — so a broken-but-not-crashing image
+#     recovers on its own. ---
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # --- TLS: use the mbedTLS-bundled root CA store so esp-mqtt can verify
 #         broker.w3p.ovh's Let's Encrypt cert without us having to embed
