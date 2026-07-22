@@ -466,13 +466,20 @@ static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
 
     if (cls == WUPS_CLASS_SYSTEM) {
         if (op == WUPS_OP_SYS_PING && (flags & WUPS_FLAG_REQ)) {
+            /* Struct + optional ASCII fw-string tail (see protocol.h). */
+            uint8_t buf[sizeof(wups_sys_pong_v1_t) + 24];
             wups_sys_pong_v1_t pong;
             pong.version    = 1;
             pong.reserved   = 0;
-            pong.fw_version = (uint16_t)((1u << 8) | 0u); /* 1.0 */
+            pong.fw_version = (uint16_t)((0u << 8) | 6u); /* coarse 0.6 */
             pong.uptime_ms  = (uint32_t)(esp_timer_get_time() / 1000);
+            memcpy(buf, &pong, sizeof(pong));
+            const char *fw = identity_fw_version();       /* "esp32:x.y.z" */
+            size_t fw_len = strnlen(fw, sizeof(buf) - sizeof(pong));
+            memcpy(buf + sizeof(pong), fw, fw_len);
             wups_link_send_seq(src, WUPS_CLASS_SYSTEM, WUPS_OP_SYS_PING,
-                               WUPS_FLAG_RESP, seq, &pong, sizeof(pong));
+                               WUPS_FLAG_RESP, seq, buf,
+                               (uint16_t)(sizeof(pong) + fw_len));
             return;
         }
         /* hello / log / status_query — ignored in v1 */

@@ -449,6 +449,12 @@ static powercycle_state_t Powercycle_State = POWERCYCLE_IDLE;
 static UINT16 Powercycle_Timer_Ms = 0;
 #define POWERCYCLE_OFF_MS 1500
 
+/* Firmware version, reported in system.ping RESP / system.hello. The
+ * string rides the optional pong tail (protocol.h); the u16 stays as
+ * the coarse legacy field. Bump on release. */
+#define FW_VERSION_STR "ch32x:1.1.0"
+#define FW_VERSION_U16 ((uint16_t)((1u << 8) | 1u)) /* coarse 1.1 */
+
 /*********************************************************************
  * Web3 Pi UPS — binary wire protocol v1 (CH32X side).
  *
@@ -769,7 +775,7 @@ static void wups_send_hello_bcast(void)
     h.proto_version = WUPS_PROTO_VERSION;
     h.node_addr     = WUPS_ADDR_CH32X;
     h.reserved      = 0;
-    h.fw_version    = (uint16_t)((1u << 8) | 0u); /* 1.0 — bump on release */
+    h.fw_version    = FW_VERSION_U16;
     h.caps_classes  = WUPS_CAP_SYSTEM | WUPS_CAP_POWER;
     h.build_id      = 0;
     wups_send_frame(WUPS_ADDR_BROADCAST, WUPS_CLASS_SYSTEM,
@@ -905,13 +911,17 @@ static void wups_handle_frame(uint8_t dst, uint8_t src, uint8_t cls,
     {
         if (op == WUPS_OP_SYS_PING && (flags & WUPS_FLAG_REQ))
         {
+            /* Struct + ASCII fw-string tail (see protocol.h). */
+            uint8_t buf[sizeof(wups_sys_pong_v1_t) + sizeof(FW_VERSION_STR) - 1];
             wups_sys_pong_v1_t pong;
             pong.version    = 1;
             pong.reserved   = 0;
-            pong.fw_version = (uint16_t)((1u << 8) | 0u);
+            pong.fw_version = FW_VERSION_U16;
             pong.uptime_ms  = (uint32_t)Uptime_Sec * 1000u;
+            memcpy(buf, &pong, sizeof(pong));
+            memcpy(buf + sizeof(pong), FW_VERSION_STR, sizeof(FW_VERSION_STR) - 1);
             wups_send_frame(src, WUPS_CLASS_SYSTEM, WUPS_OP_SYS_PING,
-                            WUPS_FLAG_RESP, seq, &pong, sizeof(pong));
+                            WUPS_FLAG_RESP, seq, buf, sizeof(buf));
         }
         else if (op == WUPS_OP_SYS_STATUS_QUERY && (flags & WUPS_FLAG_REQ))
         {

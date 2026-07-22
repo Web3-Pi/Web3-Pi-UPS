@@ -198,11 +198,16 @@ typedef enum {
 #  define WUPS_PACKED
 #endif
 
-/* system.ping (REQ empty; RESP carries uptime+fw_version) */
+/* system.ping (REQ empty; RESP carries uptime+fw_version).
+ * OPTIONAL TAIL (2026-07-22): an ASCII firmware version string (not
+ * NUL-terminated, e.g. "esp32:0.6.3") may follow the struct; its length is
+ * frame LEN minus sizeof(struct). Absent on older firmware — consumers must
+ * fall back to the coarse u16 when LEN == sizeof(struct). Length-based
+ * detection keeps the struct at version 1 and old parsers unaffected. */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */
     uint8_t  reserved;
-    uint16_t fw_version;     /* (major << 8) | minor */
+    uint16_t fw_version;     /* (major << 8) | minor — coarse/legacy */
     uint32_t uptime_ms;
 } wups_sys_pong_v1_t;
 

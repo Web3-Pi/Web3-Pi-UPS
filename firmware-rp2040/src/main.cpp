@@ -222,6 +222,12 @@ char netAlertDismissedText[24] = {0};     // [0]=='\0' → no dismissal in effec
 unsigned long netAlertDismissedAtMs = 0;
 
 // UPS-data staleness alert. CH32X pushes power.status at 1 Hz; when that
+// Firmware version, reported in system.ping RESP / system.hello. The string
+// rides the optional pong tail (protocol.h); the u16 stays as the coarse
+// legacy field. Bump on release.
+#define FW_VERSION_STR "rp2040:1.1.0"
+#define FW_VERSION_U16 ((uint16_t)((1u << 8) | 1u))   /* coarse 1.1 */
+
 // stream dies the cached ui.* values FREEZE and everything downstream
 // (OLED, alarms, uplink-on-change) silently runs on dead data — exactly
 // what masked the 2026-07-11 CH32X wedge for 8 h (frozen "4.6 V" looked
@@ -1342,14 +1348,18 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     return;
   }
 
-  // system.ping → respond with uptime + fw_version.
+  // system.ping → respond with uptime + fw_version (+ ASCII fw-string tail,
+  // see protocol.h — length-detected, absent on older firmware).
   if (f.cls == WUPS_CLASS_SYSTEM && f.op == WUPS_OP_SYS_PING &&
       (f.flags & WUPS_FLAG_REQ)) {
+    uint8_t buf[sizeof(wups_sys_pong_v1_t) + sizeof(FW_VERSION_STR) - 1];
     wups_sys_pong_v1_t pong;
     pong.version    = 1;
     pong.reserved   = 0;
-    pong.fw_version = (uint16_t)((1u << 8) | 0u); /* 1.0 — bump on release */
+    pong.fw_version = FW_VERSION_U16;
     pong.uptime_ms  = (uint32_t)millis();
+    memcpy(buf, &pong, sizeof(pong));
+    memcpy(buf + sizeof(pong), FW_VERSION_STR, sizeof(FW_VERSION_STR) - 1);
 
     uint8_t out_port = WUPS_PORT_NONE;
     if      (f.src == WUPS_ADDR_RPI)   out_port = WUPS_PORT_RPI;
@@ -1357,7 +1367,7 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     else if (f.src == WUPS_ADDR_ESP32) out_port = WUPS_PORT_ESP32;
     if (out_port != WUPS_PORT_NONE) {
       wups_send_seq(out_port, f.src, WUPS_CLASS_SYSTEM, WUPS_OP_SYS_PING,
-                    WUPS_FLAG_RESP, f.seq, &pong, sizeof(pong));
+                    WUPS_FLAG_RESP, f.seq, buf, sizeof(buf));
     }
     return;
   }
@@ -1534,7 +1544,7 @@ static void wupsSendHelloBcast(void) {
   h.proto_version = WUPS_PROTO_VERSION;
   h.node_addr     = WUPS_ADDR_RP2040;
   h.reserved      = 0;
-  h.fw_version    = (uint16_t)((1u << 8) | 0u);
+  h.fw_version    = FW_VERSION_U16;
   h.caps_classes  = WUPS_CAP_SYSTEM | WUPS_CAP_UI;
   h.build_id      = 0;
   // Broadcast goes to every reachable MCU port (and USB-CDC if a host is
