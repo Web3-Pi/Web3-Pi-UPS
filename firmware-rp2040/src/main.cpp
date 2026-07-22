@@ -201,10 +201,25 @@ bool powerLossAlertPlayed = false;  // Prevent repeated alerts
 // reminder beep, so a silent-in-panel unit is visible + audible on the bench.
 // Cleared by an empty-text ui.display_msg (modem recovered) or by an ESP32
 // reboot (system.hello) — the ESP32 re-raises it if still degraded.
+// Two local escape hatches (the clear frame is a single unACKed msg on a
+// no-flow-control UART, so it CAN be lost — field case: banner latched
+// forever after the modem had recovered):
+//   - any button press dismisses the banner; the SAME text re-raised by the
+//     ESP32 then stays hidden for ALERT_DISMISS_COOLDOWN_MS, a DIFFERENT
+//     text (new problem) shows immediately and drops the dismissal;
+//   - a banner not re-asserted for ALERT_STALE_TTL_MS auto-clears (the
+//     ESP32 re-sends an active alert every failing round, worst case
+//     ~3 min apart, so 5 min of silence means the alert is gone).
 char netAlertText[24] = {0};
 bool netAlertActive = false;
 bool netAlertBeeped = false;              // rising-edge error-sound guard
 unsigned long netAlertLastReminder = 0;
+bool netAlertOnScreen = false;            // banner actually rendered last pass
+unsigned long netAlertLastAssertMs = 0;   // last non-empty display_msg (TTL basis)
+constexpr unsigned long ALERT_DISMISS_COOLDOWN_MS = 10UL * 60UL * 1000UL;
+constexpr unsigned long ALERT_STALE_TTL_MS        = 5UL * 60UL * 1000UL;
+char netAlertDismissedText[24] = {0};     // [0]=='\0' → no dismissal in effect
+unsigned long netAlertDismissedAtMs = 0;
 
 // UPS-data staleness alert. CH32X pushes power.status at 1 Hz; when that
 // stream dies the cached ui.* values FREEZE and everything downstream
@@ -1201,6 +1216,8 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     currentScreen = 0;
     lastInteractionTime = millis();
     netAlertActive = false;   // ESP32 rebooted — drop stale alert; it re-raises if still degraded
+    netAlertDismissedText[0] = '\0';   // fresh ESP32 session — old dismissal no longer applies
+    netAlertDismissedAtMs = 0;
     return;
   }
 
@@ -1297,13 +1314,29 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
       uint8_t tl = h.text_len < avail ? h.text_len : avail;
       if (tl > sizeof(netAlertText) - 1) tl = sizeof(netAlertText) - 1;
       if (tl == 0) {
+        // Explicit CLEAR — wipe everything, incl. dismiss-cooldown bookkeeping.
         netAlertActive = false;
         netAlertText[0] = '\0';
+        netAlertDismissedText[0] = '\0';
+        netAlertDismissedAtMs = 0;
       } else {
-        memcpy(netAlertText, f.payload + sizeof(h), tl);
-        netAlertText[tl] = '\0';
-        if (!netAlertActive) netAlertBeeped = false;  // rising edge → error sound
-        netAlertActive = true;
+        char text[sizeof(netAlertText)];
+        memcpy(text, f.payload + sizeof(h), tl);
+        text[tl] = '\0';
+        netAlertLastAssertMs = millis();   // any raise/re-raise re-arms the TTL
+        // Manually-dismissed alert: the SAME text stays hidden for the
+        // cooldown window; DIFFERENT text (new problem) shows immediately
+        // and drops the dismissal.
+        bool dismissed = netAlertDismissedText[0] != '\0' &&
+                         strcmp(text, netAlertDismissedText) == 0 &&
+                         millis() - netAlertDismissedAtMs < ALERT_DISMISS_COOLDOWN_MS;
+        if (!dismissed) {
+          netAlertDismissedText[0] = '\0';
+          netAlertDismissedAtMs = 0;
+          memcpy(netAlertText, text, tl + 1u);
+          if (!netAlertActive) netAlertBeeped = false;  // rising edge → error sound
+          netAlertActive = true;
+        }
       }
     }
     return;
@@ -1766,6 +1799,43 @@ void loop() {
     s_btn_release_guard = false;
   }
 
+  // Modem-alert banner dismiss: while the netAlert override is on the OLED,
+  // ANY button press acknowledges it — drop the banner and fall back to
+  // whatever screen the dashboard was on. Edge-triggered on the press
+  // (HIGH→LOW seen while the banner is up): a button already held when the
+  // banner appears — e.g. mid LEFT-hold menu gesture — is ignored, so an
+  // in-flight press can neither silently dismiss an alert the user never
+  // read nor double-act (its release still navigates exactly as before).
+  // The prev-level trackers sample every pass, banner or not, so a held
+  // LOW level is never mistaken for a fresh press. A consumed press is
+  // swallowed via the same release guard used on menu exit (this block runs
+  // before the hold-gesture and nav blocks, and the early return keeps them
+  // from ever seeing the press), so it can't double as a nav tap or arm the
+  // LEFT-hold menu gesture. Silent: no beep on dismiss, and the reminder
+  // cadence stops with the banner. The dismissed text is remembered so the
+  // ESP32 re-raising the SAME alert doesn't instantly bring the banner back
+  // (see the ui.display_msg handler).
+  {
+    static bool s_dismiss_left_prev  = false;
+    static bool s_dismiss_right_prev = false;
+    bool left_down  = digitalRead(BTN_LEFT_PIN)  == LOW;
+    bool right_down = digitalRead(BTN_RIGHT_PIN) == LOW;
+    bool press_edge = (left_down && !s_dismiss_left_prev) ||
+                      (right_down && !s_dismiss_right_prev);
+    s_dismiss_left_prev  = left_down;
+    s_dismiss_right_prev = right_down;
+    if (netAlertOnScreen && netAlertActive && press_edge) {
+      memcpy(netAlertDismissedText, netAlertText, sizeof(netAlertDismissedText));
+      netAlertDismissedAtMs = millis();
+      netAlertActive = false;
+      netAlertText[0] = '\0';
+      netAlertOnScreen = false;
+      s_btn_release_guard = true;   // swallow this press until both release
+      delay(50);
+      return;
+    }
+  }
+
   // We're back on the dashboard with no hand-off pending: the ESP32 menu (if
   // any) closed by timeout, not its "Back". Drop the back-to-local intent so a
   // later unrelated set_screen(0) isn't misread as a menu back-out.
@@ -2042,6 +2112,26 @@ void loop() {
   }
   bool badCharger = (badChargerDebounce >= BAD_PSU_DEBOUNCE_PASSES);
 
+  // Stale-banner TTL: the ESP32 clears an alert with a single unACKed
+  // empty-text display_msg — if that one frame is lost on the UART the
+  // banner would latch forever with the uplink actually fine. An active
+  // alert is re-asserted every failing round (worst case ~3 min apart),
+  // so 5 min without a re-assert means the alert is dead: auto-clear.
+  if (netAlertActive &&
+      millis() - netAlertLastAssertMs >= ALERT_STALE_TTL_MS) {
+    netAlertActive = false;
+    netAlertText[0] = '\0';
+  }
+  // The dismissal record only matters within its cooldown window — expire it
+  // eagerly so a record orphaned by a lost clear frame can't spuriously
+  // suppress a genuinely new alert after a ~49.7-day millis() wrap.
+  if (netAlertDismissedText[0] != '\0' &&
+      millis() - netAlertDismissedAtMs >= ALERT_DISMISS_COOLDOWN_MS) {
+    netAlertDismissedText[0] = '\0';
+    netAlertDismissedAtMs = 0;
+  }
+  netAlertOnScreen = false;   // set below iff the banner branch renders
+
   if (upsStaleActive) {
     // Dead power-telemetry stream — the one alert that must outrank all
     // others (they all consume the frozen data). Same sound pattern as
@@ -2107,6 +2197,9 @@ void loop() {
     // Modem/network alert from the ESP32 — overrides all dashboard screens
     // (below BAD PSU: power problems win). Same buzzer cadence as BAD PSU:
     // error sound once on the rising edge, reminder beep every 10 s.
+    // Any button press dismisses the banner (consumed in the loop's button
+    // section, which runs before this render on the next pass).
+    netAlertOnScreen = true;
     unsigned long now = millis();
     if (!netAlertBeeped) {
       playErrorSound();
