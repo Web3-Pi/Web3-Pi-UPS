@@ -239,6 +239,11 @@ void app_main(void)
          * bring-up can't starve it. */
         fw_ota_rollback_tick();
 
+        /* fw_xfer receiver idle guard: a Workbench push that died mid-
+         * transfer must not hold the update slot (and the modem-watchdog
+         * freeze) forever — drop the session after 30 s of silence. */
+        fw_ota_xfer_tick();
+
         int64_t uptime_us = esp_timer_get_time();
         uint32_t uptime_s = (uint32_t)(uptime_us / 1000000);
         uint32_t free_heap = (uint32_t)esp_get_free_heap_size();

@@ -141,6 +141,22 @@ typedef enum {
        whose payload is a single result byte (see WUPS_FW_UPDATE_RESULT_*).
        Payload: wups_net_fw_update_v1_hdr_t. */
     WUPS_OP_NET_FW_UPDATE     = 0x22,
+
+    /* net.fw_xfer_* — chunked firmware-image transfer over the local WUPS
+       link. One wire format, two directions:
+         - Workbench (USB) -> RP2040 -> ESP32: the browser pushes an ESP32
+           app image into the ESP32's passive OTA slot (RP2040 only routes).
+         - ESP32 -> RP2040: the ESP32 relays an RP2040 image it downloaded
+           over LTE (net.fw_update with target=RP2040) into the RP2040's
+           staging area.
+       STRICTLY stop-and-wait: the sender MUST wait for each RESP before
+       sending the next REQ — the RP2040 stalls its UART RX while erasing /
+       programming flash, so pipelined frames would be lost. The receiver
+       drops an idle session after WUPS_FW_XFER_IDLE_TIMEOUT_S; BEGIN
+       implicitly aborts any session in progress. */
+    WUPS_OP_NET_FW_XFER_BEGIN = 0x23,  /* wups_net_fw_xfer_begin_v1_t; RESP: [result] */
+    WUPS_OP_NET_FW_XFER_DATA  = 0x24,  /* u32 offset LE + raw bytes;    RESP: [result] */
+    WUPS_OP_NET_FW_XFER_END   = 0x25,  /* wups_net_fw_xfer_end_v1_t;    RESP: [result] */
 } wups_op_net_t;
 
 /* net.config items (the `item` field of wups_net_config_v1_hdr_t). */
@@ -377,11 +393,53 @@ typedef struct WUPS_PACKED {
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */
     uint8_t  url_len;        /* bytes of ASCII URL following the header */
-    uint16_t reserved;
+    uint8_t  target;         /* WUPS_FW_TARGET_* — 0 (legacy encoders) = ESP32 */
+    uint8_t  reserved;
     uint32_t image_len;      /* expected app image size in bytes */
     char     sha256_hex[64]; /* ASCII hex SHA-256 of the image, no NUL */
     /* char url[url_len] follows */
 } wups_net_fw_update_v1_hdr_t;
+
+/* Firmware-transfer targets (net.fw_update `target` / net.fw_xfer_begin). */
+#define WUPS_FW_TARGET_ESP32   1u
+#define WUPS_FW_TARGET_RP2040  2u
+
+/* net.fw_xfer_begin — opens a transfer session on the receiving MCU. */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 1 */
+    uint8_t  target;         /* WUPS_FW_TARGET_* — must match the receiver */
+    uint8_t  reserved[2];
+    uint32_t image_len;      /* total image size in bytes */
+    uint8_t  sha256[32];     /* RAW SHA-256 of the exact image bytes */
+} wups_net_fw_xfer_begin_v1_t;
+
+/* net.fw_xfer_data — one chunk: this header + raw image bytes (chunk length
+ * = frame LEN - sizeof(header), max WUPS_FW_XFER_CHUNK). `offset` must equal
+ * the byte count received so far (contiguous, in-order) — anything else is
+ * answered with SEQ_MISMATCH and the sender restarts from BEGIN. */
+typedef struct WUPS_PACKED {
+    uint32_t offset;         /* LE, contiguous */
+} wups_net_fw_xfer_data_v1_hdr_t;
+
+/* net.fw_xfer_end — closes the session. commit=1: verify SHA-256 over the
+ * staged image and on success apply + reboot; commit=0: abort/discard. */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 1 */
+    uint8_t  commit;         /* 1 = verify+apply+reboot, 0 = abort */
+    uint8_t  reserved[2];
+} wups_net_fw_xfer_end_v1_t;
+
+/* Max image bytes per fw_xfer_data frame. */
+#define WUPS_FW_XFER_CHUNK        (WUPS_MAX_PAYLOAD - 4u)
+
+/* fw_xfer RESP result codes (single byte at payload[0]). */
+#define WUPS_FW_XFER_OK             0u
+#define WUPS_FW_XFER_BAD_REQ        1u  /* malformed / wrong target / bad len */
+#define WUPS_FW_XFER_BUSY           2u  /* another update session in progress */
+#define WUPS_FW_XFER_SEQ_MISMATCH   3u  /* offset not contiguous — restart    */
+#define WUPS_FW_XFER_FLASH_ERR      4u  /* staging write/erase failed         */
+#define WUPS_FW_XFER_VERIFY_FAIL    5u  /* SHA-256 mismatch at END(commit)    */
+#define WUPS_FW_XFER_IDLE_TIMEOUT_S 30u
 
 /* net.fw_update RESP result codes (single byte at payload[0]). "OK" only
  * means the download was accepted and started — completion/failure is

@@ -13,7 +13,11 @@
  *
  * Inbound (handled in wups_link.c):
  *   - system.ping    REQ → system.ping RESP with uptime + fw_version.
+ *   - system.hello   from RP2040 → fw_ota relay reboot detector.
  *   - net.publish    REQ → forward via mqtt_publish_raw().
+ *   - net.config     REQ → persist HTTP-mode endpoint in NVS.
+ *   - net.fw_xfer_*  REQ → fw_ota receiver (Workbench USB push);
+ *                    RESP → fw_ota relay sender stop-and-wait.
  *
  * Wire format and payload structs are defined in
  * Web3-Pi-UPS/common/protocol.h (pulled in via wups_proto.h).

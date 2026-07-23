@@ -471,7 +471,7 @@ static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
             wups_sys_pong_v1_t pong;
             pong.version    = 1;
             pong.reserved   = 0;
-            pong.fw_version = (uint16_t)((0u << 8) | 6u); /* coarse 0.6 */
+            pong.fw_version = (uint16_t)((0u << 8) | 7u); /* coarse 0.7 */
             pong.uptime_ms  = (uint32_t)(esp_timer_get_time() / 1000);
             memcpy(buf, &pong, sizeof(pong));
             const char *fw = identity_fw_version();       /* "esp32:x.y.z" */
@@ -482,7 +482,14 @@ static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
                                (uint16_t)(sizeof(pong) + fw_len));
             return;
         }
-        /* hello / log / status_query — ignored in v1 */
+        /* system.hello from the RP2040 — the fw_ota relay (target=RP2040)
+         * uses it as the "rebooted into the new image" signal. Cheap
+         * counter bump; no-op for every other consumer. */
+        if (op == WUPS_OP_SYS_HELLO && src == WUPS_ADDR_RP2040) {
+            fw_ota_notify_rp2040_hello();
+            return;
+        }
+        /* log / status_query — ignored in v1 */
         return;
     }
     if (cls == WUPS_CLASS_NET) {
@@ -492,6 +499,21 @@ static void on_local_frame(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
         }
         if (op == WUPS_OP_NET_CONFIG && (flags & WUPS_FLAG_REQ)) {
             handle_net_config(src, seq, payload, len);
+            return;
+        }
+        /* fw_xfer (OTA matrix): REQs make us the RECEIVER (Workbench pushes
+         * an ESP32 image through the RP2040 router — local USB link, so no
+         * WS-9 envelope: physical access is the auth model, same as every
+         * other local command). RESPs belong to our SENDER side (the
+         * RP2040 answering the LTE relay's stop-and-wait chunks). */
+        if (op == WUPS_OP_NET_FW_XFER_BEGIN ||
+            op == WUPS_OP_NET_FW_XFER_DATA ||
+            op == WUPS_OP_NET_FW_XFER_END) {
+            if (flags & WUPS_FLAG_REQ) {
+                fw_ota_xfer_on_req(op, src, seq, payload, len);
+            } else if (flags & WUPS_FLAG_RESP) {
+                fw_ota_xfer_on_resp(op, seq, payload, len);
+            }
             return;
         }
         /* status / downlink / time_sync are outbound from us; drop. */
