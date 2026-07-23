@@ -9,6 +9,7 @@
 #include "trust_ui.h"
 #include "ui_settings.h"
 #include "local_menu.h"
+#include "fw_update.h"
 
 // --- I2C for OLED ---
 constexpr uint8_t I2C0_SDA_PIN = 8;
@@ -225,8 +226,8 @@ unsigned long netAlertDismissedAtMs = 0;
 // Firmware version, reported in system.ping RESP / system.hello. The string
 // rides the optional pong tail (protocol.h); the u16 stays as the coarse
 // legacy field. Bump on release.
-#define FW_VERSION_STR "rp2040:1.1.0"
-#define FW_VERSION_U16 ((uint16_t)((1u << 8) | 1u))   /* coarse 1.1 */
+#define FW_VERSION_STR "rp2040:1.2.0"
+#define FW_VERSION_U16 ((uint16_t)((1u << 8) | 2u))   /* coarse 1.2 */
 
 // stream dies the cached ui.* values FREEZE and everything downstream
 // (OLED, alarms, uplink-on-change) silently runs on dead data — exactly
@@ -874,6 +875,12 @@ static void wupsSendLogToHost(uint8_t level, const char* text) {
 }
 
 void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
+  // OTA-2 pending-verify heartbeat: ANY locally-delivered frame (checksum
+  // already verified by the deframer) proves a freshly applied firmware's
+  // RX path + router + dispatcher work end-to-end — confirm the update and
+  // drop the rollback snapshot. Cheap no-op when nothing is pending.
+  fw_update_note_frame_ok();
+
   // Command RESP bridge: a HOST command RESP that came UP from the RPi agent
   // (service start/stop/restart, os.reboot/shutdown) is destined back to the
   // cloud, but its dst=RPI would route straight back out the RPI port and be
@@ -1142,6 +1149,57 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     // Re-inject through the router so broadcast/unicast frames are also
     // forwarded to CH32X / RPi as required (e.g. ups.power.* lives on CH32X).
     wups_route_frame(inbound_port, ifr);
+    return;
+  }
+
+  // OTA-2 — net.fw_xfer_{begin,data,end} (0x23/0x24/0x25) addressed to US:
+  // chunked RP2040 self-update. Sender is the ESP32 over UART1 (LTE OTA
+  // relay, fw.update target=RP2040) or the host/Workbench over USB-CDC.
+  // Strictly stop-and-wait: each handler does ALL its flash work before we
+  // RESP, so the sender never transmits into a receiver stalled by an
+  // erase (see fw_update.h). Unicast-only — a broadcast fw_xfer would hit
+  // the ESP32's own receiver too, so require dst == RP2040.
+  if (f.cls == WUPS_CLASS_NET && (f.flags & WUPS_FLAG_REQ) &&
+      f.dst == WUPS_ADDR_RP2040 &&
+      (f.op == WUPS_OP_NET_FW_XFER_BEGIN ||
+       f.op == WUPS_OP_NET_FW_XFER_DATA  ||
+       f.op == WUPS_OP_NET_FW_XFER_END)) {
+    bool reboot_after = false;
+    uint8_t result;
+    if (f.op == WUPS_OP_NET_FW_XFER_BEGIN) {
+      // The FW UPDATE screen is about to take the OLED (fw branch at the
+      // top of loop()); close the local menu so it can't resume on a
+      // phantom edge afterwards — same guard as the trust_prompt path.
+      if (local_menu_active()) local_menu_close();
+      result = fw_update_handle_begin(f.payload, f.len);
+    } else if (f.op == WUPS_OP_NET_FW_XFER_DATA) {
+      result = fw_update_handle_data(f.payload, f.len);
+    } else {
+      // END(commit=1) blocks loop() for several seconds (SHA verify +
+      // rollback snapshot + arm) — paint the "applying" screen NOW, it is
+      // the last OLED update before the reboot. payload[1] = commit flag.
+      if (f.len >= 2 && f.payload[1] == 1) fw_update_render_applying(oled);
+      result = fw_update_handle_end(f.payload, f.len, &reboot_after);
+    }
+
+    uint8_t out_port = WUPS_PORT_NONE;
+    if      (f.src == WUPS_ADDR_RPI)   out_port = WUPS_PORT_RPI;
+    else if (f.src == WUPS_ADDR_ESP32) out_port = WUPS_PORT_ESP32;
+    else if (f.src == WUPS_ADDR_CH32X) out_port = WUPS_PORT_CH32X;
+    if (out_port != WUPS_PORT_NONE) {
+      wups_send_seq(out_port, f.src, WUPS_CLASS_NET, f.op,
+                    WUPS_FLAG_RESP, f.seq, &result, 1);
+    }
+
+    if (reboot_after) {
+      // RESP result byte FIRST, drain the TX path so it actually leaves
+      // the box, then reboot into the OTA bootloader which applies the
+      // staged image from LittleFS.
+      if (out_port == WUPS_PORT_RPI)   Serial.flush();
+      if (out_port == WUPS_PORT_ESP32) Serial2.flush();
+      delay(200);   // let the far side read the RESP before USB drops
+      rp2040.reboot();
+    }
     return;
   }
 
@@ -1719,6 +1777,12 @@ void setup() {
   // Play startup melody
   playStartupMelody();
 
+  // OTA-2 — mount LittleFS, clean stale staging, and run the pending-verify
+  // / rollback boot checks (may reboot on a crash-loop rollback). Runs with
+  // the splash already up and BEFORE the watchdog is armed: the first boot
+  // after reflashing auto-formats the 1 MB filesystem, which takes ~10 s.
+  fw_update_boot_init();
+
   // Initialize interaction time for auto-return
   lastInteractionTime = millis();
 
@@ -1750,6 +1814,23 @@ void loop() {
   // Shovel as much of the debug ring buffer as the SerialPIO HW FIFO can
   // accept, then return. Non-blocking, runs every loop iteration (~50 ms).
   dbgRing.pump(dbgSerial);
+
+  // OTA-2 timeouts: 30 s fw_xfer session idle discard + the ~5 min
+  // pending-verify rollback (may reboot). Runs before every early-return
+  // branch below so it ticks even while a menu owns the display.
+  fw_update_tick();
+
+  // OTA-2 — while a fw_xfer session is open the FW UPDATE screen owns the
+  // OLED outright: placed ABOVE trust_ui / local menu / all alert banners
+  // so nothing can preempt it, and buttons are simply not read (nav and
+  // menu gestures suppressed). Frames keep flowing via wups_router_drain()
+  // above; the short delay paces the stop-and-wait transfer faster than
+  // the dashboard's 50 ms cadence (the sender waits for each RESP).
+  if (fw_update_session_active()) {
+    fw_update_render(oled);
+    delay(5);
+    return;
+  }
 
   // Track 2 / ADR-0011 §10.1/§10.4 — the Paranoic owner-binding gate is a
   // security override: while a ui.trust_prompt is active the trust UI owns
