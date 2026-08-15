@@ -109,3 +109,7 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# Deployment-specific WS token for the self-hosted Arkiv node (see
+# main/arkiv_ws_token.h.example) — never commit the real one.
+main/arkiv_ws_token.h

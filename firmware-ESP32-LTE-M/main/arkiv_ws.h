@@ -13,7 +13,8 @@ extern "C" {
  * Track 2 / ADR-0011 — Arkiv command channel over WebSocket (eth_subscribe).
  *
  * Replaces the 5-second HTTP `arkiv_query` cmd-poll with a long-lived WSS
- * subscription to `wss://braga.hoodi.arkiv.network/rpc/ws`. The node emits
+ * subscription to the self-hosted node (`wss://arkiv.web3pi.io/ws/<token>`,
+ * see arkiv_ws.c / arkiv_ws_token.h.example). The node emits
  * `ArkivEntityCreated(...)` (and friends) on every storage write; we
  * subscribe to it with a server-side filter on
  *   address = ARKIV_STORAGE_CONTRACT,

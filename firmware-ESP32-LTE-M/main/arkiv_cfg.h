@@ -2,12 +2,15 @@
 
 /*
  * Track 2 / ADR-0011 — Arkiv (Paranoic) configuration & on-chain entity
- * contract. Braga testnet only (project scope: no mainnet).
+ * contract. Network: self-hosted Web3 Pi Arkiv chain (Panel ADR-0015;
+ * replaced the Braga testnet after its 2026-08-12 sunset). Same wire
+ * contract — the node runs the pinned Braga-era arkiv-op-geth build.
  */
 
 /* Single RPC gateway (plan §4.7). Availability deliberately NOT protected. */
-#define ARKIV_RPC_URL           "https://braga.hoodi.arkiv.network/rpc"
-#define ARKIV_CHAIN_ID          60138453102ULL
+#define ARKIV_RPC_URL           "https://arkiv.web3pi.io/rpc"
+/* 0x77337069 — ASCII "w3pi". EIP-155 signing must match the node's genesis. */
+#define ARKIV_CHAIN_ID          1999859817ULL
 
 #define ARKIV_CMD_ENTITY_TYPE   "w3pups-cmd"
 

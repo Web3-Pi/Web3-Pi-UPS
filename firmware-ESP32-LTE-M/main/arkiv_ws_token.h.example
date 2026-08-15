@@ -1,0 +1,8 @@
+#pragma once
+
+/*
+ * Secret path segment of the Arkiv node's WS endpoint (see arkiv_ws.c).
+ * Copy this file to arkiv_ws_token.h (gitignored) and paste the token
+ * from the node deployment (/opt/arkiv-node/ws-token.txt on the host).
+ */
+#define ARKIV_WS_TOKEN "00000000000000000000000000000000"

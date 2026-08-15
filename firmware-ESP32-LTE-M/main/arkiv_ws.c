@@ -19,12 +19,19 @@
 
 #define TAG "arkiv_ws"
 
-/* WSS endpoint — same host as the HTTPS RPC, with the `/ws` suffix the
- * Arkiv node serves go-ethereum's WS RPC at (see arkiv-sdk-js
- * src/chains/braga.ts: webSocket = wss://…/rpc/ws). Pinned via the
- * public CA bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) the rest of the
- * firmware uses for HTTPS/MQTTS. */
-#define ARKIV_WS_URI               "wss://braga.hoodi.arkiv.network/rpc/ws"
+/* WSS endpoint — same host as the HTTPS RPC. The self-hosted node's WS
+ * lives behind a token path (`/ws/<token>`, enforced by the HAProxy in
+ * front of the node): the proxy's JSON-RPC method deny-list cannot
+ * inspect WS frames, so the unguessable path keeps internet scanners off
+ * the socket. The token ships inside every firmware image, so it is
+ * scan-protection, not a secret against a determined attacker (the RPC
+ * itself is public and the threat model already tolerates a hostile
+ * gateway). Value lives in the gitignored arkiv_ws_token.h — copy
+ * arkiv_ws_token.h.example and fill in the deployment's token. Pinned
+ * via the public CA bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) the rest
+ * of the firmware uses for HTTPS/MQTTS. */
+#include "arkiv_ws_token.h"
+#define ARKIV_WS_URI               "wss://arkiv.web3pi.io/ws/" ARKIV_WS_TOKEN
 
 /* Operator's safe ping cadence — 1NCE/SimBase may close idle PPP TCP
  * after ~20 min; 30 s is well under any reasonable idle timeout while
