@@ -30,7 +30,16 @@
  * arkiv_ws_token.h.example and fill in the deployment's token. Pinned
  * via the public CA bundle (CONFIG_MBEDTLS_CERTIFICATE_BUNDLE) the rest
  * of the firmware uses for HTTPS/MQTTS. */
+#if __has_include("arkiv_ws_token.h")
 #include "arkiv_ws_token.h"
+#else
+/* CI / fresh checkouts build with the committed placeholder: the proxy
+ * 404s the WS upgrade, arkiv_ws reconnect-loops and the cmd channel
+ * falls back to the 5 s HTTP poll — degraded but functional. Production
+ * images MUST be built with the real token in place. */
+#include "arkiv_ws_token.h.example"
+#pragma message("arkiv_ws_token.h missing - placeholder WS token in use (WS push will 404; copy arkiv_ws_token.h.example)")
+#endif
 #define ARKIV_WS_URI               "wss://arkiv.web3pi.io/ws/" ARKIV_WS_TOKEN
 
 /* Operator's safe ping cadence — 1NCE/SimBase may close idle PPP TCP
