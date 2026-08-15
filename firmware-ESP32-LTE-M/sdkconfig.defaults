@@ -54,3 +54,13 @@ CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS=600000
 #     force-define MIB2_STATS 0 (the MIB2_STATS=1 itself comes from a global
 #     compile option in CMakeLists.txt — it changes struct netif layout). ---
 CONFIG_LWIP_STATS=y
+
+# --- UART ISR in IRAM: without this every flash op (OTA writes, NVS commits)
+#     masks the UART ISRs for the whole cache-disabled window; at 921600 the
+#     128 B RX FIFO of the RP2040 link (UART2) overflows within ~1.4 ms, and
+#     the resulting ring-buffer-full storms arm a cross-core race in the IDF
+#     driver (uart.c uart_check_buf_full vs ISR, present through v6.0.2 and
+#     master) that leaves RX interrupts permanently disabled — RX goes
+#     silently deaf until reboot. Field-hit on two units, 2026-08. With this
+#     set, uart_driver_install auto-adds ESP_INTR_FLAG_IRAM. ---
+CONFIG_UART_ISR_IN_IRAM=y

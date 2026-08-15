@@ -1029,14 +1029,22 @@ void fw_ota_xfer_tick(void)
     /* Zero-timeout take: if the lock is held the session is mid-frame right
      * now, i.e. not idle — check again on the next heartbeat. */
     if (xSemaphoreTake(s_xfer_lock, 0) != pdTRUE) return;
+    bool aborted = false;
     if (s_xfer_open &&
         esp_timer_get_time() - s_xfer_last_us >
             (int64_t)WUPS_FW_XFER_IDLE_TIMEOUT_S * 1000000) {
         xfer_abort_locked("idle timeout");
+        aborted = true;
+    }
+    xSemaphoreGive(s_xfer_lock);
+    /* QoS-1 publish OUTSIDE the lock: with the lock held this could park the
+     * heartbeat task on the esp-mqtt API for up to network.timeout_ms while
+     * rx_task waits on the same lock at portMAX_DELAY for the next fw_xfer
+     * frame — wedging the whole RP2040 link. */
+    if (aborted) {
         emit_status("{\"fw_update\":\"error\",\"stage\":\"xfer\","
                     "\"detail\":\"idle timeout\",\"via\":\"usb\"}");
     }
-    xSemaphoreGive(s_xfer_lock);
 }
 
 void fw_ota_notify_rp2040_hello(void)

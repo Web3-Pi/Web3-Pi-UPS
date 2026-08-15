@@ -22,6 +22,18 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "sdkconfig.h"
+
+/* Load-bearing config: without the UART ISR in IRAM every flash op masks RX
+ * for the whole cache-disabled window and the overflow storms that armed the
+ * 2026-08 RX-death wedge return. sdkconfig.defaults sets it, but a stale
+ * generated sdkconfig silently overrides defaults ("not set" is a recorded
+ * value) — so fail the build instead of shipping a regressed image that
+ * still reports the fixed version string. Fix: delete sdkconfig (or run
+ * tools/idf reconfigure after removing it) so it regenerates from defaults. */
+#if !CONFIG_UART_ISR_IN_IRAM
+#error "CONFIG_UART_ISR_IN_IRAM=y required (UART2 RX-death fix) — delete stale sdkconfig and rebuild from sdkconfig.defaults"
+#endif
 
 #define TAG "wups_link"
 
@@ -52,6 +64,21 @@
 #define WUPS_UART_RX_BUFSIZE 1024
 #define WUPS_UART_TX_BUFSIZE 0
 
+/* RX watchdog. The RP2040 uplinks telemetry every <=30 s and answers
+ * system.ping on every firmware vintage, so a healthy link is never silent
+ * for a minute. Field failure 2026-08 (two units): an IDF driver race left
+ * RX interrupts permanently disabled — uart_read_bytes returned 0 forever
+ * while TX kept working. See uart_bringup() for the race notes. */
+#define WUPS_RX_IDLE_PING_MS     60000  /* RX silence before the first probe */
+#define WUPS_RX_PING_RETRY_MS    15000  /* probe spacing / post-probe grace */
+/* Escalate to reboot only on the 6th consecutive recovery cycle (~9 min of
+ * silence). A real RX wedge is already healed by the FIRST driver reinstall
+ * at ~90 s, so the reboot is a true last resort — and the long ladder keeps
+ * a deliberately halted RP2040 (SWD breakpoint, BOOTSEL/Workbench flash,
+ * board detached mid-session) from rebooting a healthy ESP32 during routine
+ * maintenance. */
+#define WUPS_RX_REBOOT_CYCLE     6
+
 /* --- module state ------------------------------------------------------- */
 
 static SemaphoreHandle_t s_tx_mutex;
@@ -72,6 +99,7 @@ static volatile uint32_t s_frames_rx = 0;
 static volatile uint32_t s_bytes_tx  = 0;
 static volatile uint32_t s_bytes_rx  = 0;
 static volatile uint32_t s_rx_resync = 0;  /* SYNC2 mismatch — out-of-frame bytes seen */
+static volatile uint32_t s_rx_reinstalls = 0;  /* RX-watchdog driver reinstalls */
 
 typedef enum {
     WUPS_RX_SYNC1 = 0,
@@ -149,10 +177,10 @@ static void send_frame_full(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
 
 void wups_link_log_stats(void)
 {
-    ESP_LOGI(TAG, "stats: tx=%lu (%lu B) rx=%lu (%lu B) resync=%lu",
+    ESP_LOGI(TAG, "stats: tx=%lu (%lu B) rx=%lu (%lu B) resync=%lu reinst=%lu",
              (unsigned long)s_frames_tx, (unsigned long)s_bytes_tx,
              (unsigned long)s_frames_rx, (unsigned long)s_bytes_rx,
-             (unsigned long)s_rx_resync);
+             (unsigned long)s_rx_resync, (unsigned long)s_rx_reinstalls);
 }
 
 void wups_link_send_seq(uint8_t dst, uint8_t cls, uint8_t op,
@@ -647,10 +675,84 @@ static void rx_byte(uint8_t b)
     }
 }
 
+/* Configure + install the UART driver. Called from init and from the RX
+ * watchdog's recovery path.
+ *
+ * The RX-death race this feeds into (field-hit 2026-08, two units): the IDF
+ * driver's ring-buffer-full handling desyncs `rx_buffer_full_flg` against
+ * the RXFIFO_TOUT|FULL interrupt-enable bits when the ISR (core 0) and the
+ * reader run on different cores — IDF's own comment in uart_read_bytes
+ * admits the flag "may lose synchronization", and the losing interleaving
+ * leaves RX interrupts off with the flag false, i.e. nothing ever re-enables
+ * them (verified present through v6.0.2 and master). Mitigations here:
+ * CONFIG_UART_ISR_IN_IRAM=y (no more FIFO-overflow storms during flash ops
+ * arming the race), the rx_task pinned to core 0 (same core as the ISR ⇒
+ * the desync can't happen per IDF's comment), and the RX watchdog reinstall
+ * as defense in depth for any variant that slips through (e.g. an S3 FIFO
+ * desync from the OVF-path rxfifo_rst toggle). */
+static esp_err_t uart_bringup(void)
+{
+    /* ADR-0012 / 2026-05-25: HW flow control disabled. The CTS/RTS handshake
+     * misbehaved across ESP32-only reboots — RP2040 saw a stuck or pulsing
+     * CTS from the booting ESP32 and either paused sends or sent into a
+     * non-listening RX, leaving the deframer permanently desynced (resync
+     * counter climbed every frame, telemetry only worked after a full
+     * power-cycle). Without HW flow control we rely on the 4 KB RX FIFO
+     * + per-frame Fletcher-8 checksum + deframer resync — the existing
+     * defense-in-depth was already carrying the load, so dropping CTS/RTS
+     * trades a soft "stop sending" hint for a more robust cold-start. */
+    uart_config_t cfg = {
+        .baud_rate           = WUPS_UART_BAUD,
+        .data_bits           = UART_DATA_8_BITS,
+        .parity              = UART_PARITY_DISABLE,
+        .stop_bits           = UART_STOP_BITS_1,
+        .flow_ctrl           = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk          = UART_SCLK_DEFAULT,
+    };
+
+    esp_err_t err = uart_param_config(WUPS_UART_NUM, &cfg);
+    if (err != ESP_OK) return err;
+
+    /* TX + RX only; pass UART_PIN_NO_CHANGE for RTS/CTS so the pins stay
+     * driven by their previous configuration (typically inputs with
+     * pullups) and don't try to negotiate a phantom handshake. */
+    err = uart_set_pin(WUPS_UART_NUM, WUPS_UART_TX_PIN, WUPS_UART_RX_PIN,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err != ESP_OK) return err;
+
+    return uart_driver_install(WUPS_UART_NUM, WUPS_UART_RX_BUFSIZE,
+                               WUPS_UART_TX_BUFSIZE, 0, NULL, 0);
+}
+
+/* RX-watchdog recovery: tear the driver down and bring it back up. Runs in
+ * rx_task (the sole reader, so nothing is blocked inside uart_read_bytes),
+ * which is pinned to core 0 — the reinstalled ISR lands back on core 0 too.
+ * The TX mutex keeps concurrent senders (MQTT downlink, OTA banners) off
+ * the dying handle for the few ms this takes. */
+static void rx_link_recover(void)
+{
+    xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
+    uart_driver_delete(WUPS_UART_NUM);
+    esp_err_t err = uart_bringup();
+    xSemaphoreGive(s_tx_mutex);
+    rx_reset();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UART reinstall failed (%s) — rebooting",
+                 esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(100));   /* let the log line drain */
+        esp_restart();
+    }
+}
+
 static void rx_task(void *arg)
 {
     (void)arg;
     uint8_t buf[64];
+    int64_t last_rx_us      = esp_timer_get_time();
+    int64_t last_ping_us    = 0;
+    int     pings_sent      = 0;
+    int     recovery_cycles = 0;
     while (1) {
         int n = uart_read_bytes(WUPS_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(50));
         if (n < 0) {
@@ -658,8 +760,63 @@ static void rx_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        if (n > 0) s_bytes_rx += (uint32_t)n;
+        if (n > 0) {
+            s_bytes_rx += (uint32_t)n;
+            last_rx_us      = esp_timer_get_time();
+            pings_sent      = 0;
+            recovery_cycles = 0;
+        }
         for (int i = 0; i < n; ++i) rx_byte(buf[i]);
+
+        /* --- RX watchdog (see uart_bringup for the failure this heals) ---
+         * In the wedged state uart_read_bytes returns 0 forever while TX
+         * still works, so this loop keeps spinning and can self-heal:
+         * probe with system.ping (answered by every RP2040 vintage), then
+         * reinstall the driver, then reboot as the last resort. */
+        if (fw_ota_in_progress()) {
+            /* OTA download / RP2040 relay / fw_xfer sessions have irregular
+             * link traffic (and fw_xfer stalls this task on flash writes by
+             * design) — don't probe into them; restart the window after. */
+            last_rx_us = esp_timer_get_time();
+            pings_sent = 0;
+            continue;
+        }
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_rx_us < (int64_t)WUPS_RX_IDLE_PING_MS * 1000) continue;
+        if (pings_sent < 2) {
+            if (pings_sent == 0 ||
+                now_us - last_ping_us >= (int64_t)WUPS_RX_PING_RETRY_MS * 1000) {
+                ESP_LOGW(TAG, "RX idle %llds — ping probe %d/2",
+                         (long long)((now_us - last_rx_us) / 1000000),
+                         pings_sent + 1);
+                wups_link_send(WUPS_ADDR_RP2040, WUPS_CLASS_SYSTEM,
+                               WUPS_OP_SYS_PING, WUPS_FLAG_REQ, NULL, 0);
+                pings_sent++;
+                last_ping_us = now_us;
+            }
+            continue;
+        }
+        if (now_us - last_ping_us < (int64_t)WUPS_RX_PING_RETRY_MS * 1000) continue;
+
+        /* Two probes unanswered — the RX path is dead. Escalate to a reboot
+         * only if the link has worked this boot (s_frames_rx > 0): a bench
+         * card with no RP2040 attached keeps cycling cheap reinstalls
+         * instead of reboot-looping. */
+        recovery_cycles++;
+        if (recovery_cycles >= WUPS_RX_REBOOT_CYCLE && s_frames_rx > 0) {
+            ESP_LOGE(TAG, "RX dead after %d driver reinstalls (frames_rx=%lu) "
+                          "— rebooting", recovery_cycles - 1,
+                     (unsigned long)s_frames_rx);
+            vTaskDelay(pdMS_TO_TICKS(100));   /* let the log line drain */
+            esp_restart();
+        }
+        ESP_LOGE(TAG, "RX silent %llds, 2 pings unanswered — reinstalling "
+                      "UART driver (cycle %d)",
+                 (long long)((now_us - last_rx_us) / 1000000), recovery_cycles);
+        s_rx_reinstalls++;
+        rx_link_recover();
+        last_rx_us = esp_timer_get_time();
+        pings_sent = 0;
     }
 }
 
@@ -755,42 +912,16 @@ esp_err_t wups_link_init(void)
 
     rx_reset();
 
-    /* ADR-0012 / 2026-05-25: HW flow control disabled. The CTS/RTS handshake
-     * misbehaved across ESP32-only reboots — RP2040 saw a stuck or pulsing
-     * CTS from the booting ESP32 and either paused sends or sent into a
-     * non-listening RX, leaving the deframer permanently desynced (resync
-     * counter climbed every frame, telemetry only worked after a full
-     * power-cycle). Without HW flow control we rely on the 4 KB RX FIFO
-     * + per-frame Fletcher-8 checksum + deframer resync — the existing
-     * defense-in-depth was already carrying the load, so dropping CTS/RTS
-     * trades a soft "stop sending" hint for a more robust cold-start. */
-    uart_config_t cfg = {
-        .baud_rate           = WUPS_UART_BAUD,
-        .data_bits           = UART_DATA_8_BITS,
-        .parity              = UART_PARITY_DISABLE,
-        .stop_bits           = UART_STOP_BITS_1,
-        .flow_ctrl           = UART_HW_FLOWCTRL_DISABLE,
-        .rx_flow_ctrl_thresh = 0,
-        .source_clk          = UART_SCLK_DEFAULT,
-    };
-
-    esp_err_t err = uart_param_config(WUPS_UART_NUM, &cfg);
-    if (err != ESP_OK) return err;
-
-    /* TX + RX only; pass UART_PIN_NO_CHANGE for RTS/CTS so the pins stay
-     * driven by their previous configuration (typically inputs with
-     * pullups) and don't try to negotiate a phantom handshake. */
-    err = uart_set_pin(WUPS_UART_NUM, WUPS_UART_TX_PIN, WUPS_UART_RX_PIN,
-                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    if (err != ESP_OK) return err;
-
-    err = uart_driver_install(WUPS_UART_NUM, WUPS_UART_RX_BUFSIZE,
-                              WUPS_UART_TX_BUFSIZE, 0, NULL, 0);
+    esp_err_t err = uart_bringup();
     if (err != ESP_OK) return err;
 
     /* 4 KB stack: deframer + occasional mqtt_publish_raw call (which just
-     * enqueues to the MQTT task). */
-    BaseType_t ok = xTaskCreate(rx_task, "wups_rx", 4096, NULL, 5, NULL);
+     * enqueues to the MQTT task). Pinned to core 0 — the same core the UART
+     * ISR was allocated on (app_main) — so the driver's cross-core
+     * rx_buffer_full_flg desync (see uart_bringup) is structurally
+     * impossible. */
+    BaseType_t ok = xTaskCreatePinnedToCore(rx_task, "wups_rx", 4096, NULL, 5,
+                                            NULL, 0);
     if (ok != pdPASS) return ESP_ERR_NO_MEM;
 
     /* Hook MQTT inbound → net.downlink. The handler will fire once MQTT
