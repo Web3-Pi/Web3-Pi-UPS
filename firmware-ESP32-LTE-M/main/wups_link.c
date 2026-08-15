@@ -18,6 +18,7 @@
 
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -820,6 +821,109 @@ static void rx_task(void *arg)
     }
 }
 
+/* --- system.reset (panel "Restart ESP32", ESP32-local) ------------------ */
+
+static void sys_reset_timer_cb(void *arg)
+{
+    (void)arg;
+    esp_restart();
+}
+
+/* Intercept a system.reset REQ addressed to us (or broadcast — the panel
+ * always sends DST=BROADCAST and, like net.fw_update, this must never reach
+ * the RP2040). RESPs on cmd/response first, then restarts via a one-shot
+ * timer so the esp-mqtt task keeps running long enough to flush the RESP.
+ * Returns true when the frame was consumed. */
+static bool try_handle_sys_reset(const uint8_t *frame, size_t frame_len)
+{
+    if (!frame || frame_len < WUPS_FRAMING_BYTES) return false;
+    if (frame[0] != WUPS_SYNC1 || frame[1] != WUPS_SYNC2) return false;
+    if (frame[4] != WUPS_CLASS_SYSTEM || frame[5] != WUPS_OP_SYS_RESET) {
+        return false;                 /* not ours — forward as usual */
+    }
+    if (frame[2] != WUPS_ADDR_ESP32 && frame[2] != WUPS_ADDR_BROADCAST) {
+        return false;                 /* explicit other-node reset — forward */
+    }
+
+    const uint8_t src   = frame[3];
+    const uint8_t flags = frame[6];
+    const uint8_t seq   = frame[7];
+    if (!(flags & WUPS_FLAG_REQ)) {
+        ESP_LOGW(TAG, "system.reset without REQ flag — dropping");
+        return true;
+    }
+
+    uint32_t delay_ms = 1500;         /* default: let the RESP flush */
+    uint8_t result = WUPS_SYS_RESET_RESULT_OK;
+    const uint16_t plen = (uint16_t)frame[8] | ((uint16_t)frame[9] << 8);
+    if ((size_t)WUPS_FRAMING_BYTES + plen > frame_len) {
+        result = WUPS_SYS_RESET_RESULT_BAD_REQ;
+    } else if (plen >= sizeof(wups_sys_reset_v1_t)) {
+        wups_sys_reset_v1_t req;
+        memcpy(&req, frame + WUPS_HEADER_BYTES, sizeof(req));
+        if (req.version != 1) {
+            result = WUPS_SYS_RESET_RESULT_BAD_REQ;
+        } else if (req.delay_ms) {
+            delay_ms = req.delay_ms;
+            if (delay_ms < 500)   delay_ms = 500;    /* RESP must get out */
+            if (delay_ms > 10000) delay_ms = 10000;
+        }
+    }
+    /* An OTA download / RP2040 relay / fw_xfer session must not be cut mid-
+     * flash — the operator can retry once it finishes (or times out). */
+    if (result == WUPS_SYS_RESET_RESULT_OK && fw_ota_in_progress()) {
+        result = WUPS_SYS_RESET_RESULT_BUSY;
+    }
+
+    /* Full inner WUPS RESP frame (dst = the REQ's src, result byte at
+     * payload[0]) — same cmd/response convention as fw_ota's ACK. */
+    uint8_t resp[WUPS_FRAMING_BYTES + 1];
+    resp[0]  = WUPS_SYNC1;
+    resp[1]  = WUPS_SYNC2;
+    resp[2]  = src;
+    resp[3]  = WUPS_ADDR_ESP32;
+    resp[4]  = WUPS_CLASS_SYSTEM;
+    resp[5]  = WUPS_OP_SYS_RESET;
+    resp[6]  = WUPS_FLAG_RESP;
+    resp[7]  = seq;
+    resp[8]  = 1;                     /* LEN_L */
+    resp[9]  = 0;                     /* LEN_H */
+    resp[10] = result;
+    uint8_t a, b;
+    wups_fletcher8(resp + 2, 9, &a, &b);
+    resp[11] = a;
+    resp[12] = b;
+    resp[13] = WUPS_END1;
+    resp[14] = WUPS_END2;
+    const char *topic = mqtt_topic_cmd_response();
+    if (topic[0]) {
+        (void)mqtt_publish_raw(topic, resp, sizeof(resp), /*qos=*/1, /*retain=*/0);
+    }
+
+    if (result != WUPS_SYS_RESET_RESULT_OK) {
+        ESP_LOGW(TAG, "system.reset refused (seq=%u result=%u)", seq, result);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "system.reset accepted (seq=%u) — restarting in %lu ms",
+             seq, (unsigned long)delay_ms);
+    static esp_timer_handle_t s_reset_timer;
+    if (!s_reset_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = sys_reset_timer_cb,
+            .name     = "sys_reset",
+        };
+        if (esp_timer_create(&args, &s_reset_timer) != ESP_OK) {
+            /* Can't schedule — restart inline; the RESP was enqueued QoS1
+             * and will be redelivered from the broker's session if lost. */
+            esp_restart();
+        }
+    }
+    esp_timer_stop(s_reset_timer);    /* re-trigger safe (repeated REQ) */
+    esp_timer_start_once(s_reset_timer, (uint64_t)delay_ms * 1000);
+    return true;
+}
+
 /* --- MQTT inbound → net.downlink -------------------------------------- */
 
 /* Forward an arriving MQTT message to RP2040 (hub) as a net.downlink event.
@@ -854,6 +958,11 @@ static void on_mqtt_data(const char *topic, size_t topic_len,
      * forward it to the RP2040. The hook validates, ACKs on cmd/response
      * and kicks off the download task; true = frame consumed. */
     if (fw_ota_try_handle_downlink((const uint8_t *)payload, payload_len)) {
+        return;
+    }
+
+    /* system.reset (panel "Restart ESP32") — also ESP32-local. */
+    if (try_handle_sys_reset((const uint8_t *)payload, payload_len)) {
         return;
     }
 

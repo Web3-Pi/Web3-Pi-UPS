@@ -123,6 +123,7 @@ cycles possible).
 | 0x02 | hello          | EVENT (broadcast)  | `wups_sys_hello_v1_t`         |
 | 0x03 | status_query   | REQ                | empty                          |
 | 0x04 | log            | EVENT              | `wups_sys_log_v1_hdr_t` + ASCII text |
+| 0x05 | reset          | REQ ↔, RESP ←      | `wups_sys_reset_v1_t` (optional) / 1 result byte |
 
 ### Class 0x02 POWER (CH32X)
 

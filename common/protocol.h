@@ -87,6 +87,12 @@ typedef enum {
     WUPS_OP_SYS_HELLO        = 0x02,
     WUPS_OP_SYS_STATUS_QUERY = 0x03,
     WUPS_OP_SYS_LOG          = 0x04,
+    /* Reset the receiving node. Panel-issued with DST=BROADCAST today, which
+       the ESP32 consumes locally (like net.fw_update — it never reaches the
+       RP2040); a future RP2040/CH32X reset would address DST explicitly.
+       Payload: wups_sys_reset_v1_t (optional — empty payload = defaults).
+       RESP: 1 byte result (see WUPS_SYS_RESET_RESULT_*). */
+    WUPS_OP_SYS_RESET        = 0x05,
     /* ADR-0012 — emitted by ESP32 when the OLED menu (or a future
        panel-side flow) initiates a backend-mode switch. Payload:
          u8 version=1
@@ -237,6 +243,19 @@ typedef struct WUPS_PACKED {
     uint16_t caps_classes;   /* bitmap, bit N = supports class N */
     uint32_t build_id;       /* git short hash or build epoch */
 } wups_sys_hello_v1_t;
+
+/* system.reset (REQ; RESP payload = 1 result byte). Empty REQ payload is
+ * valid — the node applies its default delay. The delay exists so the RESP
+ * can flush out (MQTT/UART) before the node goes down. */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 1 */
+    uint8_t  reserved;
+    uint16_t delay_ms;       /* restart delay; 0 = node default (~1500 ms) */
+} wups_sys_reset_v1_t;
+
+#define WUPS_SYS_RESET_RESULT_OK      0u  /* accepted, restarting shortly   */
+#define WUPS_SYS_RESET_RESULT_BUSY    1u  /* refused: fw update in progress */
+#define WUPS_SYS_RESET_RESULT_BAD_REQ 2u  /* malformed request              */
 
 /* system.log (EVENT, ASCII text follows; len = LEN of frame minus header) */
 typedef struct WUPS_PACKED {
