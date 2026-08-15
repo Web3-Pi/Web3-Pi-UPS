@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Wrapper that activates ESP-IDF v6.0 (EIM install) and runs idf.py with the
-# given arguments. Use this instead of remembering to `source activate_idf_v6.0.sh`
-# before every command.
+# Wrapper that activates ESP-IDF and runs idf.py with the given arguments.
+# Use this instead of remembering to source an activation script before
+# every command.
+#
+# The toolchain/python env comes from the EIM v6.0 install, but IDF_PATH is
+# overridden to the plain v6.0.2 checkout below (EIM doesn't manage patch
+# releases; 6.0.0→6.0.2 changes only gdb/openocd versions in tools.json, so
+# the EIM-installed compilers and python env still match). Keep IDF_VERSION_DIR
+# in sync with esp_idf_version in .github/workflows/firmware-ci.yml.
 #
 # Examples:
 #   tools/idf build
@@ -37,6 +43,17 @@ ESP_ROM_ELF_DIR|OPENOCD_SCRIPTS|IDF_PYTHON_ENV_PATH|ESP_IDF_VERSION)
       ;;
   esac
 done < <(bash "$ACTIVATE" -e)
+
+# Pin the IDF source tree to the v6.0.2 checkout (see header comment). Must
+# happen after the EIM env is applied (the dump sets IDF_PATH to v6.0.0) and
+# before the PATH assembly below so the right idf.py wins.
+IDF_VERSION_DIR="/Users/cmd0s/esp/v6.0.2"
+if [[ ! -f "$IDF_VERSION_DIR/tools/idf.py" ]]; then
+  echo "ERROR: ESP-IDF checkout not found at: $IDF_VERSION_DIR" >&2
+  exit 1
+fi
+export IDF_PATH="$IDF_VERSION_DIR"
+export ESP_IDF_VERSION="6.0.2"
 
 # Final PATH: idf.py wrappers + IDF tool dirs + system (so cmake/git/ninja work).
 export PATH="${IDF_PATH}/tools:${IDF_ONLY_PATH}:${SYSTEM_PATH}:${PATH}"

@@ -19,4 +19,11 @@ while IFS='=' read -r key value; do
     esac
 done < <("$ACTIVATE" -e)
 
+# Pin the IDF source tree to the v6.0.2 checkout — same override as tools/idf
+# (EIM env supplies toolchain + python env; patch releases share both). Keep
+# in sync with tools/idf and .github/workflows/firmware-ci.yml.
+export IDF_PATH="/Users/cmd0s/esp/v6.0.2"
+export ESP_IDF_VERSION="6.0.2"
+export PATH="$IDF_PATH/tools:$PATH"
+
 exec "$IDF_PYTHON_ENV_PATH/bin/python" "$IDF_PATH/tools/idf.py" mcp-server "$@"

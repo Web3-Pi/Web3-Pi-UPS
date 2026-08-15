@@ -42,7 +42,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 6.0.0
+    version: 6.0.2
 direct_dependencies:
 - espressif/cjson
 - espressif/esp_modem
