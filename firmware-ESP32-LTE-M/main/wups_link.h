@@ -85,3 +85,9 @@ void wups_link_trust_prompt(uint8_t mode, uint8_t confirm_secs,
  */
 esp_err_t wups_link_trust_wait(uint32_t nonce, uint32_t timeout_ms,
                                uint8_t *result_out);
+
+/* Try to consume an ESP32-local system.reset REQ frame (dst=ESP32/BCAST).
+ * Returns true if the frame was handled (RESP emitted via MQTT or, for an
+ * Arkiv-tracked SEQ, as a w3pups-ack entity). Exposed for the Arkiv cmd
+ * ingress — MQTT-downlink-path parity. */
+bool wups_link_try_sys_reset(const uint8_t *frame, size_t frame_len);

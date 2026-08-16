@@ -18,6 +18,7 @@
 #include "wups_proto.h"
 #include "arkiv_ack.h"
 #include "arkiv_ws.h"
+#include "fw_ota.h"
 
 #define TAG "arkiv_rpc"
 
@@ -502,7 +503,18 @@ static void poll_once(const char *iccid)
         if (vlen >= WUPS_HEADER_BYTES) {
             arkiv_ack_track_pending(vframe[7] /* SEQ offset */, command_id);
         }
-        forward_to_rp2040(iccid, vframe, vlen);
+        /* ESP32-local ops — MQTT-downlink-path parity (wups_link.c):
+         * fw.update and system.reset execute on the ESP32 itself and ACK
+         * through the tracker above (w3pups-ack); they must never reach
+         * the RP2040, which would drop them and the command would time
+         * out after the owner already paid signature + gas. */
+        if (fw_ota_try_handle_downlink(vframe, vlen)) {
+            /* consumed — OTA kicked off (or refused), ACK emitted */
+        } else if (wups_link_try_sys_reset(vframe, vlen)) {
+            /* consumed — reset scheduled (or refused), ACK emitted */
+        } else {
+            forward_to_rp2040(iccid, vframe, vlen);
+        }
     }
     cJSON_Delete(root);
 }

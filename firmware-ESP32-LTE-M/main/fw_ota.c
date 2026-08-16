@@ -22,6 +22,7 @@
  */
 
 #include "fw_ota.h"
+#include "arkiv_ack.h"
 #include "identity.h"
 #include "modem.h"
 #include "mqtt.h"
@@ -797,11 +798,20 @@ bool fw_ota_try_handle_downlink(const uint8_t *frame, size_t frame_len)
 
 reply:
     {
-        uint8_t resp[WUPS_FRAMING_BYTES + 1];
-        uint16_t n = encode_resp_frame(resp, sizeof(resp), src, seq, result);
-        const char *topic = mqtt_topic_cmd_response();
-        if (n && topic[0]) {
-            (void)mqtt_publish_raw(topic, resp, n, /*qos=*/1, /*retain=*/0);
+        /* Arkiv-issued command (arkiv_rpc tracked SEQ -> command_id before
+         * intercepting): ACK as a w3pups-ack entity — this mode has no
+         * broker, the MQTT publish below would be a silent no-op and the
+         * panel row would sit "pending" until timeout. */
+        if (arkiv_ack_has_pending(seq)) {
+            uint8_t pl = result;
+            (void)arkiv_ack_emit(seq, &pl, 1);
+        } else {
+            uint8_t resp[WUPS_FRAMING_BYTES + 1];
+            uint16_t n = encode_resp_frame(resp, sizeof(resp), src, seq, result);
+            const char *topic = mqtt_topic_cmd_response();
+            if (n && topic[0]) {
+                (void)mqtt_publish_raw(topic, resp, n, /*qos=*/1, /*retain=*/0);
+            }
         }
         ESP_LOGI(TAG, "fw.update ACKed (seq=%u result=%u)", seq, result);
     }

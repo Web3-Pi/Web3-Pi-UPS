@@ -895,9 +895,16 @@ static bool try_handle_sys_reset(const uint8_t *frame, size_t frame_len)
     resp[12] = b;
     resp[13] = WUPS_END1;
     resp[14] = WUPS_END2;
-    const char *topic = mqtt_topic_cmd_response();
-    if (topic[0]) {
-        (void)mqtt_publish_raw(topic, resp, sizeof(resp), /*qos=*/1, /*retain=*/0);
+    /* Arkiv-issued command: divert the ACK to a w3pups-ack entity (same
+     * rationale as fw_ota's reply — no broker in this mode). */
+    if (arkiv_ack_has_pending(seq)) {
+        uint8_t pl = result;
+        (void)arkiv_ack_emit(seq, &pl, 1);
+    } else {
+        const char *topic = mqtt_topic_cmd_response();
+        if (topic[0]) {
+            (void)mqtt_publish_raw(topic, resp, sizeof(resp), /*qos=*/1, /*retain=*/0);
+        }
     }
 
     if (result != WUPS_SYS_RESET_RESULT_OK) {
@@ -930,6 +937,13 @@ static bool try_handle_sys_reset(const uint8_t *frame, size_t frame_len)
  * The frame carries the topic and the raw payload; RP2040 decides what to
  * do with it (route to CH32X for power commands, to itself for UI/system,
  * etc.). Runs in the MQTT client task context. */
+/* Public wrapper — the Arkiv cmd ingress (arkiv_rpc.c) intercepts the same
+ * ESP32-local ops as this MQTT downlink path (Decision C parity). */
+bool wups_link_try_sys_reset(const uint8_t *frame, size_t frame_len)
+{
+    return try_handle_sys_reset(frame, frame_len);
+}
+
 static void on_mqtt_data(const char *topic, size_t topic_len,
                          const void *payload, size_t payload_len)
 {
