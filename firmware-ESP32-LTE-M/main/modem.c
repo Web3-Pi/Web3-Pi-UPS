@@ -7,6 +7,7 @@
 #include "cmdauth_arkiv.h"
 #include "arkiv_tlm.h"
 #include "arkiv_ws.h"
+#include "arkiv_rpc.h"
 #include "fw_ota.h"
 #include "../../common/protocol.h"
 
@@ -117,6 +118,7 @@
 #define PPP_SUPERVISE_TICK_MS   30000
 #define UPLINK_DEAD_SECS          300
 #define HTTP_UPLINK_FRESH_SECS     90   /* 3 missed 30 s POST cadences = unhealthy */
+#define ARKIV_UPLINK_FRESH_SECS   120   /* 4 missed 30 s telemetry writes = unhealthy */
 
 /* Belt-and-braces re-sends of the OLED alert CLEAR after recovery — the
  * ui.display_msg frame is unACKed on a no-flow-control UART, so a single
@@ -1060,7 +1062,18 @@ static void uplink_health(bool *up, bool *wd_ok)
             *up = false;
             *wd_ok = true;      /* unclaimed: no uplink expected, never trip */
         } else {
-            *up = arkiv_ws_subscribed();
+            /* RPC round-trips prove the uplink (telemetry every 30 s, cmd
+             * poll every 5 s while the WS is down). The WS subscription is
+             * only the low-latency cmd push — a refused/404 WS (e.g. a
+             * placeholder-token CI build; field incident 2026-08-16: the
+             * old `*wd_ok = ws_subscribed` put the unit in a permanent
+             * CFUN/PWRKEY reset cycle with a "NO UPLINK" banner while
+             * writes were landing on-chain) must never trip the modem
+             * watchdog on its own. */
+            uint32_t last = arkiv_rpc_last_success_s();
+            bool rpc_fresh =
+                last != 0 && (now_s() - last) <= ARKIV_UPLINK_FRESH_SECS;
+            *up = rpc_fresh || arkiv_ws_subscribed();
             *wd_ok = *up;
         }
         break;

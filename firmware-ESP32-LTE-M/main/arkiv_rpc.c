@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
@@ -22,6 +23,11 @@
 
 /* Single hex-nibble decode; defined with the other hex helpers below. */
 static int hexnib(char c);
+
+/* Monotonic (esp_timer) second-stamp of the last successful JSON-RPC
+ * round-trip. 0 = none yet this boot. Volatile: written from the caller's
+ * task, read from modem.c's supervision task. */
+static volatile uint32_t s_last_rpc_ok_s;
 
 /* --- HTTP JSON-RPC ---------------------------------------------------- */
 
@@ -80,8 +86,16 @@ static esp_err_t rpc_post(const char *body, char *resp, size_t resp_cap)
         ESP_LOGW(TAG, "rpc http=%d len=%u", status, (unsigned)ctx.len);
         return ESP_FAIL;
     }
+    /* Uplink-health stamp: a completed HTTPS round-trip with a 2xx body is
+     * proof the LTE data path works end-to-end. modem.c's watchdog uses
+     * this instead of the WS-subscription state (a refused/404 WS — e.g. a
+     * placeholder-token build — must not trip modem resets while RPC
+     * traffic flows; field incident 2026-08-16). */
+    s_last_rpc_ok_s = (uint32_t)(esp_timer_get_time() / 1000000);
     return ESP_OK;
 }
+
+uint32_t arkiv_rpc_last_success_s(void) { return s_last_rpc_ok_s; }
 
 esp_err_t arkiv_eth_block_number(uint64_t *out_block)
 {

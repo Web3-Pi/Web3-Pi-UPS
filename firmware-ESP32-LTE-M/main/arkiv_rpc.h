@@ -12,7 +12,13 @@
  * MQTT path (Decision C).
  */
 
-/* eth_blockNumber → current Braga height (the §4.4 clock). */
+/* Seconds (esp_timer monotonic) of the last successful JSON-RPC round-trip
+ * this boot; 0 = none yet. modem.c's uplink watchdog uses the freshness of
+ * this stamp as the Arkiv-mode health signal — writes/polls prove the
+ * uplink, the WS subscription is only a latency optimization. */
+uint32_t arkiv_rpc_last_success_s(void);
+
+/* eth_blockNumber → current chain height (the §4.4 clock). */
 esp_err_t arkiv_eth_block_number(uint64_t *out_block);
 
 /* eth_getTransactionCount(addr, "pending") → next nonce for `addr` (20 B).
