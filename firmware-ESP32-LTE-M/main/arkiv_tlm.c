@@ -176,7 +176,7 @@ static void tlm_task(void *arg)
             dev_pub_hex[128] = '\0';
         }
 
-        arkiv_attr_t attrs[6] = {
+        arkiv_attr_t attrs[7] = {
             { .key = "type",      .value_str = "w3pups-telemetry", .is_numeric = false },
             { .key = "device_id", .value_str = iccid,              .is_numeric = false },
             { .key = "seq",       .value_num = (int64_t)seq,       .is_numeric = true  },
@@ -187,7 +187,14 @@ static void tlm_task(void *arg)
         if (announce) {
             attrs[5] = (arkiv_attr_t){ .key = "dev_pub", .value_str = dev_pub_hex,
                                        .is_numeric = false };
-            nattrs = 6;
+            /* fw version rides the same once-per-boot announcement: the
+             * panel otherwise keeps showing whatever MQTT last reported —
+             * Workbench/USB flashes never pass through the backend
+             * (field report 2026-08-16: panel said 0.8.0 on a 0.8.2 unit). */
+            attrs[6] = (arkiv_attr_t){ .key = "fw",
+                                       .value_str = identity_fw_version(),
+                                       .is_numeric = false };
+            nattrs = 7;
         }
         uint8_t txh[32];
         esp_err_t rc = arkiv_writer_create_entity(
