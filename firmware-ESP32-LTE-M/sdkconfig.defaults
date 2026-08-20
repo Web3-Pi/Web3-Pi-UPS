@@ -64,3 +64,13 @@ CONFIG_LWIP_STATS=y
 #     silently deaf until reboot. Field-hit on two units, 2026-08. With this
 #     set, uart_driver_install auto-adds ESP_INTR_FLAG_IRAM. ---
 CONFIG_UART_ISR_IN_IRAM=y
+
+# --- Release size optimization (2026-08-20, esp32:0.8.6) ---
+# -Os instead of the IDF default -Og: image 948 -> 859 KB. Matters for OTA
+# over slow Cat-M links: devices running <=0.8.4 download under a 10-min
+# hard cap (FW_OTA_TIMEOUT_S was raised to 20 min only in 0.8.5), and at
+# the ~14 kbps observed in the field (unit ...9940) the -Og image missed
+# that window while the -Os one fits with ~1.5 min to spare.
+# NB: a stale generated sdkconfig silently overrides this default — flip
+# CONFIG_COMPILER_OPTIMIZATION_* there too (or delete sdkconfig to regen).
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
