@@ -65,13 +65,25 @@
 #define WUPS_UART_RX_BUFSIZE 1024
 #define WUPS_UART_TX_BUFSIZE 0
 
-/* RX watchdog. The RP2040 uplinks telemetry every <=30 s and answers
- * system.ping on every firmware vintage, so a healthy link is never silent
- * for a minute. Field failure 2026-08 (two units): an IDF driver race left
- * RX interrupts permanently disabled — uart_read_bytes returned 0 forever
- * while TX kept working. See uart_bringup() for the race notes. */
-#define WUPS_RX_IDLE_PING_MS     60000  /* RX silence before the first probe */
+/* RX watchdog — fed by VALID FRAMES, not raw bytes. The RP2040 uplinks
+ * telemetry every <=30 s and answers system.ping on every firmware vintage,
+ * so a healthy link always produces a deframed frame within a minute (the
+ * probe's pong counts). Two field failure shapes this must catch:
+ *   - 2026-08 (two units, esp32:0.7.0): an IDF driver race left RX
+ *     interrupts permanently disabled — uart_read_bytes returned 0 forever
+ *     while TX kept working. See uart_bringup() for the race notes.
+ *   - 2026-08-20 (unit ...8870, esp32:0.8.3): bytes kept flowing but every
+ *     frame failed deframing (persistent RX-stream corruption); the old
+ *     byte-based feed never tripped, so the wedge sat for hours until a
+ *     manual remote reset. Frame-based feeding closes that blind spot. */
+#define WUPS_RX_IDLE_PING_MS     60000  /* no valid frame before the first probe */
 #define WUPS_RX_PING_RETRY_MS    15000  /* probe spacing / post-probe grace */
+/* Garbage floor that lets the reboot escalation fire even with zero frames
+ * this boot: a real 921600-baud corrupted stream crosses this in seconds,
+ * while a bench card with no RP2040 (pulled-up idle line, at most stray
+ * noise) never accumulates it — so no reboot loops on the bench, but a
+ * corrupt-from-boot unit still reaches the whole-SoC restart last resort. */
+#define WUPS_RX_REBOOT_GARBAGE_MIN 4096u
 /* Escalate to reboot only on the 6th consecutive recovery cycle (~9 min of
  * silence). A real RX wedge is already healed by the FIRST driver reinstall
  * at ~90 s, so the reboot is a true last resort — and the long ladder keeps
@@ -101,6 +113,17 @@ static volatile uint32_t s_bytes_tx  = 0;
 static volatile uint32_t s_bytes_rx  = 0;
 static volatile uint32_t s_rx_resync = 0;  /* SYNC2 mismatch — out-of-frame bytes seen */
 static volatile uint32_t s_rx_reinstalls = 0;  /* RX-watchdog driver reinstalls */
+/* esp_timer ms (u32, wrap-safe subtraction) of the last VALID frame accepted
+ * by deliver_frame(). Written by rx_task, read by the modem task for
+ * net.status v2 — u32 loads/stores are atomic on Xtensa. Initialized at
+ * init so "no frame yet" reads as time-since-boot, which is the honest
+ * answer (a bench card with no RP2040 shows an ever-growing age). */
+static volatile uint32_t s_last_frame_ms = 0;
+
+static inline uint32_t now_ms32(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
 
 typedef enum {
     WUPS_RX_SYNC1 = 0,
@@ -178,10 +201,28 @@ static void send_frame_full(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
 
 void wups_link_log_stats(void)
 {
-    ESP_LOGI(TAG, "stats: tx=%lu (%lu B) rx=%lu (%lu B) resync=%lu reinst=%lu",
+    ESP_LOGI(TAG, "stats: tx=%lu (%lu B) rx=%lu (%lu B) resync=%lu reinst=%lu age=%lus",
              (unsigned long)s_frames_tx, (unsigned long)s_bytes_tx,
              (unsigned long)s_frames_rx, (unsigned long)s_bytes_rx,
-             (unsigned long)s_rx_resync, (unsigned long)s_rx_reinstalls);
+             (unsigned long)s_rx_resync, (unsigned long)s_rx_reinstalls,
+             (unsigned long)wups_link_frame_age_s());
+}
+
+uint32_t wups_link_frames_rx(void)    { return s_frames_rx; }
+uint32_t wups_link_resync_count(void) { return s_rx_resync; }
+
+uint32_t wups_link_frame_age_s(void)
+{
+    /* Load the stamp BEFORE sampling the clock: deliver_frame() (core 0) can
+     * stamp between the two reads, and stamp-newer-than-clock would make the
+     * unsigned delta underflow to ~49 days (one bogus 0xFFFF sample on the
+     * panel). Reading the stamp first bounds that race to "age reads 0",
+     * and the implausible-delta guard catches any reordering leftovers.
+     * Wrap-safe u32 delta otherwise — correct for true ages < ~24 days. */
+    uint32_t last  = s_last_frame_ms;
+    uint32_t delta = now_ms32() - last;
+    if (delta > 0x80000000u) return 0;
+    return delta / 1000u;
 }
 
 void wups_link_send_seq(uint8_t dst, uint8_t cls, uint8_t op,
@@ -604,6 +645,7 @@ static void deliver_frame(void)
         return;
     }
     s_frames_rx++;
+    s_last_frame_ms = now_ms32();   /* feeds the frame-based RX watchdog */
     /* exp_a / exp_b were updated alongside each rx_step() and matched
      * the on-wire CK_A/CK_B at the end of WUPS_RX_CK_B, so they're the
      * canonical checksum bytes for re-publish. */
@@ -750,10 +792,23 @@ static void rx_task(void *arg)
 {
     (void)arg;
     uint8_t buf[64];
-    int64_t last_rx_us      = esp_timer_get_time();
-    int64_t last_ping_us    = 0;
-    int     pings_sent      = 0;
-    int     recovery_cycles = 0;
+    int64_t  last_ping_us       = 0;
+    int      pings_sent         = 0;
+    int      recovery_cycles    = 0;
+    uint32_t frames_seen        = s_frames_rx;
+    /* Watchdog window reference. Deliberately SEPARATE from s_last_frame_ms:
+     * the ladder re-arms this after every reinstall / OTA pause so each
+     * recovery cycle gets a fresh 60 s window, while s_last_frame_ms is
+     * stamped ONLY by deliver_frame() — so the sys_link_age_s the panel sees
+     * keeps growing monotonically through a persistent wedge instead of
+     * sawtoothing 0..90 s below the banner threshold. */
+    uint32_t wd_ref_ms          = now_ms32();
+    /* Byte count at the moment of the last valid frame — the delta ("garbage")
+     * distinguishes "line silent" (classic RX-interrupt death) from "bytes
+     * flowing but nothing deframes" (the 2026-08-20 corrupted-stream wedge).
+     * NOT reset by reinstalls, so it accumulates per no-frame episode and can
+     * qualify the reboot escalation even when zero frames arrived this boot. */
+    uint32_t bytes_at_last_frame = s_bytes_rx;
     while (1) {
         int n = uart_read_bytes(WUPS_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(50));
         if (n < 0) {
@@ -761,34 +816,43 @@ static void rx_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        if (n > 0) {
-            s_bytes_rx += (uint32_t)n;
-            last_rx_us      = esp_timer_get_time();
-            pings_sent      = 0;
-            recovery_cycles = 0;
-        }
+        if (n > 0) s_bytes_rx += (uint32_t)n;
         for (int i = 0; i < n; ++i) rx_byte(buf[i]);
 
-        /* --- RX watchdog (see uart_bringup for the failure this heals) ---
-         * In the wedged state uart_read_bytes returns 0 forever while TX
-         * still works, so this loop keeps spinning and can self-heal:
-         * probe with system.ping (answered by every RP2040 vintage), then
-         * reinstall the driver, then reboot as the last resort. */
+        /* --- RX watchdog (see uart_bringup for the failures this heals) ---
+         * Fed by VALID FRAMES only (deliver_frame stamps s_last_frame_ms):
+         * raw bytes that never deframe do NOT count. Ladder: 60 s without a
+         * frame → 2× system.ping probes (a healthy RP2040's pong is itself a
+         * valid frame and resets the clock), then driver reinstall cycles,
+         * then reboot as the last resort. */
+        if (s_frames_rx != frames_seen) {
+            frames_seen         = s_frames_rx;
+            bytes_at_last_frame = s_bytes_rx;
+            wd_ref_ms           = now_ms32();
+            pings_sent          = 0;
+            recovery_cycles     = 0;
+        }
         if (fw_ota_in_progress()) {
             /* OTA download / RP2040 relay / fw_xfer sessions have irregular
              * link traffic (and fw_xfer stalls this task on flash writes by
-             * design) — don't probe into them; restart the window after. */
-            last_rx_us = esp_timer_get_time();
+             * design) — don't probe into them; restart the window after.
+             * Only the WATCHDOG window is re-armed: s_last_frame_ms keeps
+             * telling the truth to net.status. */
+            wd_ref_ms  = now_ms32();
             pings_sent = 0;
             continue;
         }
-        int64_t now_us = esp_timer_get_time();
-        if (now_us - last_rx_us < (int64_t)WUPS_RX_IDLE_PING_MS * 1000) continue;
+        int64_t  now_us  = esp_timer_get_time();
+        if ((uint32_t)(now_ms32() - wd_ref_ms) < WUPS_RX_IDLE_PING_MS) continue;
+        uint32_t age_s   = wups_link_frame_age_s();  /* true no-frame age, for logs */
+        uint32_t garbage = s_bytes_rx - bytes_at_last_frame;
         if (pings_sent < 2) {
             if (pings_sent == 0 ||
                 now_us - last_ping_us >= (int64_t)WUPS_RX_PING_RETRY_MS * 1000) {
-                ESP_LOGW(TAG, "RX idle %llds — ping probe %d/2",
-                         (long long)((now_us - last_rx_us) / 1000000),
+                ESP_LOGW(TAG, "RX: no valid frame for %lus (%lu B %s) — "
+                              "ping probe %d/2",
+                         (unsigned long)age_s, (unsigned long)garbage,
+                         garbage ? "of garbage" : "= silence",
                          pings_sent + 1);
                 wups_link_send(WUPS_ADDR_RP2040, WUPS_CLASS_SYSTEM,
                                WUPS_OP_SYS_PING, WUPS_FLAG_REQ, NULL, 0);
@@ -799,24 +863,28 @@ static void rx_task(void *arg)
         }
         if (now_us - last_ping_us < (int64_t)WUPS_RX_PING_RETRY_MS * 1000) continue;
 
-        /* Two probes unanswered — the RX path is dead. Escalate to a reboot
-         * only if the link has worked this boot (s_frames_rx > 0): a bench
-         * card with no RP2040 attached keeps cycling cheap reinstalls
-         * instead of reboot-looping. */
+        /* Two probes without a decodable pong — the RX path is dead or the
+         * stream is corrupt beyond deframing. Escalate to a reboot when the
+         * link has worked this boot (s_frames_rx > 0) OR when enough garbage
+         * accumulated to prove an RP2040 is actually transmitting: a bench
+         * card with no RP2040 attached matches neither and keeps cycling
+         * cheap reinstalls instead of reboot-looping. */
         recovery_cycles++;
-        if (recovery_cycles >= WUPS_RX_REBOOT_CYCLE && s_frames_rx > 0) {
-            ESP_LOGE(TAG, "RX dead after %d driver reinstalls (frames_rx=%lu) "
-                          "— rebooting", recovery_cycles - 1,
-                     (unsigned long)s_frames_rx);
+        if (recovery_cycles >= WUPS_RX_REBOOT_CYCLE &&
+            (s_frames_rx > 0 || garbage >= WUPS_RX_REBOOT_GARBAGE_MIN)) {
+            ESP_LOGE(TAG, "RX dead after %d driver reinstalls (frames_rx=%lu "
+                          "garbage=%lu B) — rebooting", recovery_cycles - 1,
+                     (unsigned long)s_frames_rx, (unsigned long)garbage);
             vTaskDelay(pdMS_TO_TICKS(100));   /* let the log line drain */
             esp_restart();
         }
-        ESP_LOGE(TAG, "RX silent %llds, 2 pings unanswered — reinstalling "
-                      "UART driver (cycle %d)",
-                 (long long)((now_us - last_rx_us) / 1000000), recovery_cycles);
+        ESP_LOGE(TAG, "RX: no valid frame for %lus (%lu B %s), 2 pings "
+                      "unanswered — reinstalling UART driver (cycle %d)",
+                 (unsigned long)age_s, (unsigned long)garbage,
+                 garbage ? "of garbage" : "= silence", recovery_cycles);
         s_rx_reinstalls++;
         rx_link_recover();
-        last_rx_us = esp_timer_get_time();
+        wd_ref_ms  = now_ms32();
         pings_sent = 0;
     }
 }
@@ -1034,6 +1102,7 @@ esp_err_t wups_link_init(void)
     if (!s_trust_sig) return ESP_ERR_NO_MEM;
 
     rx_reset();
+    s_last_frame_ms = now_ms32();   /* boot grace for the frame watchdog */
 
     esp_err_t err = uart_bringup();
     if (err != ESP_OK) return err;

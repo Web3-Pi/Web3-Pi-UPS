@@ -154,7 +154,7 @@ emitter flips to v2; the RP2040 hub must forward the raw payload length, not
 
 | Op   | Name           | Direction                       | Payload struct               |
 |------|----------------|----------------------------------|-------------------------------|
-| 0x01 | status         | EVENT (ESP32→RP2040), RESP       | `wups_net_status_v1_t`       |
+| 0x01 | status         | EVENT (ESP32→RP2040), RESP       | `wups_net_status_v1_t` / `v2_t` |
 | 0x02 | publish        | REQ → ESP32                      | `wups_net_publish_v1_hdr_t`  |
 | 0x10 | downlink       | EVENT → destination              | `wups_net_downlink_v1_hdr_t` |
 | 0x20 | time_sync      | EVENT (INTERNAL broadcast)       | `wups_net_time_sync_v1_t`    |

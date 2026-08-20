@@ -65,7 +65,16 @@
  *   "AT\r\r\nOK\r\n"      -> path alive, translator working. */
 #define MODEM_UART_DIAG   0
 
-#define APN_1NCE_IOT      "iot.1nce.net"
+/* Attach/PDP APN candidates, tried round-robin: the LTE attach carries the
+ * CGDCONT cid-1 APN, and a wrong one is torn down by the core right after
+ * attach (same-second Update+Purge in the 1NCE portal, device stuck at
+ * CEREG stat=2). New-batch SIMs (2026-08) use sensor.net, the original
+ * batch iot.1nce.net — every registration timeout advances to the next
+ * candidate, so either batch registers by the second 90 s round. */
+static const char *s_apn_candidates[] = { "sensor.net", "iot.1nce.net" };
+static size_t      s_apn_idx = 0;
+static bool        s_apn_seeded = false;   /* start APN picked from ICCID prefix */
+#define APN_CANDIDATE_COUNT (sizeof(s_apn_candidates) / sizeof(s_apn_candidates[0]))
 
 #define EVT_GOT_IP        BIT0
 #define EVT_LOST_IP       BIT1
@@ -297,12 +306,18 @@ static void poll_cpsi(int8_t *rsrp_out, int8_t *rsrq_out)
 static void emit_net_status(uint8_t state, int8_t rssi_dbm,
                             int8_t rsrp, int8_t rsrq)
 {
-    wups_net_status_v1_t st = {0};
-    st.version  = 1;
+    wups_net_status_v2_t st = {0};
+    st.version  = 2;
     st.state    = state;
     st.rssi_dBm = rssi_dbm;
     st.rsrp_dBm = rsrp;
     st.rsrq_dB  = rsrq;
+    /* v2 tail — ESP32<->RP2040 sys-link health (wups_link.h). Lets the
+     * panel tell a dead inter-MCU link from a quiet one (2026-08-20). */
+    st.sys_frames_rx = wups_link_frames_rx();
+    st.sys_resync    = wups_link_resync_count();
+    uint32_t age_s   = wups_link_frame_age_s();
+    st.sys_link_age_s = (age_s > 0xFFFFu) ? 0xFFFFu : (uint16_t)age_s;
     esp_netif_ip_info_t ip;
     if (s_ppp_netif && esp_netif_get_ip_info(s_ppp_netif, &ip) == ESP_OK) {
         st.ip_addr = ip.ip.addr;            /* already network byte order */
@@ -717,7 +732,8 @@ static esp_err_t ppp_bringup_dce(void)
     /* DCE = Data Circuit-terminating Equipment side (the modem). The 1nce
      * SIM auto-provisions the radio APN, but the application PPP context
      * still needs an explicit APN at PDP-context activation time. */
-    esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG(APN_1NCE_IOT);
+    esp_modem_dce_config_t dce_cfg =
+        ESP_MODEM_DCE_DEFAULT_CONFIG(s_apn_candidates[s_apn_idx]);
 
     /* SIM7080G isn't a separate DCE class; SIM7070 covers the same AT set
      * (the SIM7070/SIM7080/SIM7090 family share commands and the V1.05 AT
@@ -862,6 +878,52 @@ static esp_err_t ppp_bringup_dce(void)
         }
     }
 
+    /* Seed the starting APN from the SIM card. The OLD (iot.1nce.net) fleet
+     * is a closed set of exactly these five cards, listed in full; every
+     * other card — the 2026-08 production batch and anything newer —
+     * defaults to sensor.net. A wrong guess still converges via the
+     * rotate-on-timeout below. Seeded once per boot. */
+    static const char *OLD_BATCH_ICCIDS[] = {
+        "8988228066614189920",
+        "8988280666000338870",
+        "8988280666000338871",
+        "8988228066618136967",
+        "8988228066618136966",
+    };
+    if (!s_apn_seeded) {
+        s_apn_seeded = true;
+        const char *iccid = identity_iccid();
+        bool old_batch = false;
+        for (size_t i = 0;
+             i < sizeof(OLD_BATCH_ICCIDS) / sizeof(OLD_BATCH_ICCIDS[0]); i++) {
+            if (strcmp(iccid, OLD_BATCH_ICCIDS[i]) == 0) {
+                old_batch = true;
+                break;
+            }
+        }
+        s_apn_idx = old_batch ? 1 : 0;   /* 1 = iot.1nce.net, 0 = sensor.net */
+        ESP_LOGI(MODEM_TAG, "APN seeded from ICCID list: %s",
+                 s_apn_candidates[s_apn_idx]);
+    }
+
+    /* Program the attach APN BEFORE waiting for registration. The LTE attach
+     * carries the default-bearer (PDN) request built from CGDCONT cid 1, so
+     * the APN must be in place now — esp_modem itself only sends CGDCONT in
+     * setup_data_mode(), i.e. after registration succeeds, which is too late
+     * for networks that reject the attach on a wrong/stale APN (new SIM
+     * batch, bench 2026-08-18). Best-effort: on failure the modem attaches
+     * with whatever CGDCONT its NVRAM holds, as before. */
+    {
+        char apn_cmd[64];
+        snprintf(apn_cmd, sizeof apn_cmd, "AT+CGDCONT=1,\"IP\",\"%s\"",
+                 s_apn_candidates[s_apn_idx]);
+        if (esp_modem_at(s_dce, apn_cmd, NULL, 3000) == ESP_OK) {
+            ESP_LOGI(MODEM_TAG, "attach APN set: %s", s_apn_candidates[s_apn_idx]);
+        } else {
+            ESP_LOGW(MODEM_TAG, "AT+CGDCONT failed — attach uses modem's stored APN");
+        }
+    }
+
     /* Switch to CMUX mode — PPP (data channel) and an AT command channel run
      * concurrently, which is what lets the post-GOT_IP supervision loop poll
      * CSQ/CPSI and issue AT+CFUN resets while the link is up. Entered ONCE
@@ -913,6 +975,11 @@ static esp_err_t ppp_bringup_dce(void)
                          MODEM_REG_WAIT_MS / 1000, stat);
                 s_fail_stage = MODEM_FAIL_NET;
                 s_reg_timeout_streak++;
+                /* Wrong attach APN produces exactly this timeout — rotate to
+                 * the next candidate so the following round tries it. */
+                s_apn_idx = (s_apn_idx + 1) % APN_CANDIDATE_COUNT;
+                ESP_LOGW(MODEM_TAG, "next bring-up will try attach APN \"%s\"",
+                         s_apn_candidates[s_apn_idx]);
                 return ESP_FAIL;
             }
             s_reg_timeout_streak = 0;

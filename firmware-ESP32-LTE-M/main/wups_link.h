@@ -61,6 +61,13 @@ uint16_t wups_link_render_frame(uint8_t *out, size_t cap,
  * from a periodic heartbeat to confirm the UART2 link is actually live. */
 void wups_link_log_stats(void);
 
+/* Sys-link health, uplinked in net.status v2 so the panel can tell a dead
+ * ESP32<->RP2040 link from a quiet one (2026-08-20 incident: bytes flowed
+ * but zero frames deframed — invisible remotely until now). */
+uint32_t wups_link_frames_rx(void);      /* valid frames from RP2040 since boot */
+uint32_t wups_link_resync_count(void);   /* deframer resyncs since boot */
+uint32_t wups_link_frame_age_s(void);    /* seconds since last valid frame */
+
 /*
  * Track 2 / ADR-0011 §10.1/§10.4 — trust-anchor round-trip with the
  * RP2040 OLED gate (the OLED + 2 buttons are RP2040-only; scoped,

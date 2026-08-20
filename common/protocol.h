@@ -363,6 +363,27 @@ typedef struct WUPS_PACKED {
     uint32_t bytes_rx;
 } wups_net_status_v1_t;
 
+/* net.status v2 — v1 plus ESP32<->RP2040 sys-link health (append-only; a v1
+ * parser that checks only a 20-byte minimum reads the prefix unchanged).
+ * Added after the 2026-08-20 UPS-8870 blackout: the panel could not tell a
+ * dead inter-MCU link from a quiet one — these fields make a wedged link
+ * visible from the first net.status sample. */
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 2 */
+    uint8_t  state;          /* as v1 */
+    int8_t   rssi_dBm;
+    int8_t   rsrp_dBm;
+    int8_t   rsrq_dB;
+    uint8_t  reserved;
+    uint16_t errors;
+    uint32_t ip_addr;        /* network byte order or 0 */
+    uint32_t bytes_tx;
+    uint32_t bytes_rx;
+    uint32_t sys_frames_rx;  /* valid WUPS frames received from the RP2040 since boot */
+    uint32_t sys_resync;     /* deframer resyncs (out-of-frame bytes) since boot */
+    uint16_t sys_link_age_s; /* seconds since last valid frame, saturates at 0xFFFF */
+} wups_net_status_v2_t;      /* 30 bytes */
+
 /* net.publish (REQ -> ESP32). Variable-length tail: topic + payload. */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */

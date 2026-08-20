@@ -62,8 +62,13 @@
  * boot, roll back to the previous slot. */
 #define FW_OTA_VERIFY_WINDOW_S   (10 * 60)
 
-/* Hard cap on one whole OTA attempt (connect + download + verify). */
-#define FW_OTA_TIMEOUT_S         (10 * 60)
+/* Hard cap on one whole OTA attempt (connect + download + verify).
+ * Field data 2026-08-20 (unit ...9940): a ~970 KB image on a ~14 kbps
+ * Cat-M link needs ~9.5-10 min — the old 10-min cap killed attempt after
+ * attempt seconds from the finish line. 20 min gives 2x headroom (covers
+ * ~6.5 kbps sustained); genuine stalls are still caught much earlier by
+ * the 30 s per-socket-op timeout (FW_OTA_HTTP_TIMEOUT_MS). */
+#define FW_OTA_TIMEOUT_S         (20 * 60)
 
 /*
  * Validate {url, sha256, len, target} and start the download task (self-OTA
