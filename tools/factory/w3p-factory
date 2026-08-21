@@ -1,0 +1,125 @@
+#!/usr/bin/env node
+// w3p-factory — production-run tool for Web3 Pi UPS units.
+//
+// Produces a batch of units end to end without manual console work:
+// provision against the prod DB (ssh + docker exec, PROVISIONING.md step A),
+// build per-unit prov NVS blobs, run the per-MCU flash stations, emit the
+// label-printer CSV, and keep a resumable per-unit ledger the whole time.
+//
+//   w3p-factory init --batch 2026-08-M4 --iccids <file>
+//   w3p-factory provision [--dry-run] [--iccid <i> [--reissue]]
+//   w3p-factory blobs [--iccid <i>] [--force] [--deep]
+//   w3p-factory flash-esp32 [--port <dev>] [--redo] [--verify-only <i>]
+//                           [--skip-serial] [--keep-blobs] [--yes]
+//   w3p-factory flash-ch32x [--mode first|prod|dev]
+//   w3p-factory flash-rp2040
+//   w3p-factory labels [--out <file>]
+//   w3p-factory status [--json] [--export <file>]
+//   w3p-factory mark <station> <count> [--note <text>]
+//
+// Every command takes --batch <id> (optional when exactly one batch exists).
+// State lives in batches/<id>/ (gitignored; manifests + blobs are cleartext
+// secrets — 0600, never commit, blobs are deleted after a unit verifies).
+import { readFileSync } from 'node:fs';
+import { c, die, err, info, ok, parseArgs, warn } from './lib/util.mjs';
+import { createBatch, loadBatch, normalizeIccid, parseIccidList } from './lib/state.mjs';
+import { cmdProvision } from './lib/provision.mjs';
+import { cmdBlobs } from './lib/blobs.mjs';
+import { cmdFlashEsp32 } from './lib/esp32.mjs';
+import { cmdFlashCh32x, cmdFlashRp2040, cmdMark } from './lib/stations.mjs';
+import { cmdLabels, cmdStatus } from './lib/report.mjs';
+
+function help() {
+  const src = readFileSync(new URL(import.meta.url), 'utf8');
+  // Print this file's header comment as the help text (single source of truth).
+  for (const line of src.split('\n').slice(1)) {
+    if (!line.startsWith('//')) break;
+    console.log(line.replace(/^\/\/ ?/, ''));
+  }
+}
+
+async function cmdInit(argv) {
+  const a = parseArgs(argv, { opts: ['batch', 'iccids'] });
+  if (!a.batch || !a.iccids) die('usage: w3p-factory init --batch <id> --iccids <file>');
+  let text;
+  try {
+    text = readFileSync(a.iccids, 'utf8');
+  } catch (e) {
+    die(`cannot read ${a.iccids}: ${e.message}`);
+  }
+  const { iccids, errors } = parseIccidList(text);
+  for (const e of errors) err(e);
+  if (errors.length) die(`ICCID list has ${errors.length} problem(s) — fix the file and re-run`);
+  if (iccids.length === 0) die('ICCID list is empty');
+  const batch = createBatch(a.batch, iccids);
+  ok(`batch ${c.bold(a.batch)} created with ${iccids.length} ICCIDs → ${batch.dir}`);
+  info('review config.json (server, ports, operator), then: provision → blobs → flash-esp32 → labels');
+  info('if CH32X/RP2040 were flashed before this tool: `w3p-factory mark ch32x <n>` / `mark rp2040 <n>`');
+}
+
+async function main() {
+  const [cmd, ...rest] = process.argv.slice(2);
+  if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') return help();
+  if (cmd === 'init') return cmdInit(rest);
+
+  // All other commands operate on an existing batch.
+  const specs = {
+    provision: { flags: ['dry-run', 'reissue'], opts: ['batch', 'iccid'] },
+    blobs: { flags: ['force', 'deep'], opts: ['batch', 'iccid'] },
+    'flash-esp32': { flags: ['redo', 'skip-serial', 'keep-blobs', 'yes'], opts: ['batch', 'port', 'verify-only'] },
+    'flash-ch32x': { flags: [], opts: ['batch', 'mode'] },
+    'flash-rp2040': { flags: [], opts: ['batch'] },
+    labels: { flags: [], opts: ['batch', 'out'] },
+    status: { flags: ['json'], opts: ['batch', 'export'] },
+    mark: { flags: [], opts: ['batch', 'note'] },
+  };
+  const spec = specs[cmd];
+  if (!spec) die(`unknown command "${cmd}" — run \`w3p-factory help\``);
+  let a;
+  try {
+    a = parseArgs(rest, spec);
+  } catch (e) {
+    die(e.message);
+  }
+  // Stray positionals are only meaningful for `mark` — anywhere else they
+  // are a mis-pasted command (e.g. `flash-esp32 --redo <iccid>`) that would
+  // otherwise be silently discarded.
+  if (cmd !== 'mark' && a._.length) die(`unexpected argument(s): ${a._.join(' ')}`);
+  // Ledger keys are 19-digit normalized ICCIDs; accept the 20-digit SIM-tray
+  // form everywhere an ICCID can be passed.
+  if (a.iccid !== undefined) {
+    const n = normalizeIccid(a.iccid);
+    if (!n) die(`--iccid: not a 19-20 digit ICCID: "${a.iccid}"`);
+    a.iccid = n;
+  }
+  let batch;
+  try {
+    batch = loadBatch(a.batch);
+  } catch (e) {
+    die(e.message);
+  }
+
+  switch (cmd) {
+    case 'provision':
+      return cmdProvision(batch, { iccid: a.iccid, dryRun: a['dry-run'], reissue: a.reissue });
+    case 'blobs':
+      return cmdBlobs(batch, { iccid: a.iccid, force: a.force, deep: a.deep });
+    case 'flash-esp32':
+      return cmdFlashEsp32(batch, a);
+    case 'flash-ch32x':
+      return cmdFlashCh32x(batch, a);
+    case 'flash-rp2040':
+      return cmdFlashRp2040(batch, a);
+    case 'labels':
+      return cmdLabels(batch, a);
+    case 'status':
+      return cmdStatus(batch, a);
+    case 'mark':
+      return cmdMark(batch, a._[0], a._[1], a.note);
+  }
+}
+
+main().catch((e) => {
+  err(e.message);
+  process.exit(1);
+});

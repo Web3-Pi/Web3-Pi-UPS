@@ -1,0 +1,2 @@
+# Batch state: manifests + blobs + labels carry CLEARTEXT per-device secrets.
+batches/
