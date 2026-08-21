@@ -44,6 +44,41 @@ bool mqtt_is_connected(void);
 uint32_t mqtt_last_connected_s(void);
 
 /*
+ * Auth-refusal latch (0.8.7). The broker answering CONNACK rc=4/5 (bad
+ * credentials / not authorized) means TCP+TLS demonstrably worked — the
+ * network is fine and the unit is simply unclaimed (no EMQX account until
+ * the panel claim, ADR-0004) or its secret was rotated. mqtt_auth_refused()
+ * turns true after AUTH_REFUSED_LATCH consecutive refusals and is cleared
+ * by a successful CONNECT or by any transport-level error (which breaks
+ * the "network is fine" evidence). Lock-free single-word read.
+ */
+bool mqtt_auth_refused(void);
+uint32_t mqtt_auth_refusals(void);
+
+/*
+ * Supervisor-driven reconnects (0.8.7). The client is configured with
+ * auto-reconnect DISABLED: after any failed/lost connection it idles in
+ * WAIT_RECONNECT — task alive, outbox intact up to the 32 KB cap and the
+ * CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS expiry — until modem.c's
+ * supervisor requests the next attempt (10 s cadence normally, doubling
+ * 30→120 s while attempts keep failing). Deliberately NOT stop/start:
+ * esp_mqtt_client_stop()'s task-exit path purges the outbox without the
+ * api lock (races concurrent enqueue) and can block ~30 s across an
+ * in-flight handshake.
+ *
+ * request_reconnect: non-blocking; ESP_FAIL harmlessly when the client is
+ * not waiting (attempt in flight / already connected) — retry later. The
+ * supervisor treats a long streak of rejected requests while disconnected
+ * as a dead client task and calls mqtt_client_revive().
+ *
+ * mqtt_connect_fail_streak(): consecutive failed attempts of any kind
+ * (refusal or transport), cleared by a successful CONNECT.
+ */
+esp_err_t mqtt_client_request_reconnect(void);
+esp_err_t mqtt_client_revive(void);
+uint32_t mqtt_connect_fail_streak(void);
+
+/*
  * Callback type for incoming MQTT messages. Topic and payload pointers
  * are valid only for the duration of the callback; copy if you need to
  * keep them. Strings are NOT NUL-terminated — use the explicit lengths.

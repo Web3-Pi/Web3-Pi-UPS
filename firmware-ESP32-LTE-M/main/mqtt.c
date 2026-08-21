@@ -1,5 +1,6 @@
 #include "mqtt.h"
 #include "identity.h"
+#include "modem.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +32,18 @@ static volatile bool s_connected;
  * the modem's post-PPP watchdog (u32 so the cross-task read is atomic). */
 static volatile uint32_t s_last_connected_s;
 
+/* 0.8.7 — consecutive CONNACK auth refusals (rc=4 bad credentials / rc=5
+ * not authorized). See mqtt.h. Written from the esp-mqtt event task, read
+ * from the modem supervisor. */
+#define AUTH_REFUSED_LATCH 3
+static volatile uint32_t s_auth_refusals;
+
+/* 0.8.7 — consecutive failed connect attempts of ANY kind (auth refusal or
+ * transport error), cleared only by a successful CONNECT. Drives the same
+ * 30→120 s backoff for a broker that is down/half-up: those attempts cost a
+ * full TLS handshake each, exactly like refused ones. */
+static volatile uint32_t s_conn_fail_streak;
+
 static char s_topic_status[TOPIC_BUF_LEN];     /* t/{iccid}/status     (LWT + online retained) */
 static char s_topic_identify[TOPIC_BUF_LEN];   /* t/{iccid}/identify   (retained on connect) */
 static char s_topic_telemetry[TOPIC_BUF_LEN];  /* t/{iccid}/telemetry  (per-frame uplink) */
@@ -56,6 +69,25 @@ const char *mqtt_topic_cmd_request(void) { return s_topic_cmd_req; }
 /* Uplink-health accessors — see mqtt.h. */
 bool mqtt_is_connected(void)         { return s_connected; }
 uint32_t mqtt_last_connected_s(void) { return s_last_connected_s; }
+bool mqtt_auth_refused(void)         { return s_auth_refusals >= AUTH_REFUSED_LATCH; }
+uint32_t mqtt_auth_refusals(void)    { return s_auth_refusals; }
+uint32_t mqtt_connect_fail_streak(void) { return s_conn_fail_streak; }
+
+esp_err_t mqtt_client_request_reconnect(void)
+{
+    if (!s_client) return ESP_ERR_INVALID_STATE;
+    return esp_mqtt_client_reconnect(s_client);
+}
+
+/* Last-resort revive for a dead esp-mqtt task (transport re-alloc OOM makes
+ * the task self-delete; reconnect() then fails forever). esp_mqtt_client_
+ * start() is component-legal from INIT/DISCONNECTED — i.e. exactly when the
+ * task is actually gone — and refuses (harmlessly) otherwise. */
+esp_err_t mqtt_client_revive(void)
+{
+    if (!s_client) return ESP_ERR_INVALID_STATE;
+    return esp_mqtt_client_start(s_client);
+}
 
 static void publish_identify(void)
 {
@@ -85,6 +117,8 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
         break;
     case MQTT_EVENT_CONNECTED:
         s_connected = true;
+        s_auth_refusals = 0;
+        s_conn_fail_streak = 0;
         s_last_connected_s = (uint32_t)(esp_timer_get_time() / 1000000);
         ESP_LOGI(TAG, "CONNECTED to %s as %s", MQTT_BROKER_URI, identity_iccid());
 
@@ -107,6 +141,10 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
         ESP_LOGW(TAG, "DISCONNECTED");
+        /* Wake the modem supervisor so the first reconnect attempt lands
+         * ~10 s after the drop (matching the component's old timer), not
+         * up to a full 30 s supervise tick later. */
+        modem_notify_mqtt_down();
         break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -139,6 +177,28 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
                      evt->error_handle->esp_tls_last_esp_err,
                      evt->error_handle->esp_tls_stack_err,
                      evt->error_handle->esp_transport_sock_errno);
+            /* 0.8.7 auth-refusal latch: a CONNACK refusal for credentials
+             * (rc=4/5) proves TCP+TLS worked end to end — count it. Any
+             * transport-level error means the network itself misbehaved,
+             * which invalidates that proof — reset the streak. Other
+             * refusal codes (protocol/id/server-unavailable) are neither:
+             * leave the streak alone. */
+            if (evt->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED &&
+                (evt->error_handle->connect_return_code == MQTT_CONNECTION_REFUSE_BAD_USERNAME ||
+                 evt->error_handle->connect_return_code == MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED)) {
+                s_auth_refusals++;
+                if (s_auth_refusals == AUTH_REFUSED_LATCH) {
+                    ESP_LOGW(TAG, "broker keeps refusing our credentials (×%u) — "
+                                  "unclaimed unit or rotated secret; network itself is fine",
+                             (unsigned)s_auth_refusals);
+                }
+            } else if (evt->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                s_auth_refusals = 0;
+            }
+            if (evt->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED ||
+                evt->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                if (!s_connected) s_conn_fail_streak++;
+            }
         } else {
             ESP_LOGE(TAG, "ERROR (no error_handle)");
         }
@@ -159,6 +219,12 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
 
 esp_err_t mqtt_client_start(void)
 {
+    /* Re-entrant for the supervisor's failed-start retry (0.8.7): if init
+     * already succeeded but start failed, just try starting again — never
+     * re-init (that would leak the old handle and its registration). */
+    if (s_client) {
+        return esp_mqtt_client_start(s_client);
+    }
     esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
     esp_log_level_set("esp-tls-mbedtls", ESP_LOG_VERBOSE);
     esp_log_level_set("transport_base", ESP_LOG_VERBOSE);
@@ -207,6 +273,12 @@ esp_err_t mqtt_client_start(void)
         },
         .session.keepalive   = 60,
         .network.timeout_ms  = 15000,
+        /* 0.8.7: the modem supervisor owns the retry schedule (normal 10 s
+         * cadence, 30→120 s backoff while the broker refuses credentials —
+         * each attempt is a full TLS handshake, ~40 MB/day at the built-in
+         * fixed 10 s timer). After a failure the client idles in
+         * WAIT_RECONNECT until mqtt_client_request_reconnect(). */
+        .network.disable_auto_reconnect = true,
         /* MISC-9: bound the RAM outbox that buffers uplinks across LTE/MQTT
          * outages (see mqtt_publish_raw). WUPS frames are tens of bytes, so
          * 32 KB holds several hundred parked messages; when full, enqueue
@@ -227,6 +299,13 @@ esp_err_t mqtt_client_start(void)
                                                    mqtt_event_handler, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "register_event failed: %s", esp_err_to_name(err));
+        /* Keep the re-entrant guard's invariant: s_client non-NULL implies
+         * init AND handler registration succeeded. A handler-less client
+         * that later connects would be invisible to the whole firmware
+         * (s_connected never set, no subscribe) — destroy and let the
+         * supervisor's retry rebuild from scratch. */
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
         return err;
     }
 

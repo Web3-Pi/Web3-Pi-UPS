@@ -30,6 +30,7 @@
 #include "esp_netif_ppp.h"
 #include "esp_netif_net_stack.h" /* esp_netif_get_netif_impl */
 #include "lwip/netif.h"          /* mib2_counters for net.status byte counts */
+#include "lwip/sockets.h"        /* UDP DNS probes (uplink-watchdog classifier) */
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -79,6 +80,7 @@ static bool        s_apn_seeded = false;   /* start APN picked from ICCID prefix
 #define EVT_GOT_IP        BIT0
 #define EVT_LOST_IP       BIT1
 #define EVT_PPP_FAIL      BIT2
+#define EVT_MQTT_DOWN     BIT3   /* 0.8.7: early supervisor wake on MQTT drop */
 
 /* Supervisor backoff: start short, cap at 60s. After this many consecutive
  * bring-up failures we give the modem a full PWRKEY power cycle, since the
@@ -157,11 +159,64 @@ static bool        s_apn_seeded = false;   /* start APN picked from ICCID prefix
 #define CMUX_ENTRY_FAILS_MAX  2
 #define CMUX_FALLBACK_RETRY_S  (24 * 3600)
 
+/* 0.8.7 — supervisor-driven MQTT reconnect schedule. esp-mqtt runs with
+ * auto-reconnect disabled; the supervisor requests every attempt. Normal
+ * cadence mirrors the component's old 10 s timer. An unclaimed unit (no
+ * EMQX account until the panel claim, ADR-0004) is refused with CONNACK
+ * rc=5 on every attempt, and each attempt pays a full TCP+TLS handshake
+ * (~5 KB — ~40 MB/day at a 10 s cadence, on a 500 MB SIM plan): once
+ * mqtt.c latches the refusal streak, the interval doubles 30→120 s. Cap =
+ * 2 min (Robert's pick 2026-08-21): worst-case claim→online latency stays
+ * acceptable while the shelf cost drops to ~3 MB/day. While disconnected
+ * we tick the supervise loop faster so attempts land near their due time. */
+#define MQTT_RETRY_NORMAL_S    10
+#define AUTH_BACKOFF_MIN_S     30
+#define AUTH_BACKOFF_MAX_S    120
+#define MQTT_DOWN_TICK_MS   10000
+/* Any sustained connect-failure streak (broker down/half-up — same full-TLS
+ * cost per attempt as a refusal) joins the same backoff ramp. */
+#define MQTT_FAIL_STREAK_LATCH  6
+/* Reconnect requests rejected this many times in a row while disconnected =
+ * the esp-mqtt task is dead (transport re-alloc OOM self-deletes it) —
+ * revive it with esp_mqtt_client_start(), which the component only accepts
+ * when the task is really gone. */
+#define MQTT_RECONN_REJECTS_MAX 20
+/* Backend-outage hold (probes OK, uplink dead): after this long raise the
+ * OLED alert anyway — WITHOUT modem resets — so a genuinely wedged client
+ * is never silent forever. Long on purpose: routine backend redeploys must
+ * not beep at customers. */
+#define UPLINK_HOLD_ALERT_S  (6 * UPLINK_DEAD_SECS)
+
+/* 0.8.7 — independent internet probe used ONLY to classify an
+ * uplink-watchdog trip: a dead backend behind a healthy internet must not
+ * put the fleet into a modem-reset cycle (2026-07-21 zombie-PDP lesson in
+ * reverse — resets only help when the PDP data path itself is broken). A
+ * fresh OK verdict is cached briefly so a long outage probes once per
+ * cache window, not every tick. */
+#define INET_PROBE_TIMEOUT_MS 4000
+#define INET_PROBE_CACHE_S     120
+
 static EventGroupHandle_t s_modem_evt;
 static esp_netif_t       *s_ppp_netif;
 static esp_modem_dce_t   *s_dce;
 static bool               s_iccid_known;       /* set true once AT+CCID populated identity */
 static bool               s_mqtt_started;
+
+/* 0.8.7 reconnect-schedule state (see MQTT_RETRY_NORMAL_S and the
+ * AUTH_BACKOFF constants above). Owned by the supervisor task; survives
+ * PPP re-dials on purpose — an unclaimed unit keeps its backoff ramp
+ * across link drops. next_attempt==0 means "not scheduled yet" (client
+ * just started / just disconnected) and counts as due immediately. */
+static uint32_t s_mqtt_next_attempt_s;
+static uint32_t s_mqtt_backoff_s = AUTH_BACKOFF_MIN_S;
+static int      s_mqtt_reconn_rejects;   /* consecutive rejected requests */
+
+void modem_notify_mqtt_down(void)
+{
+    if (s_modem_evt) {
+        xEventGroupSetBits(s_modem_evt, EVT_MQTT_DOWN);
+    }
+}
 
 /* PPP holds an IP right now — single-word read, safe from any task. Used by
  * fw_ota to refuse an update with no link (OTA-1). */
@@ -223,6 +278,7 @@ typedef enum {
     MODEM_FAIL_AT,     /* modem never answered AT                    */
     MODEM_FAIL_SIM,    /* AT ok, but no SIM/ICCID (CPIN/CCID failed) */
     MODEM_FAIL_NET,    /* SIM ok, but no registration / no PPP IP    */
+    MODEM_FAIL_UPLINK, /* 0.8.7: internet fine, backend unreachable  */
 } modem_fail_t;
 
 static modem_fail_t s_fail_stage;
@@ -233,8 +289,9 @@ static int          s_alert_clear_pending;  /* recovery clears still to re-send 
 static const char *modem_fail_msg(modem_fail_t f)
 {
     switch (f) {
-    case MODEM_FAIL_SIM: return "SIM ERROR";
-    case MODEM_FAIL_NET: return "NO NETWORK";
+    case MODEM_FAIL_SIM:    return "SIM ERROR";
+    case MODEM_FAIL_NET:    return "NO NETWORK";
+    case MODEM_FAIL_UPLINK: return "NO UPLINK";
     case MODEM_FAIL_AT:  /* fallthrough */
     default:             return "MODEM FAIL";
     }
@@ -642,7 +699,11 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 static void run_http_get_test(void)
 {
-    static const char *URL = "http://example.com/";
+    /* Purpose-built connectivity endpoint (the check every Android phone
+     * uses; returns 204 with no body — ~1 KB less LTE data per boot than
+     * the old example.com page, whose operators explicitly discourage
+     * production use). Failure only logs — nothing is gated on this. */
+    static const char *URL = "http://connectivitycheck.gstatic.com/generate_204";
 
     ESP_LOGI(MODEM_TAG, "--- HTTP GET %s over PPP (esp_http_client) ---", URL);
 
@@ -1103,12 +1164,82 @@ static void ppp_teardown_dce(teardown_action_t action)
  * uplink is expected at all (Arkiv mode before the device is claimed, HTTP
  * mode before an endpoint is configured): nothing to supervise → wd_ok but
  * not up. */
-static void uplink_health(bool *up, bool *wd_ok)
+/* One minimal DNS/UDP query ("web3pi.io" A IN, RD set) to `server_ip:53`.
+ * Success = any response with our transaction ID and the QR bit — we don't
+ * care about the answer (NXDOMAIN/SERVFAIL count too), only that real bytes
+ * crossed the internet and came back (~30 B out / ~100 B in). The QNAME is
+ * our own domain purely as good netiquette; nothing depends on it
+ * resolving. ICMP is deliberately not used: LTE-M carrier NATs commonly
+ * drop it, which would misclassify a healthy network as dead. */
+static bool dns_probe_one(const char *server_ip, int timeout_ms)
+{
+    static const uint8_t qtail[] = {
+        6, 'w', 'e', 'b', '3', 'p', 'i', 2, 'i', 'o', 0, /* QNAME     */
+        0x00, 0x01,                                      /* QTYPE A   */
+        0x00, 0x01,                                      /* QCLASS IN */
+    };
+    uint8_t pkt[12 + sizeof(qtail)] = { 0 };
+    uint16_t txid = (uint16_t)(esp_timer_get_time() & 0xffff);
+    pkt[0] = (uint8_t)(txid >> 8);
+    pkt[1] = (uint8_t)(txid & 0xff);
+    pkt[2] = 0x01; /* RD */
+    pkt[5] = 0x01; /* QDCOUNT = 1 */
+    memcpy(pkt + 12, qtail, sizeof(qtail));
+
+    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) {
+        return false;
+    }
+    struct timeval tv = { .tv_sec = timeout_ms / 1000,
+                          .tv_usec = (timeout_ms % 1000) * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in dst = { 0 };
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(53);
+    bool ok = false;
+    if (inet_pton(AF_INET, server_ip, &dst.sin_addr) == 1 &&
+        sendto(fd, pkt, sizeof(pkt), 0,
+               (struct sockaddr *)&dst, sizeof(dst)) == (int)sizeof(pkt)) {
+        uint8_t resp[160];
+        int n = recv(fd, resp, sizeof(resp), 0);
+        ok = n >= 12 && resp[0] == pkt[0] && resp[1] == pkt[1] &&
+             (resp[2] & 0x80) != 0;
+    }
+    close(fd);
+    return ok;
+}
+
+/* Two independent anycast resolvers — one confirming reply is enough. */
+static bool inet_probe(void)
+{
+    return dns_probe_one("1.1.1.1", INET_PROBE_TIMEOUT_MS) ||
+           dns_probe_one("8.8.8.8", INET_PROBE_TIMEOUT_MS);
+}
+
+/* `ota_ok` (0.8.7): may this tick count as the "demonstrably healthy
+ * uplink" that marks a pending-verify OTA image valid? Everywhere it
+ * matches the pre-0.8.7 wd_ok values (legacy semantics preserved for the
+ * unclaimed-Arkiv / unconfigured-HTTP postures, whose UART-flashed updates
+ * must not be left to auto-rollback) — EXCEPT the new MQTT auth-refused
+ * clause: a unit the broker is refusing must not confirm an OTA image on
+ * network reachability alone. */
+static void uplink_health(bool *up, bool *wd_ok, bool *ota_ok)
 {
     switch (backend_mode_get()) {
     case WUPS_BACKEND_MODE_MQTT:
         *up = mqtt_is_connected();
         *wd_ok = *up;
+        *ota_ok = *up;
+        if (!*up && mqtt_auth_refused()) {
+            /* Broker reachable, TLS fine, CONNACK refused our credentials:
+             * the unit is merely unclaimed (or its secret was rotated) and
+             * the network is provably healthy — a modem reset cannot help.
+             * Same posture as unclaimed Arkiv below; without it factory
+             * units beeped "NO UPLINK" and reset the modem forever while
+             * simply waiting for their first claim (2026-08-21). */
+            *wd_ok = true;
+        }
         break;
     case WUPS_BACKEND_MODE_HTTP: {
         if (!http_backend_is_configured()) {
@@ -1117,17 +1248,20 @@ static void uplink_health(bool *up, bool *wd_ok)
              * or the watchdog would reset a healthy modem forever. */
             *up = false;
             *wd_ok = true;
+            *ota_ok = true;     /* legacy: UART-flashed update must confirm */
             break;
         }
         uint32_t last = http_backend_last_success_s();
         *up = last != 0 && (now_s() - last) <= HTTP_UPLINK_FRESH_SECS;
         *wd_ok = *up;
+        *ota_ok = *up;
         break;
     }
     case WUPS_BACKEND_MODE_ARKIV:
         if (cmdauth_arkiv_claim_state() != ARKIV_CLAIMED) {
             *up = false;
             *wd_ok = true;      /* unclaimed: no uplink expected, never trip */
+            *ota_ok = true;     /* legacy: UART-flashed update must confirm */
         } else {
             /* RPC round-trips prove the uplink (telemetry every 30 s, cmd
              * poll every 5 s while the WS is down). The WS subscription is
@@ -1142,11 +1276,13 @@ static void uplink_health(bool *up, bool *wd_ok)
                 last != 0 && (now_s() - last) <= ARKIV_UPLINK_FRESH_SECS;
             *up = rpc_fresh || arkiv_ws_subscribed();
             *wd_ok = *up;
+            *ota_ok = *up;
         }
         break;
     default:
         *up = false;
         *wd_ok = true;          /* unknown mode — never trip */
+        *ota_ok = true;
         break;
     }
 }
@@ -1158,17 +1294,124 @@ static void uplink_health(bool *up, bool *wd_ok)
  * uplink watchdog trips (module reset / power-cycle per s_uplink_trips). */
 static teardown_action_t supervise_uplink(void)
 {
-    uint32_t last_healthy_s = now_s();   /* watchdog timer starts at GOT_IP */
-    uint32_t last_clear_s   = now_s();   /* GOT_IP path just sent a clear    */
+    uint32_t last_healthy_s  = now_s();  /* watchdog timer starts at GOT_IP */
+    uint32_t last_clear_s    = now_s();  /* GOT_IP path just sent a clear    */
+    uint32_t last_probe_ok_s = 0;        /* internet-probe OK verdict cache  */
 
     for (;;) {
+        /* While MQTT is down the supervisor owns the retry schedule — tick
+         * faster so attempts land near their due time (and a freshly-
+         * claimed unit's successful CONNECT is noticed promptly). */
+        uint32_t tick_ms = PPP_SUPERVISE_TICK_MS;
+        if (s_mqtt_started && backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
+            !mqtt_is_connected()) {
+            tick_ms = MQTT_DOWN_TICK_MS;
+        }
         EventBits_t bits = xEventGroupWaitBits(s_modem_evt,
-                                               EVT_LOST_IP | EVT_PPP_FAIL,
+                                               EVT_LOST_IP | EVT_PPP_FAIL | EVT_MQTT_DOWN,
                                                pdFALSE, pdFALSE,
-                                               pdMS_TO_TICKS(PPP_SUPERVISE_TICK_MS));
+                                               pdMS_TO_TICKS(tick_ms));
         if (bits & (EVT_LOST_IP | EVT_PPP_FAIL)) {
             ESP_LOGW(MODEM_TAG, "PPP link lost — tearing down DCE");
             return TEARDOWN_NORMAL;
+        }
+        if (bits & EVT_MQTT_DOWN) {
+            /* Early wake only — the reconnect driver below does the work. */
+            xEventGroupClearBits(s_modem_evt, EVT_MQTT_DOWN);
+        }
+        uint32_t now = now_s();
+
+        /* 0.8.7 reconnect driver: with esp-mqtt's auto-reconnect disabled,
+         * every attempt is requested from HERE on our own schedule — the
+         * component's old fixed 10 s cadence normally, the doubling
+         * 30→120 s backoff while attempts keep failing (credential refusal
+         * OR a down/half-up broker: both cost a full TLS handshake per
+         * attempt). Runs ABOVE the OTA freeze guard on purpose: an OTA
+         * transfer must not leave the client unrevived. Non-blocking; a
+         * request landing mid-attempt or right after a CONNECT returns
+         * ESP_FAIL and we simply retry at the next due time. */
+        if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT) {
+            if (!s_mqtt_started) {
+                /* mqtt_client_start() failed at GOT_IP (OOM/NVS hiccup) —
+                 * keep retrying from here instead of relying on a modem
+                 * reset to re-enter the GOT_IP branch. */
+                if (s_iccid_known &&
+                    (s_mqtt_next_attempt_s == 0 ||
+                     (int32_t)(now - s_mqtt_next_attempt_s) >= 0)) {
+                    if (mqtt_client_start() == ESP_OK) {
+                        s_mqtt_started = true;
+                        ESP_LOGI(MODEM_TAG, "MQTT client started (supervisor retry)");
+                    } else {
+                        ESP_LOGE(MODEM_TAG, "mqtt_client_start retry failed");
+                    }
+                    s_mqtt_next_attempt_s = now + MQTT_RETRY_NORMAL_S;
+                }
+            } else if (!mqtt_is_connected()) {
+                /* next_attempt==0 (fresh disconnect / just-started client)
+                 * counts as due now: if the client's own first attempt is
+                 * still in flight the request is rejected harmlessly and we
+                 * land on the normal cadence. */
+                if (s_mqtt_next_attempt_s == 0 ||
+                    (int32_t)(now - s_mqtt_next_attempt_s) >= 0) {
+                    esp_err_t rc = mqtt_client_request_reconnect();
+                    if (rc == ESP_OK) {
+                        /* Only an ACCEPTED request pays a TLS handshake —
+                         * only it advances the backoff ramp and its pacing. */
+                        s_mqtt_reconn_rejects = 0;
+                        uint32_t delay_s = MQTT_RETRY_NORMAL_S;
+                        if (mqtt_auth_refused()) {
+                            delay_s = s_mqtt_backoff_s;
+                            s_mqtt_backoff_s =
+                                (s_mqtt_backoff_s * 2 > AUTH_BACKOFF_MAX_S)
+                                    ? AUTH_BACKOFF_MAX_S
+                                    : s_mqtt_backoff_s * 2;
+                            ESP_LOGW(MODEM_TAG,
+                                     "MQTT attempt now; broker refuses credentials "
+                                     "×%u (unclaimed unit or rotated secret; network "
+                                     "OK) — next attempt in %us",
+                                     (unsigned)mqtt_auth_refusals(),
+                                     (unsigned)delay_s);
+                        } else if (mqtt_connect_fail_streak() >= MQTT_FAIL_STREAK_LATCH) {
+                            delay_s = s_mqtt_backoff_s;
+                            s_mqtt_backoff_s =
+                                (s_mqtt_backoff_s * 2 > AUTH_BACKOFF_MAX_S)
+                                    ? AUTH_BACKOFF_MAX_S
+                                    : s_mqtt_backoff_s * 2;
+                            ESP_LOGW(MODEM_TAG,
+                                     "MQTT attempt now; broker unreachable "
+                                     "(×%u fails) — next attempt in %us",
+                                     (unsigned)mqtt_connect_fail_streak(),
+                                     (unsigned)delay_s);
+                        }
+                        s_mqtt_next_attempt_s = now + delay_s;
+                    } else {
+                        /* Rejected request = no handshake paid: retry on the
+                         * SHORT cadence regardless of any latched backoff,
+                         * so a dead esp-mqtt task (transport re-alloc OOM
+                         * self-deletes it; every request rejected) is
+                         * detected in ~20×10 s, not 20×backoff. */
+                        s_mqtt_reconn_rejects++;
+                        if (s_mqtt_reconn_rejects >= MQTT_RECONN_REJECTS_MAX) {
+                            ESP_LOGE(MODEM_TAG,
+                                     "reconnect rejected ×%d while disconnected "
+                                     "— esp-mqtt task presumed dead, reviving",
+                                     s_mqtt_reconn_rejects);
+                            if (mqtt_client_revive() == ESP_OK) {
+                                ESP_LOGI(MODEM_TAG, "esp-mqtt task revived");
+                            }
+                            s_mqtt_reconn_rejects = 0;
+                        } else {
+                            ESP_LOGD(MODEM_TAG,
+                                     "reconnect request not accepted (%s) — "
+                                     "attempt in flight or state changed",
+                                     esp_err_to_name(rc));
+                        }
+                        s_mqtt_next_attempt_s = now + MQTT_RETRY_NORMAL_S;
+                    }
+                }
+            } else {
+                s_mqtt_reconn_rejects = 0;
+            }
         }
 
         /* OTA-1 — while a firmware download runs, the uplink is deliberately
@@ -1181,17 +1424,27 @@ static teardown_action_t supervise_uplink(void)
             continue;
         }
 
-        bool uplink_up = false, wd_healthy = false;
-        uplink_health(&uplink_up, &wd_healthy);
-        uint32_t now = now_s();
+        bool uplink_up = false, wd_healthy = false, ota_proof = false;
+        uplink_health(&uplink_up, &wd_healthy, &ota_proof);
+        if (uplink_up) {
+            /* A genuinely-connected backend resets the retry schedule. */
+            s_mqtt_backoff_s = AUTH_BACKOFF_MIN_S;
+            s_mqtt_next_attempt_s = 0;
+        }
         if (wd_healthy) {
             last_healthy_s = now;
             /* OTA-1 rollback — first demonstrably healthy uplink marks a
-             * pending-verify OTA image valid (one-shot, no-op otherwise). */
-            fw_ota_mark_uplink_healthy();
-            if (s_uplink_trips != 0) {
+             * pending-verify OTA image valid (one-shot, no-op otherwise).
+             * Gated on ota_proof, NOT wd_ok: an auth-refused unit must not
+             * confirm an image on network reachability alone. */
+            if (ota_proof) {
+                fw_ota_mark_uplink_healthy();
+            }
+            if (s_uplink_trips != 0 || s_alert_active) {
                 /* Deferred recovery bookkeeping (see the GOT_IP branch):
-                 * only a demonstrably healthy uplink ends an escalation. */
+                 * only a demonstrably healthy uplink ends an escalation.
+                 * Also covers the hold-alert (backend outage) case, which
+                 * raises the alert with zero trips. */
                 ESP_LOGI(MODEM_TAG, "uplink healthy again — resetting trip escalation");
                 s_uplink_trips = 0;
                 s_fails_since_ok = 0;
@@ -1204,6 +1457,12 @@ static teardown_action_t supervise_uplink(void)
                     ESP_LOGI(MODEM_TAG, "uplink recovered — clearing OLED/buzzer alert");
                 }
             }
+        } else if (s_alert_active && s_fail_stage == MODEM_FAIL_UPLINK) {
+            /* Hold alert survived a PPP re-dial (last_healthy_s re-armed, so
+             * the hold branch won't re-assert for another UPLINK_DEAD_SECS):
+             * keep refreshing it here, or the RP2040's 5-min non-refresh
+             * auto-clear would drop the banner mid-outage. */
+            modem_ui_alert(modem_fail_msg(MODEM_FAIL_UPLINK));
         }
 
         /* Signal-quality poll — CMUX sessions only (the DATA fallback has no
@@ -1238,8 +1497,46 @@ static teardown_action_t supervise_uplink(void)
 
         /* The watchdog itself: PPP holds an IP but the uplink has been dead
          * for UPLINK_DEAD_SECS — the zombie-PDP signature. Count it on the
-         * existing NET-stage alert machinery and escalate. */
+         * existing NET-stage alert machinery and escalate. 0.8.7: first ask
+         * the internet itself — probes answering means the BACKEND is down,
+         * not the modem, and resetting the modem would only make a whole
+         * fleet hammer the network for the duration of the outage. Probes
+         * failing with PPP up is the genuine zombie PDP → escalate. */
         if (now - last_healthy_s >= UPLINK_DEAD_SECS) {
+            /* The hold must never cover a client that cannot even attempt
+             * (mqtt_client_start still failing) — that needs the classic
+             * escalation, not patience. */
+            bool client_missing = (backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
+                                   !s_mqtt_started);
+            bool inet_ok = (now - last_probe_ok_s < INET_PROBE_CACHE_S);
+            if (!inet_ok && !client_missing && inet_probe()) {
+                last_probe_ok_s = now;
+                inet_ok = true;
+                ESP_LOGW(MODEM_TAG,
+                         "uplink dead %us but internet probes answer — "
+                         "backend outage, not a modem problem: holding "
+                         "(no reset)",
+                         (unsigned)(now - last_healthy_s));
+            }
+            if (inet_ok && !client_missing) {
+                /* Long hold (wedged client / marathon backend outage):
+                 * surface the alert WITHOUT resetting the modem, so the
+                 * unit is never silent forever. Re-asserted every tick —
+                 * the RP2040 auto-clears a non-refreshed alert after 5 min
+                 * and does not re-beep on a repeated identical text. */
+                if (now - last_healthy_s >= UPLINK_HOLD_ALERT_S) {
+                    if (!s_alert_active) {
+                        ESP_LOGE(MODEM_TAG,
+                                 "uplink dead %us with internet OK — raising "
+                                 "'NO UPLINK' alert (still no modem reset)",
+                                 (unsigned)(now - last_healthy_s));
+                    }
+                    s_fail_stage = MODEM_FAIL_UPLINK;
+                    s_alert_active = true;
+                    modem_ui_alert(modem_fail_msg(s_fail_stage));
+                }
+                continue;
+            }
             s_uplink_trips++;
             s_fail_stage = MODEM_FAIL_NET;
             s_fails_since_ok++;
@@ -1308,7 +1605,11 @@ static void ppp_supervisor_task(void *arg)
                 ESP_LOGI(MODEM_TAG, "PPP up — TCP/IP stack is on the cellular interface");
                 consecutive_fails = 0;
                 backoff_ms = PPP_BACKOFF_MIN_MS;
-                if (s_uplink_trips == 0) {
+                if (s_uplink_trips == 0 && s_fail_stage != MODEM_FAIL_UPLINK) {
+                    /* NOTE: a zero-trip NO-UPLINK hold alert (backend outage
+                     * with healthy internet) is deliberately NOT cleared
+                     * here — PPP-up proves nothing about the backend; the
+                     * supervision loop's wd-healthy branch clears it. */
                     s_fails_since_ok = 0;
                     s_fail_stage = MODEM_FAIL_NONE;
                     if (s_alert_active) {
@@ -1369,7 +1670,7 @@ static void ppp_supervisor_task(void *arg)
                         }
                     }
                 } else {
-                    ESP_LOGI(MODEM_TAG, "PPP reconnected — esp-mqtt will resume on its own");
+                    ESP_LOGI(MODEM_TAG, "PPP reconnected — supervisor will drive the MQTT reconnect");
                 }
 
                 /* First net.status of the session, seeded from the CSQ read

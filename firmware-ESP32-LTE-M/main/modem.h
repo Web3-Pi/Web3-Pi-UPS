@@ -45,3 +45,11 @@ bool modem_ppp_is_up(void);
  *   - bytes from the modem go to the console (and the serial monitor's log)
  * After this returns, AT commands can be sent interactively. */
 void modem_at_pass_through_start(void);
+
+/*
+ * 0.8.7 — called by mqtt.c from MQTT_EVENT_DISCONNECTED (esp-mqtt task
+ * context) so the supervisor wakes promptly and schedules the first
+ * reconnect ~10 s after a drop instead of a full 30 s tick later. Safe
+ * no-op before the supervisor task exists.
+ */
+void modem_notify_mqtt_down(void);
