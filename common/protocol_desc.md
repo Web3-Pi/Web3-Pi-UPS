@@ -56,8 +56,13 @@ frames whose `DST` is not itself or a broadcast address.
 - **CK_A / CK_B**: Fletcher-8 over `DST..LEN_H..payload[LEN-1]`. Same algo
   as u-blox UBX. SYNC and end marker are NOT covered.
 - **End marker**: `0x55 0xAA`. Aids resynchronization after corruption.
+- **Guard byte (byte streams only, since 2026-09)**: senders on UART / USB-CDC
+  emit one `0x00` (`WUPS_GUARD_BYTE`) after the end marker. It is NOT part of
+  the frame (never stored, never relayed inside MQTT payloads or Arkiv
+  entities, not covered by the checksum); receivers drop it while hunting
+  for SYNC. Rationale below ("Receive state machine").
 
-Total frame size = `14 + LEN` bytes. Max frame = 254 bytes.
+Total frame size = `14 + LEN` bytes. Max frame = 254 bytes (+1 guard byte on the wire).
 
 ## Endianness and alignment
 
@@ -239,18 +244,41 @@ loop:
   byte = uart_read()
   switch state:
     SYNC1: state = (byte == 0xAA) ? SYNC2 : SYNC1
-    SYNC2: state = (byte == 0x55) ? HEADER_DST : SYNC1
+    SYNC2: state = (byte == 0x55) ? HEADER_DST : RESET_WITH(byte)
     HEADER_DST..HEADER_LEN_H: accumulate; after LEN_H known, state = PAYLOAD
+                              (LEN > 240 -> RESET_WITH(byte))
     PAYLOAD: accumulate LEN bytes
     CK_A: store; state = CK_B
-    CK_B: validate Fletcher-8 over header+payload; on mismatch -> SYNC1
-    END1: state = (byte == 0x55) ? END2 : SYNC1
-    END2: if byte == 0xAA -> deliver frame; else discard. state = SYNC1
+    CK_B: validate Fletcher-8 over header+payload; on mismatch -> RESET_WITH(byte)
+    END1: state = (byte == 0x55) ? END2 : RESET_WITH(byte)
+    END2: if byte == 0xAA -> deliver frame, state = SYNC1; else RESET_WITH(byte)
+
+  RESET_WITH(byte): state = (byte == 0xAA) ? SYNC2 : SYNC1
 ```
 
-If the byte stream loses sync (e.g. UART noise), the receiver returns to
-`SYNC1` and resumes. The end marker plus checksum makes a false-positive
-deframe extremely unlikely.
+**`RESET_WITH` is load-bearing (2026-09-07 field incident).** `END2` and
+`SYNC1` are both `0xAA`. A receiver that lost sync mid-frame scans that
+frame's tail, takes `END2` for `SYNC1`, and then sees the REAL `SYNC1` of the
+next frame where it expects `SYNC2`. A naive `-> SYNC1` reset there discards
+the real `SYNC1`, the real `SYNC2` is then skipped in `SYNC1` state, the whole
+next frame is lost and the collision repeats at its end — the deframer stays
+exactly one frame behind **forever**. The only thing it can still lock onto is
+an `AA 55` inside a payload — and every `net.publish` carries a complete inner
+frame, so the ESP32 kept decoding (and ignoring) inner `power.status` frames
+for days while no wrapper ever reached MQTT. Re-evaluating the failed byte as
+a `SYNC1` candidate re-locks on the very next `SYNC2`.
+
+Two further, independent safeguards:
+
+- **Guard byte on the wire** (see frame format): lets a receiver still running
+  the naive deframer (e.g. a CH32X that cannot be updated remotely) burn its
+  bogus `SYNC2` check on the guard and re-lock on the next frame.
+- **Idle reset**: a frame is at most 254 B = 2.8 ms at 921600 baud. A receiver
+  that is mid-frame and sees no byte for ~50 ms resets to `SYNC1` — the frame
+  can no longer complete (peer reset, overflow).
+
+The end marker plus checksum makes a false-positive deframe extremely
+unlikely.
 
 ## Limits & timeouts
 

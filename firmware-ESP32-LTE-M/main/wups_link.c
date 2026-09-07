@@ -75,7 +75,12 @@
  *   - 2026-08-20 (unit ...8870, esp32:0.8.3): bytes kept flowing but every
  *     frame failed deframing (persistent RX-stream corruption); the old
  *     byte-based feed never tripped, so the wedge sat for hours until a
- *     manual remote reset. Frame-based feeding closes that blind spot. */
+ *     manual remote reset. Frame-based feeding closes that blind spot.
+ *   - 2026-09-07 (unit ...9990, esp32:0.8.7, 5.9 days): the deframer sat one
+ *     frame behind (see rx_reset_with) and delivered ONLY the inner
+ *     power.status frames wrapped inside net.publish — valid, broadcast,
+ *     ignored — which kept feeding the "any valid frame" watchdog. Since
+ *     0.8.8 only frames ADDRESSED TO US (dst == ESP32) feed it. */
 #define WUPS_RX_IDLE_PING_MS     60000  /* no valid frame before the first probe */
 #define WUPS_RX_PING_RETRY_MS    15000  /* probe spacing / post-probe grace */
 /* Garbage floor that lets the reboot escalation fire even with zero frames
@@ -112,11 +117,21 @@ static volatile uint32_t s_frames_rx = 0;
 static volatile uint32_t s_bytes_tx  = 0;
 static volatile uint32_t s_bytes_rx  = 0;
 static volatile uint32_t s_rx_resync = 0;  /* SYNC2 mismatch — out-of-frame bytes seen */
+static volatile uint32_t s_rx_bad    = 0;  /* frames rejected: bad LEN / checksum / end marker */
+static volatile uint32_t s_rx_idle_resets = 0; /* deframer reset by inter-frame silence mid-frame */
 static volatile uint32_t s_rx_reinstalls = 0;  /* RX-watchdog driver reinstalls */
-/* esp_timer ms (u32, wrap-safe subtraction) of the last VALID frame accepted
- * by deliver_frame(). Written by rx_task, read by the modem task for
- * net.status v2 — u32 loads/stores are atomic on Xtensa. Initialized at
- * init so "no frame yet" reads as time-since-boot, which is the honest
+/* Frames addressed to US (dst == ESP32: net.publish, pong, net.config,
+ * fw_xfer). This — not s_frames_rx — feeds the RX watchdog. Broadcast frames
+ * also deframe fine, but a broadcast can be the INNER frame the RP2040 wraps
+ * inside net.publish (power.status src=CH32X dst=BCAST): a deframer stuck one
+ * frame behind locks onto exactly those inner AA 55 pairs, delivers them,
+ * and looked "healthy" to a watchdog fed by any valid frame for 5.9 days
+ * (2026-09-07, …569990) while the wrappers never decoded. */
+static volatile uint32_t s_frames_rx_unicast = 0;
+/* esp_timer ms (u32, wrap-safe subtraction) of the last valid frame ADDRESSED
+ * TO US accepted by deliver_frame(). Written by rx_task, read by the modem
+ * task for net.status v2 — u32 loads/stores are atomic on Xtensa. Initialized
+ * at init so "no frame yet" reads as time-since-boot, which is the honest
  * answer (a bench card with no RP2040 shows an ever-growing age). */
 static volatile uint32_t s_last_frame_ms = 0;
 
@@ -154,6 +169,19 @@ static struct {
 } s_rx;
 
 static inline void rx_reset(void) { s_rx.state = WUPS_RX_SYNC1; }
+/* Reset after byte `b` FAILED a check — `b` must be re-evaluated as a SYNC1
+ * candidate, never discarded. END2 == SYNC1 == 0xAA: a deframer that lost
+ * sync mid-frame scans that frame's tail, takes END2 for SYNC1, moves to
+ * SYNC2 and then meets the REAL SYNC1 of the next frame. A blind reset here
+ * throws that byte away, the real SYNC2 is then skipped in SYNC1 state, the
+ * whole next frame is lost and the same collision repeats at its end — the
+ * deframer stays exactly one frame behind forever (2026-09-07 relay
+ * blackout; see protocol.h WUPS_GUARD_BYTE). Keeping 0xAA as the new
+ * candidate makes the very next SYNC2 lock the stream again. */
+static inline void rx_reset_with(uint8_t b)
+{
+    s_rx.state = (b == WUPS_SYNC1) ? WUPS_RX_SYNC2 : WUPS_RX_SYNC1;
+}
 static inline void rx_step(uint8_t b)
 {
     s_rx.exp_a = (uint8_t)(s_rx.exp_a + b);
@@ -185,26 +213,33 @@ static void send_frame_full(uint8_t dst, uint8_t src, uint8_t cls, uint8_t op,
     for (int i = 2; i < 10; ++i) { a = (uint8_t)(a + header[i]); b = (uint8_t)(b + a); }
     const uint8_t *p = (const uint8_t *)payload;
     for (uint16_t i = 0; i < payload_len; ++i) { a = (uint8_t)(a + p[i]); b = (uint8_t)(b + a); }
-    uint8_t trailer[4] = { a, b, WUPS_END1, WUPS_END2 };
+    /* Trailer + one inter-frame guard byte (protocol.h WUPS_GUARD_BYTE): a
+     * receiver still running the pre-2026-09 deframer, stuck one frame
+     * behind, burns its bogus SYNC2 check on the guard instead of on our
+     * real SYNC1 and re-locks on this very frame. Not part of the frame. */
+    uint8_t trailer[5] = { a, b, WUPS_END1, WUPS_END2, WUPS_GUARD_BYTE };
 
     /* Serialize at frame granularity so concurrent senders (RX task,
      * MQTT data callback, hello at boot) don't interleave. */
     xSemaphoreTake(s_tx_mutex, portMAX_DELAY);
     uart_write_bytes(WUPS_UART_NUM, (const char *)header, 10);
     if (payload_len) uart_write_bytes(WUPS_UART_NUM, (const char *)payload, payload_len);
-    uart_write_bytes(WUPS_UART_NUM, (const char *)trailer, 4);
+    uart_write_bytes(WUPS_UART_NUM, (const char *)trailer, sizeof(trailer));
     xSemaphoreGive(s_tx_mutex);
 
     s_frames_tx++;
-    s_bytes_tx += (uint32_t)(14 + payload_len);
+    s_bytes_tx += (uint32_t)(WUPS_HEADER_BYTES + payload_len + sizeof(trailer));
 }
 
 void wups_link_log_stats(void)
 {
-    ESP_LOGI(TAG, "stats: tx=%lu (%lu B) rx=%lu (%lu B) resync=%lu reinst=%lu age=%lus",
+    ESP_LOGI(TAG, "stats: tx=%lu (%lu B) rx=%lu (%lu to us, %lu B) resync=%lu bad=%lu "
+                  "idle_rst=%lu reinst=%lu age=%lus",
              (unsigned long)s_frames_tx, (unsigned long)s_bytes_tx,
-             (unsigned long)s_frames_rx, (unsigned long)s_bytes_rx,
-             (unsigned long)s_rx_resync, (unsigned long)s_rx_reinstalls,
+             (unsigned long)s_frames_rx, (unsigned long)s_frames_rx_unicast,
+             (unsigned long)s_bytes_rx,
+             (unsigned long)s_rx_resync, (unsigned long)s_rx_bad,
+             (unsigned long)s_rx_idle_resets, (unsigned long)s_rx_reinstalls,
              (unsigned long)wups_link_frame_age_s());
 }
 
@@ -645,7 +680,13 @@ static void deliver_frame(void)
         return;
     }
     s_frames_rx++;
-    s_last_frame_ms = now_ms32();   /* feeds the frame-based RX watchdog */
+    /* Only frames addressed to us feed the RX watchdog / sys_link_age_s —
+     * see s_frames_rx_unicast. Broadcast frames still count in s_frames_rx
+     * (net.status v2 diagnostics) and are dispatched below as before. */
+    if (s_rx.dst == WUPS_ADDR_ESP32) {
+        s_frames_rx_unicast++;
+        s_last_frame_ms = now_ms32();
+    }
     /* exp_a / exp_b were updated alongside each rx_step() and matched
      * the on-wire CK_A/CK_B at the end of WUPS_RX_CK_B, so they're the
      * canonical checksum bytes for re-publish. */
@@ -669,7 +710,7 @@ static void rx_byte(uint8_t b)
             s_rx.state = WUPS_RX_DST;
         } else {
             s_rx_resync++;
-            rx_reset();
+            rx_reset_with(b);       /* 0xAA here may be the real SYNC1 */
         }
         break;
     case WUPS_RX_DST:    s_rx.dst   = b; rx_step(b); s_rx.state = WUPS_RX_SRC;   break;
@@ -686,7 +727,7 @@ static void rx_byte(uint8_t b)
     case WUPS_RX_LEN_H:
         s_rx.len |= (uint16_t)((uint16_t)b << 8);
         rx_step(b);
-        if (s_rx.len > WUPS_MAX_PAYLOAD) { rx_reset(); break; }
+        if (s_rx.len > WUPS_MAX_PAYLOAD) { s_rx_bad++; rx_reset_with(b); break; }
         s_rx.state = (s_rx.len == 0) ? WUPS_RX_CK_A : WUPS_RX_PAYLOAD;
         break;
     case WUPS_RX_PAYLOAD:
@@ -702,15 +743,26 @@ static void rx_byte(uint8_t b)
         if (s_rx.rx_ck_a == s_rx.exp_a && b == s_rx.exp_b) {
             s_rx.state = WUPS_RX_END1;
         } else {
-            rx_reset();
+            s_rx_bad++;
+            rx_reset_with(b);
         }
         break;
     case WUPS_RX_END1:
-        s_rx.state = (b == WUPS_END1) ? WUPS_RX_END2 : WUPS_RX_SYNC1;
+        if (b == WUPS_END1) {
+            s_rx.state = WUPS_RX_END2;
+        } else {
+            s_rx_bad++;
+            rx_reset_with(b);
+        }
         break;
     case WUPS_RX_END2:
-        if (b == WUPS_END2) deliver_frame();
-        rx_reset();
+        if (b == WUPS_END2) {
+            deliver_frame();
+            rx_reset();
+        } else {
+            s_rx_bad++;
+            rx_reset_with(b);
+        }
         break;
     default:
         rx_reset();
@@ -795,7 +847,7 @@ static void rx_task(void *arg)
     int64_t  last_ping_us       = 0;
     int      pings_sent         = 0;
     int      recovery_cycles    = 0;
-    uint32_t frames_seen        = s_frames_rx;
+    uint32_t frames_seen        = s_frames_rx_unicast;
     /* Watchdog window reference. Deliberately SEPARATE from s_last_frame_ms:
      * the ladder re-arms this after every reinstall / OTA pause so each
      * recovery cycle gets a fresh 60 s window, while s_last_frame_ms is
@@ -819,14 +871,29 @@ static void rx_task(void *arg)
         if (n > 0) s_bytes_rx += (uint32_t)n;
         for (int i = 0; i < n; ++i) rx_byte(buf[i]);
 
+        /* Inter-frame silence while mid-frame: a frame is <= 254 B = 2.8 ms at
+         * 921600, so 50 ms (one empty read) without a byte inside a frame means
+         * that frame will never complete (sender reset, bytes lost in an
+         * overflow). Start clean so the next real SYNC pair is matched from
+         * SYNC1 — second, independent safeguard against the one-frame-behind
+         * trap on top of rx_reset_with(). */
+        if (n == 0 && s_rx.state != WUPS_RX_SYNC1) {
+            s_rx_idle_resets++;
+            rx_reset();
+        }
+
         /* --- RX watchdog (see uart_bringup for the failures this heals) ---
-         * Fed by VALID FRAMES only (deliver_frame stamps s_last_frame_ms):
-         * raw bytes that never deframe do NOT count. Ladder: 60 s without a
-         * frame → 2× system.ping probes (a healthy RP2040's pong is itself a
-         * valid frame and resets the clock), then driver reinstall cycles,
-         * then reboot as the last resort. */
-        if (s_frames_rx != frames_seen) {
-            frames_seen         = s_frames_rx;
+         * Fed by valid frames ADDRESSED TO US only (deliver_frame stamps
+         * s_last_frame_ms for dst == ESP32): raw bytes that never deframe do
+         * NOT count, and neither do broadcast frames — those can be the inner
+         * frames of net.publish wrappers a stuck deframer locks onto (see
+         * s_frames_rx_unicast). Ladder: 60 s without such a frame → 2×
+         * system.ping probes (a healthy RP2040's pong is unicast to us and
+         * resets the clock), then driver reinstall cycles (each ends in
+         * rx_reset(), which alone breaks the trap), then reboot as the last
+         * resort. */
+        if (s_frames_rx_unicast != frames_seen) {
+            frames_seen         = s_frames_rx_unicast;
             bytes_at_last_frame = s_bytes_rx;
             wd_ref_ms           = now_ms32();
             pings_sent          = 0;
@@ -852,7 +919,7 @@ static void rx_task(void *arg)
                 ESP_LOGW(TAG, "RX: no valid frame for %lus (%lu B %s) — "
                               "ping probe %d/2",
                          (unsigned long)age_s, (unsigned long)garbage,
-                         garbage ? "of garbage" : "= silence",
+                         garbage ? "since last frame to us" : "= silence",
                          pings_sent + 1);
                 wups_link_send(WUPS_ADDR_RP2040, WUPS_CLASS_SYSTEM,
                                WUPS_OP_SYS_PING, WUPS_FLAG_REQ, NULL, 0);
@@ -881,7 +948,7 @@ static void rx_task(void *arg)
         ESP_LOGE(TAG, "RX: no valid frame for %lus (%lu B %s), 2 pings "
                       "unanswered — reinstalling UART driver (cycle %d)",
                  (unsigned long)age_s, (unsigned long)garbage,
-                 garbage ? "of garbage" : "= silence", recovery_cycles);
+                 garbage ? "since last frame to us" : "= silence", recovery_cycles);
         s_rx_reinstalls++;
         rx_link_recover();
         wd_ref_ms  = now_ms32();

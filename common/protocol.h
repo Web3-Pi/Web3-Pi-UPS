@@ -43,6 +43,27 @@ extern "C" {
 #define WUPS_END1                0x55u
 #define WUPS_END2                0xAAu
 
+/*
+ * Inter-frame guard byte (2026-09, field incident: relay blackout).
+ *
+ * END2 (0xAA) == SYNC1 (0xAA). A receiver that lost sync mid-frame scans the
+ * tail of that frame, takes END2 for SYNC1, then sees the REAL SYNC1 where it
+ * expects SYNC2 — and a naive deframer discards it and never re-locks (it
+ * stays exactly one frame behind forever). Two independent mitigations:
+ *
+ *   1. RECEIVERS MUST re-evaluate a byte that fails the SYNC2 (or any later)
+ *      check as a fresh SYNC1 candidate: `state = (b == SYNC1) ? SYNC2 : SYNC1`
+ *      instead of a blind reset to SYNC1.
+ *   2. SENDERS on a byte stream (UART / USB-CDC) SHOULD emit one guard byte
+ *      after END2. A guard is neither SYNC1 nor SYNC2, so a receiver still
+ *      running the old deframer burns its bogus SYNC2 check on the guard and
+ *      locks onto the next real SYNC1/SYNC2 pair. Receivers ignore it: while
+ *      hunting for SYNC1 any non-0xAA byte is dropped. The guard is NOT part
+ *      of the frame — it is never present in stored/relayed frames (MQTT
+ *      payloads, Arkiv entities) and is not covered by the checksum.
+ */
+#define WUPS_GUARD_BYTE          0x00u
+
 #define WUPS_HEADER_BYTES        10u   /* SYNC1 SYNC2 DST SRC CLASS OP FLAGS SEQ LEN_L LEN_H */
 #define WUPS_TRAILER_BYTES       4u    /* CK_A CK_B END1 END2 */
 #define WUPS_FRAMING_BYTES       (WUPS_HEADER_BYTES + WUPS_TRAILER_BYTES)  /* 14 */
@@ -381,7 +402,9 @@ typedef struct WUPS_PACKED {
     uint32_t bytes_rx;
     uint32_t sys_frames_rx;  /* valid WUPS frames received from the RP2040 since boot */
     uint32_t sys_resync;     /* deframer resyncs (out-of-frame bytes) since boot */
-    uint16_t sys_link_age_s; /* seconds since last valid frame, saturates at 0xFFFF */
+    uint16_t sys_link_age_s; /* seconds since last valid frame ADDRESSED TO the ESP32
+                              * (dst == ESP32; broadcasts excluded since esp32:0.8.8 —
+                              * they can be inner frames of net.publish), saturates at 0xFFFF */
 } wups_net_status_v2_t;      /* 30 bytes */
 
 /* net.publish (REQ -> ESP32). Variable-length tail: topic + payload. */

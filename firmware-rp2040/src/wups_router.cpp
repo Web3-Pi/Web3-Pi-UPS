@@ -57,6 +57,26 @@ static inline void rx_step(PortRxState& s, uint8_t b)
 
 static inline void rx_reset(PortRxState& s) { s.state = WUPS_S_SYNC1; }
 
+/* Reset after byte `b` FAILED a check — `b` must be re-evaluated as a SYNC1
+ * candidate, never discarded. END2 == SYNC1 == 0xAA: a deframer that lost
+ * sync mid-frame scans that frame's tail, takes END2 for SYNC1, moves to
+ * SYNC2 and then meets the REAL SYNC1 of the next frame. A blind reset
+ * throws it away, the real SYNC2 is skipped in SYNC1 state, the whole next
+ * frame is lost and the collision repeats at its end — one frame behind
+ * forever (2026-09-07 relay blackout on the ESP32 side; same state machine
+ * here). Keeping 0xAA as the candidate re-locks on the very next SYNC2. */
+static inline void rx_reset_with(PortRxState& s, uint8_t b)
+{
+    s.state = (b == WUPS_SYNC1) ? WUPS_S_SYNC2 : WUPS_S_SYNC1;
+}
+
+/* Inter-frame silence while mid-frame: a frame is <= 254 B = 2.8 ms at
+ * 921600 (USB-CDC delivers a frame within a few ms too), so 50 ms without
+ * a byte inside a frame means it will never complete (peer reset, bytes
+ * lost). Reset so the next real SYNC pair is matched from SYNC1. */
+static const uint32_t WUPS_RX_IDLE_RESET_MS = 50;
+static uint32_t port_last_rx_ms[WUPS_PORT_COUNT] = { 0, 0, 0, 0 };
+
 /* --- encode / emit -------------------------------------------------- */
 
 void wups_send_with_src(uint8_t port, uint8_t dst, uint8_t src,
@@ -84,12 +104,18 @@ void wups_send_with_src(uint8_t port, uint8_t dst, uint8_t src,
     for (int i = 2; i < 10; ++i) { a = (uint8_t)(a + header[i]); b = (uint8_t)(b + a); }
     const uint8_t* p = (const uint8_t*)payload;
     for (uint16_t i = 0; i < payload_len; ++i) { a = (uint8_t)(a + p[i]); b = (uint8_t)(b + a); }
-    uint8_t trailer[4] = { a, b, WUPS_END1, WUPS_END2 };
+    /* Trailer + one inter-frame guard byte (protocol.h WUPS_GUARD_BYTE). A
+     * peer still running the pre-2026-09 deframer and stuck one frame behind
+     * burns its bogus SYNC2 check on the guard instead of on our real SYNC1
+     * and re-locks on this very frame. Matters most for the CH32X, which
+     * cannot be updated remotely; harmless for every receiver (a byte that
+     * is neither 0xAA nor 0x55 is ignored while hunting for SYNC). */
+    uint8_t trailer[5] = { a, b, WUPS_END1, WUPS_END2, WUPS_GUARD_BYTE };
 
     Stream& s = *port_streams[port];
     s.write(header, 10);
     if (payload_len) s.write((const uint8_t*)payload, payload_len);
-    s.write(trailer, 4);
+    s.write(trailer, sizeof(trailer));
 
     Wups_Frames_Tx[port]++;
 }
@@ -210,7 +236,7 @@ static void rx_byte(uint8_t inbound_port, PortRxState& s, uint8_t b)
         }
         else
         {
-            rx_reset(s);
+            rx_reset_with(s, b);    /* 0xAA here may be the real SYNC1 */
         }
         break;
     case WUPS_S_DST:    s.dst   = b; rx_step(s, b); s.state = WUPS_S_SRC;   break;
@@ -227,7 +253,7 @@ static void rx_byte(uint8_t inbound_port, PortRxState& s, uint8_t b)
     case WUPS_S_LEN_H:
         s.len |= (uint16_t)((uint16_t)b << 8);
         rx_step(s, b);
-        if (s.len > WUPS_MAX_PAYLOAD) { rx_reset(s); break; }
+        if (s.len > WUPS_MAX_PAYLOAD) { rx_reset_with(s, b); break; }
         s.state = (s.len == 0) ? WUPS_S_CK_A : WUPS_S_PAYLOAD;
         break;
     case WUPS_S_PAYLOAD:
@@ -246,18 +272,23 @@ static void rx_byte(uint8_t inbound_port, PortRxState& s, uint8_t b)
         }
         else
         {
-            rx_reset(s);
+            rx_reset_with(s, b);
         }
         break;
     case WUPS_S_END1:
-        s.state = (b == WUPS_END1) ? WUPS_S_END2 : WUPS_S_SYNC1;
+        if (b == WUPS_END1) s.state = WUPS_S_END2;
+        else                rx_reset_with(s, b);
         break;
     case WUPS_S_END2:
         if (b == WUPS_END2)
         {
             deliver_frame(inbound_port, s);
+            rx_reset(s);
         }
-        rx_reset(s);
+        else
+        {
+            rx_reset_with(s, b);
+        }
         break;
     default:
         rx_reset(s);
@@ -293,9 +324,21 @@ void wups_router_drain(void)
                             * pass — a lagging drain lets the SW ring hit its
                             * full-boundary corruption bug (2026-07-11). Still
                             * bounded so one port can't starve the others. */
+        const uint32_t now_ms = millis();
+        bool got_bytes = false;
         while (budget-- > 0 && s->available())
         {
             rx_byte(p, port_rx[p], (uint8_t)s->read());
+            got_bytes = true;
+        }
+        if (got_bytes)
+        {
+            port_last_rx_ms[p] = now_ms;
+        }
+        else if (port_rx[p].state != WUPS_S_SYNC1 &&
+                 (uint32_t)(now_ms - port_last_rx_ms[p]) > WUPS_RX_IDLE_RESET_MS)
+        {
+            rx_reset(port_rx[p]);   /* stale partial frame — see WUPS_RX_IDLE_RESET_MS */
         }
     }
 }

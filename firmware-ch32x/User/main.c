@@ -452,7 +452,7 @@ static UINT16 Powercycle_Timer_Ms = 0;
 /* Firmware version, reported in system.ping RESP / system.hello. The
  * string rides the optional pong tail (protocol.h); the u16 stays as
  * the coarse legacy field. Bump on release. */
-#define FW_VERSION_STR "ch32x:1.1.0"
+#define FW_VERSION_STR "ch32x:1.1.1"
 #define FW_VERSION_U16 ((uint16_t)((1u << 8) | 1u)) /* coarse 1.1 */
 
 /*********************************************************************
@@ -554,11 +554,14 @@ static void wups_send_frame(uint8_t dst, uint8_t cls, uint8_t op,
         a = (uint8_t)(a + p[i]);
         b = (uint8_t)(b + a);
     }
-    uint8_t trailer[4] = { a, b, WUPS_END1, WUPS_END2 };
+    /* Trailer + one inter-frame guard byte (protocol.h WUPS_GUARD_BYTE): lets
+     * a peer whose deframer is stuck one frame behind re-lock on this frame.
+     * Ignored by every receiver while hunting for SYNC; not part of the frame. */
+    uint8_t trailer[5] = { a, b, WUPS_END1, WUPS_END2, WUPS_GUARD_BYTE };
 
     Usart2_Send_Bytes(header, 10);
     if (payload_len) Usart2_Send_Bytes(p, payload_len);
-    Usart2_Send_Bytes(trailer, 4);
+    Usart2_Send_Bytes(trailer, sizeof(trailer));
 }
 
 /* Negotiated OUTPUT PD contract (CH32X is the source to the Pi). Derived
@@ -988,6 +991,18 @@ static struct {
 
 static inline void wups_rx_reset(void) { Wups_Rx.state = WUPS_RX_SYNC1; }
 
+/* Reset after byte `b` FAILED a check — `b` must be re-evaluated as a SYNC1
+ * candidate, never discarded. END2 == SYNC1 == 0xAA: a deframer that lost
+ * sync mid-frame scans that frame's tail, takes END2 for SYNC1, moves to
+ * SYNC2 and then meets the REAL SYNC1 of the next frame. A blind reset
+ * throws it away and the deframer stays exactly one frame behind forever
+ * (2026-09-07 relay blackout, same state machine on the ESP32). Keeping
+ * 0xAA as the candidate re-locks on the very next SYNC2. */
+static inline void wups_rx_reset_with(uint8_t b)
+{
+    Wups_Rx.state = (b == WUPS_SYNC1) ? WUPS_RX_SYNC2 : WUPS_RX_SYNC1;
+}
+
 static inline void wups_rx_step(uint8_t b)
 {
     Wups_Rx.exp_a = (uint8_t)(Wups_Rx.exp_a + b);
@@ -1011,7 +1026,7 @@ static void wups_rx_byte(uint8_t b)
         }
         else
         {
-            wups_rx_reset();
+            wups_rx_reset_with(b);  /* 0xAA here may be the real SYNC1 */
         }
         break;
     case WUPS_RX_DST:    Wups_Rx.dst = b;   wups_rx_step(b); Wups_Rx.state = WUPS_RX_SRC;   break;
@@ -1028,7 +1043,7 @@ static void wups_rx_byte(uint8_t b)
     case WUPS_RX_LEN_H:
         Wups_Rx.len |= (uint16_t)((uint16_t)b << 8);
         wups_rx_step(b);
-        if (Wups_Rx.len > WUPS_MAX_PAYLOAD) { wups_rx_reset(); break; }
+        if (Wups_Rx.len > WUPS_MAX_PAYLOAD) { wups_rx_reset_with(b); break; }
         Wups_Rx.state = (Wups_Rx.len == 0) ? WUPS_RX_CK_A : WUPS_RX_PAYLOAD;
         break;
     case WUPS_RX_PAYLOAD:
@@ -1048,11 +1063,12 @@ static void wups_rx_byte(uint8_t b)
         }
         else
         {
-            wups_rx_reset();
+            wups_rx_reset_with(b);
         }
         break;
     case WUPS_RX_END1:
-        Wups_Rx.state = (b == WUPS_END1) ? WUPS_RX_END2 : WUPS_RX_SYNC1;
+        if (b == WUPS_END1) Wups_Rx.state = WUPS_RX_END2;
+        else                wups_rx_reset_with(b);
         break;
     case WUPS_RX_END2:
         if (b == WUPS_END2)
@@ -1061,8 +1077,12 @@ static void wups_rx_byte(uint8_t b)
             wups_handle_frame(Wups_Rx.dst, Wups_Rx.src, Wups_Rx.cls,
                               Wups_Rx.op, Wups_Rx.flags, Wups_Rx.seq,
                               Wups_Rx.payload, Wups_Rx.len);
+            wups_rx_reset();
         }
-        wups_rx_reset();
+        else
+        {
+            wups_rx_reset_with(b);
+        }
         break;
     default:
         wups_rx_reset();

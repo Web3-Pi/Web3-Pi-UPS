@@ -226,7 +226,7 @@ unsigned long netAlertDismissedAtMs = 0;
 // Firmware version, reported in system.ping RESP / system.hello. The string
 // rides the optional pong tail (protocol.h); the u16 stays as the coarse
 // legacy field. Bump on release.
-#define FW_VERSION_STR "rp2040:1.2.0"
+#define FW_VERSION_STR "rp2040:1.2.1"
 #define FW_VERSION_U16 ((uint16_t)((1u << 8) | 2u))   /* coarse 1.2 */
 
 // stream dies the cached ui.* values FREEZE and everything downstream
