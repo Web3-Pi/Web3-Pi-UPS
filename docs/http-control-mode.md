@@ -116,15 +116,24 @@ Server responses:
 class has a **fresh** snapshot (observed within ~90 s); otherwise they are
 omitted rather than sent stale.
 
+Body as sent by `esp32:0.8.9` with a CH32X that emits `power.status` v2 (the
+production case). The `power` object is from a real unit on 15 V USB-C mains
+with a full battery and the Pi rail up; the remaining objects are illustrative:
+
 ```json
 {
   "ts": 1780047458,
-  "fw_ver": "esp32:0.5.0+dev",
+  "fw_ver": "esp32:0.8.9",
   "uptime_s": 137,
   "power": {
-    "charge_state": 1,
-    "vbus_in_mv": 5012, "vbus_out_mv": 5050, "ibus_out_ma": 1840,
-    "vbat_mv": 7920, "ibat_ma": -200, "temp_dc": 253, "faults": 0
+    "version": 2, "flags": 31, "charge_state": 3,
+    "vbus_in_mv": 14709, "pd_in_mv": 15000, "pd_in_ma": 1750,
+    "vbus_out_mv": 5051, "vout_set_mv": 5000, "vout_read_mv": 5046,
+    "iout_limit_ma": 5010, "pd_out_mv": 5000, "pd_out_ma": 3000,
+    "vbat_mv": 7897, "ibat_ma": 0,
+    "vsys_mv": 7900, "iin_ma": 1200,
+    "temp_lm_dc": 350, "temp_mp_dc": 440, "temp_dc": 440,
+    "faults": 0, "uptime_s": 86272
   },
   "host": {
     "eth_state": 2, "cpu_temp_dc": 451,
@@ -138,12 +147,77 @@ omitted rather than sent stale.
 }
 ```
 
+**Legacy v1 shape** — no `version` key, the eight original keys (`ibus_out_ma`
+and `ibat_ma` are signed). It appears only for units whose CH32X still emits
+`power.status` v1:
+
+```json
+"power": {
+  "charge_state": 1,
+  "vbus_in_mv": 5012, "vbus_out_mv": 5050, "ibus_out_ma": 1840,
+  "vbat_mv": 7920, "ibat_ma": -200, "temp_dc": 253, "faults": 0
+}
+```
+
+> **Since `esp32:0.8.9`.** Earlier firmware decoded every `power.status`
+> payload through the v1 struct, so a v2-emitting CH32X produced the 8 legacy
+> keys with scrambled values (`temp_dc` was really `vout_set_mv`, `faults` was
+> `pd_out_mv`, `charge_state` was `flags`) — GitHub issue #7. Servers should
+> dispatch on `power.version` to tell the two shapes apart.
+
 Field origins map directly onto the WUPS telemetry structs in
-[`../common/protocol.h`](../common/protocol.h): `power.*` ←
-`wups_power_status_v1_t`, `host.*` ← `wups_host_status_v1_t`, `net.*` ←
-`wups_net_status_v1_t`. Units are as named (`*_mv` millivolts, `*_ma`
-milliamps signed, `temp_dc`/`*_dc` deci-Celsius, `*_pct` percent,
-`load_x100` = 1-min load × 100).
+[`../common/protocol.h`](../common/protocol.h). The device dispatches on the
+wire version byte (offset 0 of the payload): `power.version == 2` ↔
+`wups_power_status_v2_t` (40 B); no `version` key ↔ `wups_power_status_v1_t`
+(20 B); any other version byte, or a payload shorter than its struct → the
+`power` object is omitted and the device logs one warning per boot. `host.*` ← `wups_host_status_v1_t`, `net.*` ←
+`wups_net_status_v1_t`. Units are as named: `*_mv` millivolts, `*_ma`
+milliamps (signed where noted), `*_dc` deci-Celsius (253 = 25.3 °C), `*_pct`
+percent, `load_x100` = 1-min load × 100, `*_s` seconds.
+
+`power` v2 keys (since `esp32:0.8.9`), in emission order:
+
+| key | unit | wire field | note |
+|---|---|---|---|
+| `version` | — | `version` | always `2` for this shape |
+| `flags` | bitmask | `flags` | see legend below |
+| `charge_state` | enum | `charge_state` | see legend below |
+| `vbus_in_mv` | mV | `vbus_in_mV` | input rail after the ideal-diode OR of USB-C and barrel |
+| `pd_in_mv` | mV | `pd_in_mV` | negotiated INPUT PD contract (HUSB238); `0` = no contract |
+| `pd_in_ma` | mA | `pd_in_mA` | negotiated INPUT PD contract; `0` = no contract |
+| `vbus_out_mv` | mV | `vbus_out_mV` | independent ADC measurement of the Pi rail |
+| `vout_set_mv` | mV | `vout_set_mV` | TPS55289 commanded output voltage |
+| `vout_read_mv` | mV | `vout_read_mV` | TPS55289 output voltage readback |
+| `iout_limit_ma` | mA | `iout_limit_mA` | TPS55289 current **limit** — not a load-current measurement |
+| `pd_out_mv` | mV | `pd_out_mV` | OUTPUT PD contract to the Pi; `0` = rail off |
+| `pd_out_ma` | mA | `pd_out_mA` | OUTPUT PD contract to the Pi; `0` = rail off |
+| `vbat_mv` | mV | `vbat_mV` | battery voltage (authoritative ADC) |
+| `ibat_ma` | mA, signed | `ichg_mA` | MP2762A **charge** current; `0` on discharge (not measured) |
+| `vsys_mv` | mV | `vsys_mV` | MP2762A VSYS rail (feeds the TPS55289) |
+| `iin_ma` | mA | `iin_mA` | MP2762A charger input current |
+| `temp_lm_dc` | 0.1 °C, signed | `temp_lm_dC` | LM75B board temperature |
+| `temp_mp_dc` | 0.1 °C, signed, or `null` | `temp_mp_dC` | MP2762A junction temperature; `null` when the charger is unpowered (wire sentinel −32768) |
+| `temp_dc` | 0.1 °C, signed | derived | aggregate: `max(temp_mp_dc, temp_lm_dc)`, or `temp_lm_dc` when `temp_mp_dc` is `null` — same rule as the OLED, the host service and the Workbench |
+| `faults` | bitmask | `faults` | see legend below |
+| `uptime_s` | s | `uptime_s` | CH32X uptime (restart detection) — distinct from the top-level ESP32 `uptime_s` |
+
+Legends:
+
+- `flags` bits: 0 `DC_IN_EN` (input path enabled), 1 `VBUS_OUT_EN` (Pi rail
+  enabled), 2 `BATT_PRESENT`, 3 `POWER_GOOD` (charger ACOK, mains good),
+  4 `USB_C_ATTACH` (HUSB238 PD contract present). Bits 5-7 are currently
+  unused (0).
+  The example's `31` = all five set.
+- `charge_state`: 0 not charging, 1 pre-charge (trickle), 2 fast charge,
+  3 charge done. Faults are never signalled here — see `faults`.
+- `faults` (identical layout in v1 and v2): low byte = MP2762A REG14H fault
+  register; bit 8 = TPS55289 SCP, bit 9 = OCP, bit 10 = OVP. `0` = no fault.
+- `temp_dc`: the higher of the two sensors; falls back to `temp_lm_dc` when
+  the MP2762A is unpowered (`temp_mp_dc` is `null`, e.g. battery-only
+  operation).
+- There is **no `ibus_out_ma` in v2** — the board has no load-current
+  measurement. `iout_limit_ma` is the converter's current *limit*; `ibat_ma`
+  is the *charge* current and reads `0` while discharging.
 
 `acks` lists the `id`s of commands the device applied since its previous POST
 (empty array if none). This is the only command-confirmation channel.

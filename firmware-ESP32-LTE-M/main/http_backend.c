@@ -6,6 +6,7 @@
 #include "http_backend.h"
 #include "http_cfg.h"
 #include "identity.h"
+#include "power_status_decode.h"
 #include "wups_link.h"
 #include "wups_proto.h"
 
@@ -39,7 +40,11 @@
 #define HTTP_TIMEOUT_MS     20000
 
 #define HTTP_RESP_MAX       2048    /* response (commands) capture cap */
-#define HTTP_BODY_MAX       1024    /* telemetry JSON we POST */
+/* Telemetry JSON we POST. The v2 power object (21 keys) + host + net + up to
+ * ACK_PENDING_MAX acks reach ~960 B worst case (every field at full width),
+ * leaving no real headroom under 1 KB; cJSON_PrintPreallocated also needs a
+ * few bytes of slack beyond the printed length. 1.5 KB, static (s_body). */
+#define HTTP_BODY_MAX       1536
 #define HTTP_URL_MAX        (HTTP_CFG_URL_MAX + 96)
 
 #define ACK_ID_MAX          32      /* command id string cap (incl. NUL) */
@@ -76,6 +81,10 @@ static uint8_t s_cmd_seq;
 static char   s_resp[HTTP_RESP_MAX];
 static size_t s_resp_len;
 static char   s_resp_sig[65];   /* X-W3PUPS-Sig from the response, if any */
+
+/* Telemetry body scratch (http task only — no lock). File-scope so the
+ * 1.5 KB stays off the 10 KB task stack, which also carries the TLS handshake. */
+static char   s_body[HTTP_BODY_MAX];
 
 /* esp_timer second of the last 2xx POST — see http_backend_last_success_s(). */
 static volatile uint32_t s_last_success_s;
@@ -440,19 +449,68 @@ static size_t build_body(char *out, size_t cap)
 
     uint8_t raw[TLM_MAX_INNER];
 
-    /* power.status → wups_power_status_v1_t */
-    if (take_slot(0, raw, sizeof(raw)) >= sizeof(wups_power_status_v1_t)) {
-        wups_power_status_v1_t p;
-        memcpy(&p, raw, sizeof(p));
-        cJSON *o = cJSON_AddObjectToObject(root, "power");
-        cJSON_AddNumberToObject(o, "charge_state", p.charge_state);
-        cJSON_AddNumberToObject(o, "vbus_in_mv",   p.vbus_in_mV);
-        cJSON_AddNumberToObject(o, "vbus_out_mv",  p.vbus_out_mV);
-        cJSON_AddNumberToObject(o, "ibus_out_ma",  p.ibus_out_mA);
-        cJSON_AddNumberToObject(o, "vbat_mv",      p.vbat_mV);
-        cJSON_AddNumberToObject(o, "ibat_ma",      p.ibat_mA);
-        cJSON_AddNumberToObject(o, "temp_dc",      p.temp_dC);
-        cJSON_AddNumberToObject(o, "faults",       p.faults);
+    /* power.status → dispatch on the version byte (issue #7). v2 (40 B) is
+     * NOT a superset of v1 (20 B): decoding v2 bytes as v1 emitted vout_set as
+     * "temp_dc" and pd_out as "faults". power_status_decode.h picks the struct;
+     * the JSON shape follows: v2 → 21 keys incl. "version": 2, v1 → the legacy
+     * 8 keys with no "version" key, unknown version or truncated payload →
+     * object omitted (one warning per boot). Note: a payload longer than
+     * TLM_MAX_INNER never reaches the slot (dropped without a log in
+     * http_backend_observe_telemetry_frame), so that warning covers only
+     * what was cached. */
+    {
+        uint16_t n = take_slot(0, raw, sizeof(raw));
+        wups_power_status_view_t ps;
+        uint8_t ver = n ? wups_power_status_decode(raw, n, &ps) : 0;
+        if (ver == 2) {
+            const wups_power_status_v2_t *p = &ps.v2;
+            cJSON *o = cJSON_AddObjectToObject(root, "power");
+            cJSON_AddNumberToObject(o, "version",       2);
+            cJSON_AddNumberToObject(o, "flags",         p->flags);
+            cJSON_AddNumberToObject(o, "charge_state",  p->charge_state);
+            cJSON_AddNumberToObject(o, "vbus_in_mv",    p->vbus_in_mV);
+            cJSON_AddNumberToObject(o, "pd_in_mv",      p->pd_in_mV);
+            cJSON_AddNumberToObject(o, "pd_in_ma",      p->pd_in_mA);
+            cJSON_AddNumberToObject(o, "vbus_out_mv",   p->vbus_out_mV);
+            cJSON_AddNumberToObject(o, "vout_set_mv",   p->vout_set_mV);
+            cJSON_AddNumberToObject(o, "vout_read_mv",  p->vout_read_mV);
+            /* iout_limit_ma is the TPS55289 current LIMIT — there is no
+             * load-current measurement in v2, hence no "ibus_out_ma". */
+            cJSON_AddNumberToObject(o, "iout_limit_ma", p->iout_limit_mA);
+            cJSON_AddNumberToObject(o, "pd_out_mv",     p->pd_out_mV);
+            cJSON_AddNumberToObject(o, "pd_out_ma",     p->pd_out_mA);
+            cJSON_AddNumberToObject(o, "vbat_mv",       p->vbat_mV);
+            cJSON_AddNumberToObject(o, "ibat_ma",       p->ichg_mA);
+            cJSON_AddNumberToObject(o, "vsys_mv",       p->vsys_mV);
+            cJSON_AddNumberToObject(o, "iin_ma",        p->iin_mA);
+            cJSON_AddNumberToObject(o, "temp_lm_dc",    p->temp_lm_dC);
+            if (ps.temp_mp_valid)
+                cJSON_AddNumberToObject(o, "temp_mp_dc", p->temp_mp_dC);
+            else
+                cJSON_AddNullToObject(o, "temp_mp_dc");   /* MP2762A unpowered */
+            cJSON_AddNumberToObject(o, "temp_dc",       ps.temp_agg_dC);
+            cJSON_AddNumberToObject(o, "faults",        p->faults);
+            cJSON_AddNumberToObject(o, "uptime_s",      p->uptime_s);
+        } else if (ver == 1) {
+            const wups_power_status_v1_t *p = &ps.v1;
+            cJSON *o = cJSON_AddObjectToObject(root, "power");
+            cJSON_AddNumberToObject(o, "charge_state", p->charge_state);
+            cJSON_AddNumberToObject(o, "vbus_in_mv",   p->vbus_in_mV);
+            cJSON_AddNumberToObject(o, "vbus_out_mv",  p->vbus_out_mV);
+            cJSON_AddNumberToObject(o, "ibus_out_ma",  p->ibus_out_mA);
+            cJSON_AddNumberToObject(o, "vbat_mv",      p->vbat_mV);
+            cJSON_AddNumberToObject(o, "ibat_ma",      p->ibat_mA);
+            cJSON_AddNumberToObject(o, "temp_dc",      p->temp_dC);
+            cJSON_AddNumberToObject(o, "faults",       p->faults);
+        } else if (n) {
+            static bool warned;
+            if (!warned) {
+                warned = true;
+                ESP_LOGW(TAG, "power.status: undecodable payload (version %u, len %u; "
+                         "need v1 >= 20 B or v2 >= 40 B), skipped",
+                         (unsigned)raw[0], (unsigned)n);
+            }
+        }
     }
 
     /* host.status → wups_host_status_v1_t */
@@ -596,9 +654,8 @@ static int post_once(void)
     const uint8_t *key = (const uint8_t *)secret;
     const size_t key_len = strlen(secret);
 
-    char body[HTTP_BODY_MAX];
     int acks_in_body = s_pending_n;
-    size_t body_len = build_body(body, sizeof(body));
+    size_t body_len = build_body(s_body, sizeof(s_body));
     if (body_len == 0) return -1;
 
     char ts_str[16];
@@ -607,7 +664,7 @@ static int post_once(void)
     snprintf(nonce_hex, sizeof(nonce_hex), "%08lx%08lx",
              (unsigned long)esp_random(), (unsigned long)esp_random());
     char sig_hex[65];
-    if (sign_request(key, key_len, ts_str, nonce_hex, body, body_len, sig_hex) != ESP_OK) {
+    if (sign_request(key, key_len, ts_str, nonce_hex, s_body, body_len, sig_hex) != ESP_OK) {
         ESP_LOGE(TAG, "HMAC signing failed");
         return -1;
     }
@@ -643,7 +700,7 @@ static int post_once(void)
     esp_http_client_set_header(client, "X-W3PUPS-Ts", ts_str);
     esp_http_client_set_header(client, "X-W3PUPS-Nonce", nonce_hex);
     esp_http_client_set_header(client, "X-W3PUPS-Sig", sig_hex);
-    esp_http_client_set_post_field(client, body, (int)body_len);
+    esp_http_client_set_post_field(client, s_body, (int)body_len);
 
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);

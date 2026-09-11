@@ -37,6 +37,7 @@ import hashlib
 import hmac
 import json
 import re
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +63,7 @@ class State:
         self.lock = threading.Lock()
         self.commands = []          # queued, not yet acked: [{id, cmd, args}]
         self.seen_nonces = []       # recent nonces (replay window)
+        self.prev_net = {}          # device_id -> (bytes_tx, bytes_rx) of the last net.status sample
         self._next_id = 1
 
     def enqueue(self, cmd: str, args: dict):
@@ -93,6 +95,21 @@ class State:
                 self.seen_nonces.pop(0)
             return True
 
+    def net_delta(self, device_id: str, tx: int, rx: int):
+        """Remember this device's cumulative (tx, rx) modem counters and return
+        the delta since the previously remembered sample. None when there is no
+        previous sample, when the sample is unchanged (the device re-sent a
+        cached net.status snapshot), or when a counter went backwards (device
+        rebooted, counters reset)."""
+        with self.lock:
+            prev = self.prev_net.get(device_id)
+            self.prev_net[device_id] = (tx, rx)
+        if prev is None or prev == (tx, rx):
+            return None
+        if tx < prev[0] or rx < prev[1]:
+            return None
+        return tx - prev[0], rx - prev[1]
+
 
 STATE: State = None  # set in main()
 
@@ -111,7 +128,31 @@ def print_telemetry(device_id: str, tlm: dict):
     print(f"\n[{when}] telemetry from {device_id} "
           f"(fw={tlm.get('fw_ver','?')}, uptime={tlm.get('uptime_s','?')}s)")
     p = tlm.get("power")
-    if p:
+    if p and p.get("version") == 2:
+        # power.status v2 (since esp32:0.8.9): 21 keys, dispatched on "version".
+        # temp_mp_dc is JSON null while the MP2762A charger is unpowered.
+        temp_mp = p.get("temp_mp_dc")
+        temp_mp_s = "n/a" if temp_mp is None else f"{temp_mp}dC"
+        flags = p.get("flags")
+        flags_s = f"0x{flags:02x}" if isinstance(flags, int) else str(flags)
+        faults = p.get("faults")
+        faults_s = f"0x{faults:04x}" if isinstance(faults, int) else str(faults)
+        print(f"    power : v{p.get('version')} cs={p.get('charge_state')} flags={flags_s} "
+              f"vin={p.get('vbus_in_mv')}mV pd_in={p.get('pd_in_mv')}mV/{p.get('pd_in_ma')}mA")
+        print(f"            vout={p.get('vbus_out_mv')}mV set={p.get('vout_set_mv')}mV "
+              f"read={p.get('vout_read_mv')}mV iout_limit={p.get('iout_limit_ma')}mA "
+              f"pd_out={p.get('pd_out_mv')}mV/{p.get('pd_out_ma')}mA")
+        print(f"            vbat={p.get('vbat_mv')}mV ibat={p.get('ibat_ma')}mA "
+              f"vsys={p.get('vsys_mv')}mV iin={p.get('iin_ma')}mA")
+        print(f"            temp_lm={p.get('temp_lm_dc')}dC temp_mp={temp_mp_s} "
+              f"temp={p.get('temp_dc')}dC faults={faults_s} uptime={p.get('uptime_s')}s")
+    elif p and p.get("version") is not None:
+        # A power.status version this reference server does not know yet —
+        # dump it raw rather than printing the legacy keys as None.
+        print(f"    power : v{p.get('version')} (unknown shape) {p}")
+    elif p:
+        # Legacy v1 shape (no "version" key): units whose CH32X still emits
+        # power.status v1, or firmware older than esp32:0.8.9.
         print(f"    power : vin={p.get('vbus_in_mv')}mV vout={p.get('vbus_out_mv')}mV "
               f"iout={p.get('ibus_out_ma')}mA vbat={p.get('vbat_mv')}mV "
               f"ibat={p.get('ibat_ma')}mA temp={p.get('temp_dc')}dC "
@@ -125,6 +166,18 @@ def print_telemetry(device_id: str, tlm: dict):
     if n:
         print(f"    net   : state={n.get('state')} rssi={n.get('rssi_dbm')}dBm "
               f"tx={n.get('bytes_tx')} rx={n.get('bytes_rx')}")
+        # On-wire cost readout: delta of the modem's cumulative counters
+        # between two DISTINCT net.status samples. The device refreshes
+        # net.status every ~60 s but POSTs every ~30 s, re-sending the cached
+        # snapshot in between — an unchanged sample is skipped rather than
+        # printed as a misleading "0 B". Also skipped when there is no previous
+        # sample or a counter went backwards (device rebooted, counters reset).
+        tx, rx = n.get("bytes_tx"), n.get("bytes_rx")
+        if isinstance(tx, int) and isinstance(rx, int):
+            delta = STATE.net_delta(device_id, tx, rx)
+            if delta is not None:
+                print(f"            Δtx={delta[0]} Δrx={delta[1]} B "
+                      f"since previous net.status sample")
     acks = tlm.get("acks") or []
     if acks:
         print(f"    acks  : {acks}")
@@ -263,6 +316,11 @@ def repl():
 
 def main():
     global STATE
+    # Telemetry lines contain a non-ASCII glyph (Δ). A console that cannot
+    # encode it must not abort do_POST mid-request (the device would get no
+    # 2xx and never receive its commands) — degrade the glyph instead.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description="Web3 Pi UPS HTTP control-mode reference server")
     ap.add_argument("--secret", required=True,
                     help="device HTTP key (the code shown on the OLED; "

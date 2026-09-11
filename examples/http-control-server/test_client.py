@@ -36,9 +36,16 @@ def main():
         "ts": int(time.time()),
         "fw_ver": "esp32:test",
         "uptime_s": 42,
-        "power": {"charge_state": 1, "vbus_in_mv": 5012, "vbus_out_mv": 5050,
-                  "ibus_out_ma": 1840, "vbat_mv": 7920, "ibat_ma": -200,
-                  "temp_dc": 253, "faults": 0},
+        # power.status v2 shape as emitted since esp32:0.8.9 (21 keys). A unit
+        # whose CH32X still speaks v1 sends the legacy 8-key object (no
+        # "version") instead. temp_mp_dc is null while the charger is unpowered.
+        "power": {"version": 2, "flags": 0x1F, "charge_state": 3,
+                  "vbus_in_mv": 14709, "pd_in_mv": 15000, "pd_in_ma": 1750,
+                  "vbus_out_mv": 5051, "vout_set_mv": 5000, "vout_read_mv": 5046,
+                  "iout_limit_ma": 5010, "pd_out_mv": 5000, "pd_out_ma": 3000,
+                  "vbat_mv": 7897, "ibat_ma": 0, "vsys_mv": 7900, "iin_ma": 1200,
+                  "temp_lm_dc": 350, "temp_mp_dc": 440, "temp_dc": 440,
+                  "faults": 0, "uptime_s": 86272},
         "acks": args.acks,
     }).encode()
 
