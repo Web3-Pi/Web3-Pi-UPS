@@ -26,6 +26,7 @@
 #include "cmdauth_arkiv.h"
 #include "esp_system.h"
 #include "http_cfg.h"
+#include "modem.h"
 #include "wups_link.h"
 
 #define TAG "oled_menu"
@@ -55,7 +56,7 @@ typedef enum {
     SCR_REGEN_ARKIV,      /* confirm screen — re-roll device Arkiv wallet */
     SCR_ARKIV_WALLET,     /* Arkiv wallet submenu: Address/Balance/Regen/Back*/
     SCR_ARKIV_ADDR,       /* show the device's Arkiv fund address (read-only)*/
-    SCR_ARKIV_BALANCE,    /* show the device wallet GLM balance (read-only)  */
+    SCR_ARKIV_BALANCE,    /* show the device wallet W3P balance (read-only)  */
     SCR_HTTP_KEY,         /* show HTTP-mode secret + Back/New                */
     SCR_HTTP_REGEN,       /* confirm screen — re-roll HTTP-mode secret       */
 } menu_screen_t;
@@ -68,11 +69,47 @@ static struct {
     uint32_t      last_button_ms;
 } S;
 
-/* Result text for SCR_ARKIV_BALANCE. The balance query is network/blocking,
- * so it runs once in activate_current() and stashes the formatted line here;
- * render_screen() then just shows it (the screen has no cursor navigation —
- * any press returns). Two short lines fit the 64x32 OLED, ≤ 10 chars each. */
-static char s_balance_text[40];
+/* --- Balance screen (issue #8) ------------------------------------------ */
+/* BAL_FORMAT_BEGIN — pure, host-tested by tools/test_arkiv_balance.py */
+#define BAL_WORST_WRITE_WEI 300000000ULL  /* 300K gas x 1 Kwei gas-price FLOOR (arkiv_writer.cpp) */
+#define BAL_LOW_WEI         10000000000000ULL  /* 1e13 — panel LOW_BALANCE_WEI */
+#define BAL_TXT_NO_KEY      "No Arkiv\nwallet yet"
+#define BAL_TXT_MODE_OFF    "BALANCE\nArkiv off"
+/* Rows ≤ 10 chars (64 px / 6 px font), ≤ 4 rows; wei → W3P (1e18) with 6
+ * decimals in integer math (uint64 caps at 18.446744). Unit = W3P, the chain's
+ * gas token (older firmware printed "GLM"). After a failed read
+ * the last known value stays up, marked "stale" unless a gas hint needs row 4. */
+static void bal_format(char *out, size_t cap, const arkiv_tlm_balance_t *b)
+{
+    const bool  fail  = b->state == ARKIV_TLM_BAL_FAIL;
+    const char *stale = fail ? "\nstale" : "";
+    if (b->last_good == ARKIV_TLM_BAL_HIGH) {
+        snprintf(out, cap, "BALANCE\n>18.446744\nW3P%s", stale);
+        return;
+    }
+    if (b->last_good != ARKIV_TLM_BAL_OK) {   /* nothing known yet */
+        snprintf(out, cap, "BALANCE\n%s", fail ? "offline" : "checking..");
+        return;
+    }
+    const char *hint = b->wei < BAL_WORST_WRITE_WEI ? "\nno gas"
+                     : b->wei < BAL_LOW_WEI         ? "\nlow gas" : stale;
+    snprintf(out, cap, "BALANCE\n%" PRIu64 ".%06" PRIu64 "\nW3P%s",
+             b->wei / 1000000000000000000ULL,
+             (b->wei % 1000000000000000000ULL) / 1000000000000ULL, hint);
+}
+/* BAL_FORMAT_END */
+
+/* Button task (4 KB): no RPC, no blocking — the arkiv_tlm task keeps the cache fresh. */
+static void balance_text(char *out, size_t cap)
+{
+    const bool arkiv = backend_mode_get() == WUPS_BACKEND_MODE_ARKIV;
+    if (!cmdauth_arkiv_ready()) { snprintf(out, cap, BAL_TXT_NO_KEY);   return; }
+    if (!arkiv)                 { snprintf(out, cap, BAL_TXT_MODE_OFF); return; }
+    arkiv_tlm_balance_t b;
+    arkiv_tlm_balance(&b);
+    if (!modem_ppp_is_up()) b.state = ARKIV_TLM_BAL_FAIL;   /* no link: offline / stale */
+    bal_format(out, cap, &b);
+}
 
 /* Items per screen. The 64x32 OLED fits 4 rows at default font size. */
 static uint8_t screen_item_count(menu_screen_t s)
@@ -196,7 +233,7 @@ static void render_screen(char *out, size_t cap)
             break;
         case SCR_ARKIV_WALLET:
             /* Submenu: view the fund address (read-only), check the on-chain
-             * GLM balance, or re-roll the key. 4 items = exactly 4 OLED rows. */
+             * W3P balance, or re-roll the key. 4 items = exactly 4 OLED rows. */
             snprintf(out, cap,
                      "%cAddress\n"
                      "%cBalance\n"
@@ -209,7 +246,7 @@ static void render_screen(char *out, size_t cap)
             break;
         case SCR_ARKIV_ADDR: {
             /* The device's own Arkiv (Braga) wallet — the owner funds THIS with
-             * GLM so it can pay gas to publish telemetry. Shown on the OLED for
+             * W3P so it can pay gas to publish telemetry. Shown on the OLED for
              * the cold-start bootstrap (owner has the device physically; no
              * backend / on-chain write needed first, §4.6). 20-byte EOA = 40 hex;
              * at ~10 chars/line that's exactly 4 rows, so there is no room for a
@@ -234,10 +271,7 @@ static void render_screen(char *out, size_t cap)
             break;
         }
         case SCR_ARKIV_BALANCE:
-            /* Read-only result of the eth_getBalance query run in activate
-             * (or the re-entry from the address page). s_balance_text already
-             * holds the two formatted lines ("BALANCE\n<n> GLM" / an error). */
-            snprintf(out, cap, "%s", s_balance_text);
+            balance_text(out, cap);   /* read-only; any press returns */
             break;
     }
 }
@@ -286,37 +320,6 @@ static void push_transition_screen(const char *text)
                            S.nonce,
                            text);
     vTaskDelay(pdMS_TO_TICKS(200));
-}
-
-/* Format the device wallet's cached balance into s_balance_text for
- * SCR_ARKIV_BALANCE. Non-blocking, no RPC — reads the value the arkiv_tlm task
- * refreshes (see arkiv_tlm_cached_balance_wei). Wei → GLM (18 decimals), 6
- * fractional digits. Laid out on three lines — "BALANCE" / "<n>.<6>" / "GLM" —
- * because "<n>.<6> GLM" (12 chars) overflows the 64x32 OLED's ~10-char line. */
-static void fetch_balance_text(void)
-{
-    if (!cmdauth_arkiv_ready()) {
-        snprintf(s_balance_text, sizeof s_balance_text, "No Arkiv\nwallet yet");
-        return;
-    }
-    /* Read the cached balance refreshed by the arkiv_tlm task (6 KB stack,
-     * RPC-safe). We must NOT do eth_getBalance here: this runs on the 4 KB
-     * wups_rx button task and a blocking HTTP+TLS RPC overflows its stack
-     * (the device rebooted). The cache populates after the first telemetry
-     * submit (~30 s) and refreshes every few minutes. */
-    uint64_t wei = 0;
-    if (!arkiv_tlm_cached_balance_wei(&wei)) {
-        snprintf(s_balance_text, sizeof s_balance_text, "BALANCE\nwait tlm");
-        return;
-    }
-    /* 1 GLM = 1e18 wei. Split into integer + 6-decimal fraction without
-     * floating point: micro-GLM = wei / 1e12 keeps 6 decimals exactly. */
-    const uint64_t WEI_PER_GLM   = 1000000000000000000ULL; /* 1e18 */
-    const uint64_t WEI_PER_MICRO = 1000000000000ULL;       /* 1e12 */
-    uint64_t whole = wei / WEI_PER_GLM;
-    uint64_t micro = (wei % WEI_PER_GLM) / WEI_PER_MICRO;   /* 0..999999 */
-    snprintf(s_balance_text, sizeof s_balance_text,
-             "BALANCE\n%" PRIu64 ".%06" PRIu64 "\nGLM", whole, micro);
 }
 
 /* Perform the action bound to the highlighted item. Returns true if
@@ -452,12 +455,8 @@ static bool activate_current(void)
                     S.cursor = 0;
                     push_screen();
                     break;
-                case 1:  /* Balance → query on-chain GLM, then show result.
-                          * The query is blocking (~RPC round-trip) so flash a
-                          * "checking…" screen first, exactly like the mode
-                          * switch does for its reboot wait. */
-                    push_transition_screen("BALANCE\nchecking\nplease\nwait...");
-                    fetch_balance_text();
+                case 1:  /* Balance → flag a fresh read (no RPC on this 4 KB task) */
+                    arkiv_tlm_request_balance_refresh();
                     S.screen = SCR_ARKIV_BALANCE;
                     S.cursor = 0;
                     push_screen();

@@ -52,11 +52,36 @@ void arkiv_tlm_observe_frame(const uint8_t *frame, uint16_t frame_len);
  * Safe to call unconditionally at boot. */
 void arkiv_tlm_start(void);
 
-/* Latest device-wallet balance (wei) cached by the emit task. Returns false
- * until the first successful refresh. Non-blocking, no RPC — the OLED "Balance"
- * screen reads this instead of doing a heavy eth_getBalance on the small
- * wups_rx button-event task (which overflowed its stack). */
-bool arkiv_tlm_cached_balance_wei(uint64_t *out_wei);
+/* Device-wallet balance (issue #8) — read by the OLED "Balance" screen.
+ * Refreshed on the emit task only, INDEPENDENT of telemetry: gated on the
+ * device key + PPP, then on demand / every 30 s until the first read lands /
+ * every ~4 min after (a failed read retries next tick). An UNCLAIMED or
+ * unfunded unit (every submit fails) therefore still learns its balance.
+ * Never an RPC on the caller's task — a blocking eth_getBalance on the 4 KB
+ * wups_rx button task overflowed it. */
+typedef enum {
+    ARKIV_TLM_BAL_NONE = 0, /* no read completed yet this boot                */
+    ARKIV_TLM_BAL_OK,       /* wei is current                                 */
+    ARKIV_TLM_BAL_HIGH,     /* balance >= 2^64 wei (> 18.446744 W3P), wei unset */
+    ARKIV_TLM_BAL_FAIL,     /* last read failed; last_good says what is known */
+} arkiv_tlm_bal_state_t;
+
+typedef struct {
+    arkiv_tlm_bal_state_t state;      /* outcome of the last attempt                  */
+    arkiv_tlm_bal_state_t last_good;  /* NONE, OK (wei valid) or HIGH; survives FAIL  */
+    uint64_t wei;
+    uint32_t age_s;                   /* seconds since the last successful read (0 = none) */
+} arkiv_tlm_balance_t;
+
+/* Non-blocking snapshot of the cached balance; returns true when a value is
+ * known (out->last_good != NONE). Safe from any task; NONE before
+ * arkiv_tlm_start() (non-Arkiv modes). */
+bool arkiv_tlm_balance(arkiv_tlm_balance_t *out);
+
+/* Ask the emit task for a fresh read (served within ~1 s while the device key
+ * is present and PPP is up; otherwise stays pending). Flag only — safe from
+ * any task, never blocks, never does RPC. */
+void arkiv_tlm_request_balance_refresh(void);
 
 #ifdef __cplusplus
 }

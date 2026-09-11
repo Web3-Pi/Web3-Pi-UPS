@@ -3,6 +3,7 @@
 #include "arkiv_rpc.h"
 #include "cmdauth_arkiv.h"
 #include "identity.h"
+#include "modem.h"
 #include "wups_proto.h"
 #include "arkiv_crypto/aead.h"
 
@@ -39,18 +40,83 @@ typedef struct {
 static slot_t s_slots[3];
 static SemaphoreHandle_t s_lock;
 
-/* Device-wallet balance cache (wei), refreshed from the arkiv_tlm task (6 KB
- * stack, RPC-safe) every ARKIV_TLM_BALANCE_PERIOD successful telemetry submits.
- * The OLED "Balance" screen reads this WITHOUT any RPC: a blocking eth_getBalance
- * on the 4 KB wups_rx button-event task overflowed its stack and rebooted the
- * device. */
-#define ARKIV_TLM_BALANCE_PERIOD 8u   /* ≈ every 8 × 30 s = 4 min */
-static uint64_t s_bal_wei;
-static bool     s_bal_valid;
+/* Device-wallet balance for the OLED "Balance" screen (issue #8). Refreshed
+ * from THIS task only (6 KB stack, RPC-safe) — a blocking eth_getBalance on
+ * the 4 KB wups_rx button task overflowed its stack and rebooted the device.
+ * Independent of telemetry: the old refresh lived in the submit-OK branch, so
+ * an UNCLAIMED or unfunded unit (every submit fails, 4 RPCs per attempt) never
+ * read its balance — exactly when the owner needs the screen. Due rules
+ * (bal_due): device key present AND PPP up, then (a) the on-demand flag from
+ * the OLED (one read per ARKIV_TLM_BAL_DEBOUNCE_S — deferred, never dropped),
+ * (b) every 30 s tick until the first successful read, (c) every
+ * ARKIV_TLM_BALANCE_PERIOD ticks counted from the last SUCCESS, so a failed
+ * periodic read is retried on the next tick instead of leaving a stale value
+ * up for a whole period. A dead gateway therefore costs one RPC per 30 s —
+ * the same as phase (b), and a quarter of what a claimed unit's telemetry
+ * already spends on such an outage.
+ *
+ * Uplink-watchdog interplay: rpc_post stamps s_last_rpc_ok_s on every 2xx
+ * round-trip, so phase (b) alone keeps the Arkiv uplink "fresh" while
+ * telemetry itself fails; the steady (c) cadence (240 s) cannot on its own
+ * (ARKIV_UPLINK_FRESH_SECS = 120 s, modem.c). Acceptable — a completed HTTPS
+ * round-trip IS a healthy link, and the watchdog never trips while UNCLAIMED. */
+#define ARKIV_TLM_BALANCE_PERIOD 8u   /* 8 × 30 s = 4 min after the last success */
+#define ARKIV_TLM_BAL_DEBOUNCE_S 3u   /* on-demand reads: at most one per 3 s */
+static struct {                        /* guarded by s_lock (shared with the slots) */
+    arkiv_tlm_bal_state_t state;       /* outcome of the last attempt */
+    arkiv_tlm_bal_state_t last_good;   /* NONE / OK (wei valid) / HIGH — survives FAIL */
+    uint64_t wei;
+    uint32_t updated_s;                /* esp_timer seconds of the last good read */
+} s_bal;
+static volatile bool s_bal_req;        /* on-demand refresh; set from any task */
+static uint32_t s_tick, s_bal_tick;    /* tlm task only: loop ticks / tick of last success */
+static uint32_t s_bal_try_s;           /* tlm task only: seconds of the last attempt */
+static bool     s_bal_seen;            /* tlm task only: a good read has landed */
 
-static void ensure_lock(void)
+static uint32_t now_s(void) { return (uint32_t)(esp_timer_get_time() / 1000000); }
+
+/* `tick` = true at the 30 s iteration boundary (rules b + c), false from the
+ * 1 s wait slices (rule a only). A pending request survives a closed gate. */
+static bool bal_due(bool tick)
 {
-    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    if (!cmdauth_arkiv_ready() || !modem_ppp_is_up()) return false;
+    if (s_bal_req && now_s() - s_bal_try_s >= ARKIV_TLM_BAL_DEBOUNCE_S) return true;
+    if (!tick) return false;
+    if (!s_bal_seen) return true;
+    return (s_tick - s_bal_tick) >= ARKIV_TLM_BALANCE_PERIOD;
+}
+
+/* tlm task ONLY (HTTPS + TLS scratch on this stack); s_lock is never held
+ * across the RPC. */
+static void bal_refresh(void)
+{
+    s_bal_req   = false;   /* cleared BEFORE the RPC: a request landing mid-read re-arms */
+    s_bal_try_s = now_s();
+    uint64_t wei = 0;
+    esp_err_t rc = arkiv_eth_get_balance(cmdauth_arkiv_device_addr(), &wei);
+    const bool good = (rc == ESP_OK || rc == ESP_ERR_INVALID_SIZE);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (rc == ESP_OK) {
+        s_bal.state = s_bal.last_good = ARKIV_TLM_BAL_OK;
+        s_bal.wei   = wei;
+    } else if (rc == ESP_ERR_INVALID_SIZE) {
+        s_bal.state = s_bal.last_good = ARKIV_TLM_BAL_HIGH;   /* >= 2^64 wei: value unknown */
+    } else {
+        s_bal.state = ARKIV_TLM_BAL_FAIL;   /* last_good + wei stay: the OLED shows them as stale */
+    }
+    if (good) s_bal.updated_s = now_s();
+    xSemaphoreGive(s_lock);
+    if (good) {
+        s_bal_seen = true;
+        s_bal_tick = s_tick;   /* rule (c) counts from here */
+    }
+    if (rc == ESP_OK) {
+        ESP_LOGI(TAG, "wallet balance %llu wei", (unsigned long long)wei);
+    } else if (rc == ESP_ERR_INVALID_SIZE) {
+        ESP_LOGI(TAG, "wallet balance >= 2^64 wei (HIGH)");
+    } else {
+        ESP_LOGW(TAG, "wallet balance read failed: %s", esp_err_to_name(rc));
+    }
 }
 
 static slot_t *slot_for(uint8_t cls, uint8_t op)
@@ -74,9 +140,8 @@ void arkiv_tlm_observe_frame(const uint8_t *frame, uint16_t frame_len)
     if (inner_len == 0 || inner_len > ARKIV_TLM_MAX_INNER) return;
 
     slot_t *s = slot_for(cls, op);
-    if (!s) return;
+    if (!s || !s_lock) return;   /* no lock = not started: nothing consumes the slots */
 
-    ensure_lock();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     memcpy(s->data, frame + WUPS_HEADER_BYTES, inner_len);
     s->cls         = cls;
@@ -100,7 +165,6 @@ static size_t build_payload(uint8_t *out, size_t out_cap)
     int64_t cutoff = now - (int64_t)ARKIV_TLM_FRESHNESS_MS * 1000;
     bool any = false;
 
-    ensure_lock();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     for (size_t i = 0; i < sizeof(s_slots) / sizeof(s_slots[0]); ++i) {
         slot_t *s = &s_slots[i];
@@ -125,7 +189,16 @@ static void tlm_task(void *arg)
      * full power.status cycle from CH32X (CH32X emits every 1 s). */
     vTaskDelay(pdMS_TO_TICKS(10 * 1000));
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(ARKIV_TLM_PERIOD_MS));
+        /* 30 s telemetry cadence, waited in 1 s slices so an OLED balance
+         * request (rule a) is served within ~1 s. Cadence itself unchanged. */
+        for (int i = 0; i < ARKIV_TLM_PERIOD_MS / 1000; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (bal_due(false)) bal_refresh();
+        }
+        s_tick++;
+        /* Balance BEFORE the telemetry gates below: UNCLAIMED / unfunded units
+         * never pass them, yet that is when the owner checks the screen. */
+        if (bal_due(true)) bal_refresh();
 
         if (!arkiv_writer_ready()) continue;
         if (cmdauth_arkiv_claim_state() != ARKIV_CLAIMED) continue;
@@ -209,18 +282,6 @@ static void tlm_task(void *arg)
             ESP_LOGI(TAG, "w3pups-telemetry submitted enc (seq=%llu epoch=%u, %u B%s)",
                      (unsigned long long)seq, (unsigned)epoch, (unsigned)sealed_len,
                      announce ? ", +dev_pub" : "");
-            /* Refresh the cached device-wallet balance for the OLED "Balance"
-             * screen — done HERE (6 KB stack, RPC-safe), never on the 4 KB
-             * wups_rx button task. First refresh on the first submit, then
-             * every ARKIV_TLM_BALANCE_PERIOD submits. */
-            if ((s_tlm_ok % ARKIV_TLM_BALANCE_PERIOD) == 1u) {
-                const uint8_t *da = cmdauth_arkiv_device_addr();
-                uint64_t bal = 0;
-                if (da && arkiv_eth_get_balance(da, &bal) == ESP_OK) {
-                    s_bal_wei   = bal;
-                    s_bal_valid = true;
-                }
-            }
         }
     }
 }
@@ -230,15 +291,28 @@ void arkiv_tlm_start(void)
     static bool started;
     if (started) return;
     started = true;
+    /* Created once HERE (app_main, before the emit task exists); every other
+     * entry point returns early while s_lock is NULL, so no lazy-init race. */
+    s_lock = xSemaphoreCreateMutex();
+    if (!s_lock) { ESP_LOGE(TAG, "mutex alloc failed — telemetry disabled"); return; }
     /* 6 KB stack: TLS + tx signing scratch space. */
     xTaskCreate(tlm_task, "arkiv_tlm", 6144, NULL, 4, NULL);
     ESP_LOGI(TAG, "Arkiv telemetry task started (period=%dms)",
              ARKIV_TLM_PERIOD_MS);
 }
 
-bool arkiv_tlm_cached_balance_wei(uint64_t *out_wei)
+bool arkiv_tlm_balance(arkiv_tlm_balance_t *out)
 {
-    if (!s_bal_valid) return false;
-    if (out_wei) *out_wei = s_bal_wei;
-    return true;
+    if (!out) return false;
+    *out = (arkiv_tlm_balance_t){ 0 };
+    if (!s_lock) return false;   /* not started (not Arkiv mode): NONE */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    out->state     = s_bal.state;
+    out->last_good = s_bal.last_good;
+    out->wei       = s_bal.wei;
+    out->age_s     = s_bal.updated_s ? now_s() - s_bal.updated_s : 0;
+    xSemaphoreGive(s_lock);
+    return out->last_good != ARKIV_TLM_BAL_NONE;
 }
+
+void arkiv_tlm_request_balance_refresh(void) { s_bal_req = true; }
