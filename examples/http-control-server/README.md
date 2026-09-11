@@ -11,12 +11,13 @@ and implemented on the device in
 
 The UPS (ESP32-S3) is a pure HTTP **client**. On a fixed cadence (~30 s) it
 makes one signed `POST` carrying telemetry; your server's **response** to that
-POST carries any queued commands; the device executes them and **acks** them on
-the next POST. Nothing connects *to* the device, so it works behind the 1nce
-LTE-M carrier NAT exactly like the MQTT and Arkiv backends.
+POST carries any queued commands; the device dispatches them onto its in-board
+bus and **acks** them on the next POST (an ack = dispatched, not executed — see
+"What an ack means" below). Nothing connects *to* the device, so it works
+behind the 1nce LTE-M carrier NAT exactly like the MQTT and Arkiv backends.
 
 ```
-[ UPS / ESP32-S3 ] --outbound HTTPS--> [ your server ]
+[ UPS / ESP32-S3 ] --outbound HTTP(S)--> [ your server ]
    telemetry up in the POST body
    commands down in the POST response
    acks up on the next POST
@@ -30,7 +31,8 @@ X-W3PUPS-Nonce:  {random_hex}
 X-W3PUPS-Sig:    hex(HMAC_SHA256(secret, Ts || Nonce || raw_body))
 Content-Type:    application/json
 
-{ "ts":…, "fw_ver":…, "uptime_s":…, "power":{…}, "host":{…}, "net":{…}, "acks":[…] }
+{ "ts":…, "fw_ver":…, "uptime_s":…, "power":{…}, "host":{…}, "net":{…}, "acks":[…],
+  "rejected":[{"id":…,"reason":…}], "resp_dropped":{"bytes":…,"max":2047} }   // last two optional, esp32:0.8.10+
 ```
 
 Response:
@@ -60,7 +62,7 @@ want privacy (see below).
 
 | File | What it is |
 |---|---|
-| [`server.py`](server.py) | The reference server. Verifies signatures, prints telemetry, lets you enqueue commands from the terminal, returns + clears them via acks. |
+| [`server.py`](server.py) | The reference server. Verifies signatures, prints telemetry (incl. the per-cycle `Δtx`/`Δrx` byte readout), lets you enqueue commands from the terminal, returns them within the device's limits (`--max-commands`, ≤ 2047 B), clears them via acks, drops the ones the device reports as `rejected`, and expires any command not acked within `--cmd-max-age` seconds of being queued, delivered or not. |
 | [`send_config.py`](send_config.py) | Run on the **RPi host**: points a fielded device at your server by sending a `net.config` frame over the serial link (no ESP32 re-flash). Needs pyserial (`sudo apt install -y python3-serial`). |
 | [`test_client.py`](test_client.py) | Simulates a device POST (correct signature) so you can smoke-test the server — or a public TLS deployment — without hardware. |
 
@@ -73,6 +75,8 @@ SECRET="ABCD EFGH JKLM NPQR"
 
 # 2. start the server
 python3 server.py --secret "$SECRET" --device-id TESTDEV --port 8080
+#    (optional: --max-commands 8 --cmd-max-age 600 are the defaults — see
+#     "Device limits" below; --cmd-max-age 0 keeps commands forever)
 
 # 3. in another terminal, pretend to be the device
 python3 test_client.py --secret "$SECRET" --device-id TESTDEV --url http://127.0.0.1:8080
@@ -92,13 +96,44 @@ These map 1:1 onto the WUPS command frames the firmware already understands
 | Prompt | `cmd` / `args` | Effect |
 |---|---|---|
 | `beep [freq_hz] [dur_ms]` | `ui.beep` | Buzzer on the RP2040 — the easiest end-to-end proof a command landed. |
-| `msg <text>` | `ui.display_msg {text}` | Show text on the OLED. |
-| `shutdown [delay_s]` | `host.shutdown {delay_s}` | Shut down the Raspberry Pi (via the RPi agent). |
-| `reset [delay_s]` | `host.reset {delay_s}` | Reboot the Raspberry Pi. |
-| `powercycle [off_ms]` | `power.cycle {off_ms}` | Power-cycle the output (via CH32X). |
+| `msg <text>` | `ui.display_msg {text}` | Show text on the OLED as a plain **info notice**: 40 visible chars (4 rows × 10 cols, `\n` breaks a row, no word wrap), one short chirp, 60 s, any button closes it. Needs `rp2040:1.2.2`+ — older RP2040 firmware showed it as the MODEM alarm banner. The ESP32 accepts up to 64 B of text; the rest is cut. |
+| `shutdown [delay_s]` | `host.shutdown {delay_s}` | Shut down the Raspberry Pi (via the RPi agent). `delay_s` is currently **ignored** by the host service (immediate). |
+| `reset [delay_s]` | `host.reset {delay_s}` | Reboot the Raspberry Pi. `delay_s` is currently **ignored** (immediate). |
+| `powercycle [off_ms]` | `power.cycle {off_ms}` | Power-cycle the output (via CH32X). `off_ms` is accepted but the CH32X firmware currently always uses **1500 ms**. |
 
-Commands are **idempotent by `id`**: if the device already applied an id (but
-the server hadn't yet seen the ack), it re-acks without re-executing.
+**What an ack means.** The device acks a command once it has dispatched the
+corresponding WUPS frame onto its in-board bus (ESP32 → RP2040 → RPi host /
+CH32X). It does **not** confirm execution — verify that out of band: hear the
+beep, see the OLED, watch the `host` object disappear from the telemetry /
+`host.uptime_s` reset after a shutdown or reboot (the spec, §5 "Verifying that
+a command took effect", lists the per-command hints). Commands are
+**idempotent by `id`**: if the device already applied an id (but the server
+hadn't yet seen the ack), it re-acks without re-executing.
+
+**Device limits** (`esp32:0.8.10`+, mirrored by `server.py`). The device
+applies at most **8 commands per response**, drops a response body larger than
+**2047 B** whole (and reports it back as `resp_dropped`), rejects command ids
+longer than **47 chars**, and reports refused commands in a `rejected` list
+(`unsupported_cmd` / `bad_args` / `bad_id`) — rejected ids are never acked, so
+`server.py` drops them from its queue. It sends at most `--max-commands`
+(default 8) commands per response and keeps the body under the cap (both caps
+are off with `--max-commands 0`, which exists only to provoke the device's
+overflow path), and it expires any command not acked within `--cmd-max-age`
+seconds of being queued — delivered or not (default 600; 0 = never).
+Full description: spec §4 "Command feedback", §5 "Receiver limits" and
+"Server-side requirements" in
+[`docs/http-control-mode.md`](../../docs/http-control-mode.md).
+
+**Per-cycle data readout.** Each telemetry line prints the modem's cumulative
+`bytes_tx` / `bytes_rx`; whenever a fresh sample arrives (the device refreshes
+them every ~60 s, so not on every POST) the server adds
+`Δtx=… Δrx=… B since previous net.status sample` — the on-wire cost of the
+last cycle(s). Measured on the bench: plain `http://` at 30 s ≈ 1.6 KB per
+cycle ≈ 4.7 MB/day. `https://` is **not measured** — estimated at several
+times more (≈ 16–26 MB/day), because every POST opens a fresh TLS connection
+with a full handshake. The bundled SIM is a 1NCE prepaid pool of 500 MB per
+SIM or 10 years, whichever comes first — a lifetime allowance, not a monthly
+quota — so see spec §9 before choosing TLS or a cadence.
 
 ## Pointing a real device at your server
 
@@ -152,7 +187,13 @@ ups.example.com {
 
 …or nginx/Traefik with a Let's Encrypt cert. Keep the
 `/api/v1/devices/{device_id}/telemetry` path intact, then point the device at
-the `https://` URL.
+the `https://` URL. The certificate must be publicly trusted (the device
+verifies against the Mozilla CA bundle with hostname checking — no self-signed
+certs; an IP-literal `https://` URL needs an IP SAN), the URL must have no
+trailing slash, and redirects are not followed — point the device at the final
+URL. On the bundled SIM every `https://` POST costs a full TLS handshake
+(spec §9 — a lifetime 500 MB pool, not a monthly quota), so prefer plain
+`http://` there.
 
 ## Security notes (read before self-hosting)
 

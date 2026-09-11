@@ -180,12 +180,13 @@ def main():
         print(f"sent net.config {what} ({len(frame)} bytes) to {port}")
         result = read_result(ser)
         if result is None:
-            print("no RESP seen (the device may still have applied it; the RESP "
-                  "is routed to the RPi and can be missed amid telemetry)")
+            print("no confirmation seen (net.config RESP not observed; the device "
+                  "may still have applied it — the RESP is routed to the RPi and "
+                  "can be missed amid telemetry)")
         elif result == 0:
-            print("device acked: OK")
+            print("device confirmed net.config: OK")
         else:
-            print(f"device acked: ERROR (result={result})")
+            print(f"device reported error for net.config (result={result})")
 
 
 if __name__ == "__main__":
