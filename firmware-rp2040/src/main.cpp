@@ -222,13 +222,35 @@ constexpr unsigned long ALERT_STALE_TTL_MS        = 5UL * 60UL * 1000UL;
 char netAlertDismissedText[24] = {0};     // [0]=='\0' → no dismissal in effect
 unsigned long netAlertDismissedAtMs = 0;
 
-// UPS-data staleness alert. CH32X pushes power.status at 1 Hz; when that
+// --- Info notice (ui.display_msg from a non-ESP32 sender) ------------------
+// ui.display_msg is dispatched on the frame's SRC. Only the ESP32 (modem
+// supervisor / OTA) may raise the MODEM alarm banner above. Any other source
+// — the RPi host service over USB-CDC, the HTTP backend's operator 'msg' or
+// the panel's MQTT downlink (both arrive with src = WUPS_ADDR_RPI because the
+// net.downlink unwrap keeps the INNER frame's src) — renders as a plain INFO
+// NOTICE: no "MODEM" / "no uplink" framing, no error sound (one short click
+// chirp the first time it is actually drawn — not while hidden behind a
+// higher-priority screen, and not for a same-text keepalive re-send),
+// INFO_TTL_MS auto-expiry, any button press closes it.
+// Before rp2040:1.2.2 every non-empty display_msg went into the modem-alarm
+// path, so an operator 'msg' from the HTTP server showed up as a MODEM
+// failure with the full buzzer pattern. The two layers are independent: an
+// empty text clears only the sender's own layer (an HTTP operator cannot
+// clear the modem banner, the ESP32 cannot clear an info notice). While the
+// modem banner is up the notice stays stored but hidden; its TTL keeps running.
+char infoText[41] = {0};                  // 40 visible chars = 4 rows x 10 cols
+unsigned long infoUntilMs = 0;            // absolute millis() deadline (wrap-safe compare)
+bool infoOnScreen = false;                // notice actually rendered last pass
+bool infoChirpPending = false;            // new text stored, chirp not yet played
+constexpr unsigned long INFO_TTL_MS = 60UL * 1000UL;
+
 // Firmware version, reported in system.ping RESP / system.hello. The string
 // rides the optional pong tail (protocol.h); the u16 stays as the coarse
 // legacy field. Bump on release.
-#define FW_VERSION_STR "rp2040:1.2.1"
+#define FW_VERSION_STR "rp2040:1.2.2"
 #define FW_VERSION_U16 ((uint16_t)((1u << 8) | 2u))   /* coarse 1.2 */
 
+// UPS-data staleness alert. CH32X pushes power.status at 1 Hz; when that
 // stream dies the cached ui.* values FREEZE and everything downstream
 // (OLED, alarms, uplink-on-change) silently runs on dead data — exactly
 // what masked the 2026-07-11 CH32X wedge for 8 h (frozen "4.6 V" looked
@@ -472,6 +494,38 @@ static void drawBatteryIcon(int x, int y, int soc, int cs, bool noBattery, uint8
   // Low battery indicator (< 10%): flash
   if (soc < 10 && cs == 0 && (animPhase / 8) % 2 == 0) {
     oled.fillRect(innerX, innerY, innerW, innerH, SSD1306_BLACK);
+  }
+}
+
+// Plain info notice (ui.display_msg from a non-ESP32 sender): up to 4 rows x
+// 10 columns of the 6x8 font on the 64x32 panel, no title, no frame. A row
+// breaks on '\n' or when full; text past the 4th row is dropped. Other
+// control bytes are skipped so a stray CR / tab can't draw a garbage glyph;
+// DEL and bytes >= 0x80 (e.g. UTF-8 sequences) draw as '?' so a "10-char"
+// line can't wrap unexpectedly on CP437 glyphs.
+static void drawInfoNotice() {
+  oled.setTextSize(1);
+  oled.setTextColor(SSD1306_WHITE);
+  uint8_t row = 0, col = 0;
+  oled.setCursor(0, 0);
+  for (const char* p = infoText; *p != '\0' && row < 4; p++) {
+    char c = *p;
+    if (c == '\n') {
+      row++;
+      col = 0;
+      oled.setCursor(0, row * 8);
+      continue;
+    }
+    if ((uint8_t)c < 0x20) continue;
+    if ((uint8_t)c >= 0x7F) c = '?';
+    if (col == 10) {
+      row++;
+      col = 0;
+      if (row >= 4) break;
+      oled.setCursor(0, row * 8);
+    }
+    oled.write((uint8_t)c);
+    col++;
   }
 }
 
@@ -840,8 +894,9 @@ static void wupsPublishCmdResponse(uint8_t cls, uint8_t op, uint8_t seq, uint8_t
 static void wupsPublishEventFrame(const WupsFrame& f);
 static void wupsPublishCmdResponseFrame(const WupsFrame& f);
 
-// Cellular uplink is metered: the M.2 modem runs on a ~500 MB/mo LTE data
-// plan, sized from measured packet sizes. The CH32X pushes power.status
+// Cellular uplink is metered: the M.2 modem runs on a 500 MB lifetime prepaid
+// 1NCE data pool (10-year validity), not a monthly plan; the cadence below was
+// sized from measured packet sizes. The CH32X pushes power.status
 // every 1 s (needed locally for the OLED / alarms / SOC EMA and the
 // Last_Power_Status cache), but we only relay it to the MQTT backend every
 // TELEMETRY_UPLINK_INTERVAL_MS. Exception: a change in input-power state
@@ -1282,6 +1337,9 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     netAlertActive = false;   // ESP32 rebooted — drop stale alert; it re-raises if still degraded
     netAlertDismissedText[0] = '\0';   // fresh ESP32 session — old dismissal no longer applies
     netAlertDismissedAtMs = 0;
+    infoText[0] = '\0';      // info notice layer too — the OLED goes back to the dashboard
+    infoUntilMs = 0;
+    infoChirpPending = false;
     return;
   }
 
@@ -1365,10 +1423,13 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     return;
   }
 
-  // ui.display_msg — the ESP32 (modem supervisor) raises/clears a persistent
-  // alert banner on the OLED (+ buzzer via the render loop). text_len == 0 is
-  // the CLEAR sentinel (modem recovered). We are a dumb renderer: store the
-  // string; the render loop draws it as an override and drives the buzzer.
+  // ui.display_msg — dispatched on the frame's SRC (see the infoText block
+  // near the top of the file). From the ESP32 (modem supervisor / OTA) it
+  // raises/clears the persistent MODEM alert banner on the OLED (+ buzzer via
+  // the render loop). From any other sender (RPi host service, HTTP or MQTT
+  // downlink → src = RPI) it is a plain info notice. text_len == 0 is the
+  // CLEAR sentinel for the sender's own layer only. We are a dumb renderer:
+  // store the string; the render loop draws it as an override.
   if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_DISPLAY_MSG &&
       f.len >= sizeof(wups_ui_display_msg_v1_hdr_t)) {
     wups_ui_display_msg_v1_hdr_t h;
@@ -1376,6 +1437,30 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
     if (h.version == 1) {
       uint8_t avail = (uint8_t)(f.len - sizeof(h));   // text bytes actually present
       uint8_t tl = h.text_len < avail ? h.text_len : avail;
+      if (f.src != WUPS_ADDR_ESP32) {
+        // Info notice layer. Never touches netAlert*: an operator message
+        // must neither raise nor clear the modem alarm. `line`/`reserved`
+        // are ignored (reserved for future use).
+        if (tl > sizeof(infoText) - 1) tl = sizeof(infoText) - 1;
+        if (tl == 0) {
+          infoText[0] = '\0';             // sender clears its own notice
+          infoUntilMs = 0;
+          infoChirpPending = false;
+        } else {
+          // Same text while the notice is still live = keepalive re-send:
+          // only re-arm the TTL. Anything else is a new notice: the render
+          // branch chirps once the first time it actually draws it (so no
+          // blind click while a higher-priority screen hides it).
+          bool same = infoText[0] != '\0' && strlen(infoText) == (size_t)tl &&
+                      memcmp(infoText, f.payload + sizeof(h), tl) == 0;
+          memcpy(infoText, f.payload + sizeof(h), tl);
+          infoText[tl] = '\0';
+          infoUntilMs = millis() + INFO_TTL_MS;   // re-arm on every raise
+          if (!same) infoChirpPending = true;
+        }
+        return;
+      }
+      // ESP32 path — unchanged modem-alarm bookkeeping (23-char cap).
       if (tl > sizeof(netAlertText) - 1) tl = sizeof(netAlertText) - 1;
       if (tl == 0) {
         // Explicit CLEAR — wipe everything, incl. dismiss-cooldown bookkeeping.
@@ -1925,6 +2010,18 @@ void loop() {
       delay(50);
       return;
     }
+    // Info notice (non-ESP32 display_msg) on the OLED: any press closes it
+    // and is consumed the same way. Separate layer — does not touch the
+    // modem-banner dismissal record or its cooldown.
+    if (infoOnScreen && infoText[0] != '\0' && press_edge) {
+      infoText[0] = '\0';
+      infoUntilMs = 0;
+      infoChirpPending = false;
+      infoOnScreen = false;
+      s_btn_release_guard = true;   // swallow this press until both release
+      delay(50);
+      return;
+    }
   }
 
   // We're back on the dashboard with no hand-off pending: the ESP32 menu (if
@@ -2221,7 +2318,18 @@ void loop() {
     netAlertDismissedText[0] = '\0';
     netAlertDismissedAtMs = 0;
   }
+  // Info-notice TTL: wrap-safe signed compare against the absolute deadline
+  // (explicit 32-bit reinterpretation, not `long`, so it stays correct on a
+  // 64-bit host build). Runs whether or not the notice is visible (hidden
+  // behind the modem banner still counts down).
+  if (infoText[0] != '\0' &&
+      (int32_t)(uint32_t)(millis() - infoUntilMs) >= 0) {
+    infoText[0] = '\0';
+    infoUntilMs = 0;
+    infoChirpPending = false;
+  }
   netAlertOnScreen = false;   // set below iff the banner branch renders
+  infoOnScreen = false;       // set below iff the info-notice branch renders
 
   if (upsStaleActive) {
     // Dead power-telemetry stream — the one alert that must outrank all
@@ -2313,6 +2421,23 @@ void loop() {
     oled.print(netAlertText);         // e.g. "SIM ERROR" / "NO NETWORK"
     oled.setCursor(0, 22);
     oled.print(F("no uplink"));
+  } else if (infoText[0] != '\0') {
+    // Plain info notice from a non-ESP32 sender (host service / HTTP / MQTT
+    // downlink). Priority: NO UPS > BAD PSU > MODEM > info notice > dashboard
+    // — while the modem banner is up the notice stays stored but hidden.
+    // One short chirp the first time a NEW notice is actually drawn (never
+    // while hidden; ui_settings_beep is tone()-based, non-blocking, no-op
+    // when muted). Any button press closes it (consumed in the loop's button
+    // section). badChargerAlertPlayed is reset exactly as the dashboard
+    // branch does, so the BAD PSU rising edge re-arms while the notice is
+    // showing instead of the dashboard.
+    infoOnScreen = true;
+    badChargerAlertPlayed = false;
+    if (infoChirpPending) {
+      infoChirpPending = false;
+      ui_settings_beep(1000, 20);
+    }
+    drawInfoNotice();
   } else {
     // Reset alert state when charger is OK or disconnected
     badChargerAlertPlayed = false;

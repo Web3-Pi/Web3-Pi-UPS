@@ -290,7 +290,9 @@ typedef struct WUPS_PACKED {
 /* power.status — emitted by CH32X to RP2040 every 1 s, and on demand */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */
-    uint8_t  charge_state;   /* 0=idle 1=charging 2=charged 3=fault */
+    uint8_t  charge_state;   /* 0=not charging 1=trickle/pre-charge 2=fast charge
+                              * 3=charge done (MP2762A charger state; faults are
+                              * reported in the faults field, never here) */
     uint16_t vbus_in_mV;
     uint16_t vbus_out_mV;
     int16_t  ibus_out_mA;
@@ -319,7 +321,9 @@ typedef struct WUPS_PACKED {
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 2 */
     uint8_t  flags;          /* see WUPS_PWR2_FLAG_* */
-    uint8_t  charge_state;   /* 0=idle 1=charging 2=charged 3=fault */
+    uint8_t  charge_state;   /* 0=not charging 1=trickle/pre-charge 2=fast charge
+                              * 3=charge done (MP2762A charger state; faults are
+                              * reported in the faults field, never here) */
     uint8_t  reserved;       /* 0 (alignment / future use) */
     /* --- INPUT --- */
     uint16_t vbus_in_mV;     /* PA1 ADC (post ideal-diode OR of USB-C + barrel) */
@@ -580,12 +584,30 @@ typedef struct WUPS_PACKED {
     uint16_t dur_ms;
 } wups_ui_beep_v1_t;
 
-/* ui.display_msg (variable text follows) */
+/* ui.display_msg (variable text follows).
+ * Rendering on the RP2040 depends on the frame's SRC (since rp2040:1.2.2):
+ *   - src = ESP32 (modem supervisor / OTA): the persistent MODEM alert banner
+ *     ("! MODEM / <text> / no uplink") with the error-sound + 10 s reminder
+ *     buzzer pattern, button dismiss + 10 min cooldown, 5 min stale TTL;
+ *     text capped at 23 chars on the RP2040 (the ESP32 senders allow 24 on
+ *     the wire — keep alerts <= 23).
+ *   - any other src (RPi host service, HTTP or MQTT downlink — all arrive
+ *     with src = RPI): a plain info notice, 40 visible chars (4 rows x 10
+ *     cols, '\n' breaks a row; rows break at column 10 with no word wrap,
+ *     so senders place '\n' themselves for word-aligned rows), 60 s TTL,
+ *     no alarm (one short chirp when it first becomes visible; a same-text
+ *     re-send while live only re-arms the TTL), any button press closes it.
+ * text_len == 0 clears ONLY the sender's own layer — an HTTP/MQTT operator
+ * cannot clear the modem banner and the ESP32 cannot clear an info notice.
+ * `line` and `reserved` are reserved for future use: senders SHOULD send 0,
+ * receivers ignore any value today (existing senders — the HTTP backend's
+ * `line` argument, the Rust host service — may pass a caller-chosen `line`;
+ * it has no effect). */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */
-    uint8_t  line;
+    uint8_t  line;           /* reserved: SHOULD be 0, ignored today */
     uint8_t  text_len;
-    uint8_t  reserved;
+    uint8_t  reserved;       /* reserved: SHOULD be 0, ignored today */
     /* text[text_len] follows */
 } wups_ui_display_msg_v1_hdr_t;
 

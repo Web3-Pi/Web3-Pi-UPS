@@ -192,6 +192,17 @@ the agent's config disables the op entirely.
 | 0x03 | beep           | REQ                    | `wups_ui_beep_v1_t`             |
 | 0x04 | display_msg    | REQ                    | `wups_ui_display_msg_v1_hdr_t` + text |
 
+`ui.display_msg` rendering depends on the frame's `SRC` (since rp2040:1.2.2):
+from the ESP32 (modem supervisor / OTA) it is the persistent **MODEM** alert
+banner with buzzer (text ≤ 23 chars); from any other source (RPi host service,
+HTTP or MQTT downlink — `SRC = 0x01` RPI) it is a plain info notice: 40 visible
+chars (4 rows × 10 cols, `\n` breaks a row — no word wrap, so put `\n` in the
+text for word-aligned rows), 60 s TTL, no alarm (one short chirp when it first
+becomes visible), any button press closes it. `text_len == 0` clears only the
+sender's own layer (an HTTP operator cannot clear the modem banner). `line`
+and `reserved` are reserved for future use: senders should send 0, receivers
+ignore any value today.
+
 ## Example: RPi pings CH32X
 
 RPi composes:
