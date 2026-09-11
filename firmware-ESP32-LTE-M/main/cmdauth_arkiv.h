@@ -94,6 +94,13 @@ uint32_t cmdauth_arkiv_binding_gen(void);
 /* Highest Braga block processed (replay cursor, §4.4 fromBlock). 0 = none. */
 uint64_t cmdauth_arkiv_cursor_block(void);
 
+/* Replay baseline: the highest accepted command seq (0 = none since bind).
+ * The cmd sweep (arkiv_rpc.c) puts it in the arkiv_query filter
+ * (`seq > last_ctr`) AND pre-skips entities at or below it client-side, so
+ * consumed entities are never re-validated and a batch of pending commands
+ * is dispatched oldest-first. Advances only inside cmdauth_arkiv_check(). */
+uint64_t cmdauth_arkiv_last_ctr(void);
+
 /*
  * Verify a fetched w3pups-cmd entity against the bound owner (§4.3):
  *   writer == registered owner_addr, owner signature over the frame valid,

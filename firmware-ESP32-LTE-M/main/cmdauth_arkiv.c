@@ -281,6 +281,15 @@ bool cmdauth_arkiv_check(const arkiv_cmd_t *cmd,
     return true;
 }
 
+/* Read side of the baseline above — the sweep re-reads it after every
+ * accepted command so later candidates at or below it are pre-skipped.
+ * Plain 64-bit read (two words on Xtensa): the only writers are check()
+ * above — always inside the sweep, under its lock — and bind/clear, which
+ * reset it to 0 while the sweep is gated off (claim state != CLAIMED), so
+ * a torn read is confined to an unbind→rebind racing an in-flight sweep
+ * and costs at most one sweep with a stale window; not worth a lock. */
+uint64_t cmdauth_arkiv_last_ctr(void) { return s_last_ctr; }
+
 esp_err_t cmdauth_arkiv_bind_owner(const uint8_t owner_pub[64],
                                    const uint8_t enc_pub[64], uint32_t epoch)
 {

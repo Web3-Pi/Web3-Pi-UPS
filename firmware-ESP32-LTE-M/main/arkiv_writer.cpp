@@ -107,10 +107,12 @@ struct WriteJob {
     std::vector<uint8_t>       payload;
     uint32_t                   expires_in_seconds = 0;
     std::vector<arkiv::Attribute> attrs;
+    int64_t                    created_us = 0;   /* enqueue time (esp_timer) */
+    unsigned                   attempts   = 0;   /* submit attempts so far   */
 };
 
 static QueueHandle_t s_queue;   /* holds WriteJob* */
-static constexpr UBaseType_t WRITER_QUEUE_LEN = 8;
+static constexpr UBaseType_t WRITER_QUEUE_LEN = ARKIV_WRITER_QUEUE_LEN;
 static void writer_task(void *arg);
 
 extern "C" bool arkiv_writer_ready(void) { return s_ready; }
@@ -386,9 +388,18 @@ static const std::vector<uint8_t> &storage_addr_bytes()
 }
 
 /* Internal: do_submit using a pre-built CreateOp. Same locking + chain
- * plumbing as the public sync API. Returns ESP_OK / ESP_FAIL. */
-static esp_err_t submit_create(arkiv::CreateOp &create, uint8_t out_tx_hash[32])
+ * plumbing as the public sync API. Returns ESP_OK; ESP_ERR_INVALID_RESPONSE
+ * when the node answered eth_sendRawTransaction with a JSON-RPC error
+ * object (permanent for this tx); ESP_FAIL / ESP_ERR_TIMEOUT for transport,
+ * HTTP or lock failures (transient — the writer task retries those).
+ * `*out_at_send` (optional) is set once the signed tx has been handed to
+ * eth_sendRawTransaction: a failure after that point may still have reached
+ * the node, so the caller must not blindly resend. out_tx_hash is filled
+ * before the send for the same reason (it is what the node would report). */
+static esp_err_t submit_create(arkiv::CreateOp &create, uint8_t out_tx_hash[32],
+                               bool *out_at_send = nullptr)
 {
+    if (out_at_send) *out_at_send = false;
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20000)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
@@ -488,10 +499,12 @@ static esp_err_t submit_create(arkiv::CreateOp &create, uint8_t out_tx_hash[32])
         if (out_tx_hash) arkiv::tx::tx_hash(raw, out_tx_hash);
 
         char node_hash[64 + 1] = {0};
+        if (out_at_send) *out_at_send = true;
         esp_err_t sr = arkiv_eth_send_raw_tx(raw.data(), raw.size(),
                                              node_hash, sizeof(node_hash));
         if (sr != ESP_OK) {
-            ESP_LOGW(TAG, "eth_sendRawTransaction failed");
+            ESP_LOGW(TAG, "eth_sendRawTransaction failed (%s)", esp_err_to_name(sr));
+            if (sr == ESP_ERR_INVALID_RESPONSE) rc = sr;   /* node's verdict */
             goto out;
         }
         ESP_LOGI(TAG, "submitted nonce=%llu hash=%s",
@@ -507,6 +520,8 @@ out:
 static void writer_task(void *arg)
 {
     (void)arg;
+    static const uint32_t BACKOFF_S[] = ARKIV_WRITER_RETRY_BACKOFF_S;
+    constexpr unsigned NBACKOFF = sizeof(BACKOFF_S) / sizeof(BACKOFF_S[0]);
     for (;;) {
         WriteJob *job = nullptr;
         if (xQueueReceive(s_queue, &job, portMAX_DELAY) != pdTRUE) continue;
@@ -517,16 +532,81 @@ static void writer_task(void *arg)
             delete job;
             continue;
         }
-        arkiv::CreateOp create;
-        create.contentType      = job->content_type;
-        create.expiresInSeconds = job->expires_in_seconds;
-        create.payload          = std::move(job->payload);
-        create.attributes       = std::move(job->attrs);
-        uint8_t hash[32];
-        esp_err_t rc = submit_create(create, hash);
-        if (rc != ESP_OK) {
-            ESP_LOGW(TAG, "queued submit failed (type=%s)",
-                     job->content_type.c_str());
+        uint8_t hash[32] = {0};
+        bool maybe_sent = false;   /* send step failed on transport: the node may hold the tx */
+        for (;;) {
+            /* Age gate BEFORE every attempt (a job can age out while queued
+             * behind a dead-link retry): the panel has timed its row out by
+             * now, a submit would only spend gas. */
+            int64_t age_s = (esp_timer_get_time() - job->created_us) / 1000000;
+            if (age_s >= ARKIV_WRITER_JOB_MAX_AGE_S) {
+                ESP_LOGW(TAG, "queued submit stale (type=%s, age %lld s, "
+                         "%u attempt(s)) — dropping",
+                         job->content_type.c_str(), (long long)age_s,
+                         job->attempts);
+                break;
+            }
+            esp_err_t rc = ESP_FAIL;
+            if (maybe_sent) {
+                /* Ask before resending: a reply lost on LTE after the node
+                 * accepted the tx would otherwise become a SECOND entity
+                 * with the same seq (fresh nonce). Only a hash the node
+                 * has never seen is resent; a failed probe just counts as
+                 * one more attempt. */
+                bool known = false;
+                rc = arkiv_eth_tx_known(hash, &known);
+                if (rc == ESP_OK && known) {
+                    ESP_LOGI(TAG, "queued submit was accepted after all "
+                             "(type=%s, attempt %u) — not resending",
+                             job->content_type.c_str(), job->attempts);
+                    break;
+                }
+                if (rc == ESP_OK) maybe_sent = false;   /* never seen — resend */
+            }
+            if (!maybe_sent) {
+                /* COPY (not move) the job into the CreateOp: submit_create
+                 * consumes the op, and a transient failure resends the same
+                 * job from these fields. ~1 KB of transient heap per attempt. */
+                arkiv::CreateOp create;
+                create.contentType      = job->content_type;
+                create.expiresInSeconds = job->expires_in_seconds;
+                create.payload          = job->payload;
+                create.attributes       = job->attrs;
+                bool at_send = false;
+                rc = submit_create(create, hash, &at_send);
+                if (rc == ESP_OK) break;
+                if (rc == ESP_ERR_INVALID_RESPONSE) {
+                    /* Permanent: the node rejected THIS tx (its JSON-RPC
+                     * error text is on the arkiv_rpc line just above).
+                     * Resending the same bytes cannot succeed — drop. */
+                    ESP_LOGW(TAG, "queued submit rejected by node (type=%s, "
+                             "attempt %u, %s) — dropping",
+                             job->content_type.c_str(), job->attempts + 1,
+                             esp_err_to_name(rc));
+                    break;
+                }
+                if (at_send) maybe_sent = true;
+            }
+
+            job->attempts++;
+            if (job->attempts >= ARKIV_WRITER_RETRIES) {
+                ESP_LOGW(TAG, "queued submit failed (type=%s, %u attempt(s), "
+                         "age %lld s, %s) — dropping",
+                         job->content_type.c_str(), job->attempts,
+                         (long long)age_s, esp_err_to_name(rc));
+                break;
+            }
+            unsigned bi = job->attempts - 1 < NBACKOFF ? job->attempts - 1 : NBACKOFF - 1;
+            ESP_LOGW(TAG, "queued submit failed (type=%s, attempt %u/%d, %s) "
+                     "— retrying in %u s",
+                     job->content_type.c_str(), job->attempts,
+                     (int)ARKIV_WRITER_RETRIES, esp_err_to_name(rc),
+                     (unsigned)BACKOFF_S[bi]);
+            /* Plain vTaskDelay in the writer task: this writer sees a few
+             * entities per minute at most, and the jobs queued behind this
+             * one would hit the same dead link anyway. Retrying IN PLACE
+             * (not re-queued behind them) keeps the panel's ack order. */
+            vTaskDelay(pdMS_TO_TICKS(BACKOFF_S[bi] * 1000));
         }
         delete job;
     }
@@ -544,6 +624,7 @@ extern "C" bool arkiv_writer_enqueue_create_entity(const char *content_type,
     if (!job) return false;
     job->content_type        = content_type;
     job->expires_in_seconds  = expires_in_seconds;
+    job->created_us          = esp_timer_get_time();
     if (payload && payload_len) {
         job->payload.assign(payload, payload + payload_len);
     }
@@ -563,7 +644,9 @@ extern "C" bool arkiv_writer_enqueue_create_entity(const char *content_type,
     /* xQueueSend returns immediately when full — that's the right policy on
      * a 4-KB-stack caller: dropping one ack/event is better than blocking. */
     if (xQueueSend(s_queue, &job, 0) != pdTRUE) {
-        ESP_LOGW(TAG, "writer queue full — dropping %s", content_type);
+        ESP_LOGW(TAG, "writer queue full (%u/%u) — dropping %s",
+                 (unsigned)uxQueueMessagesWaiting(s_queue),
+                 (unsigned)WRITER_QUEUE_LEN, content_type);
         delete job;
         return false;
     }

@@ -331,7 +331,14 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base,
 
 /* Worker task — pulls observed entity keys off the queue and asks
  * arkiv_rpc to fetch + verify them. Empty-string sentinel = full catch-up
- * poll (`arkiv_query` by type + device_id, same body the legacy poll uses). */
+ * poll (`arkiv_query` by type + device_id, same body the legacy poll uses).
+ *
+ * Keys are coalesced: after one is received, everything already queued
+ * behind it is drained and the batch is served by ONE sweep. The sweep is
+ * seq-ordered and dispatches every pending command regardless of which key
+ * woke it (arkiv_rpc_fetch_and_verify_by_key delegates to it), so a burst
+ * of ArkivEntityCreated notifications — or a catch-up sentinel mixed in —
+ * costs one HTTPS round-trip instead of one per key (issue #9). */
 static void ws_worker_task(void *arg)
 {
     (void)arg;
@@ -339,14 +346,34 @@ static void ws_worker_task(void *arg)
         char *key = NULL;
         if (xQueueReceive(s_work_q, &key, portMAX_DELAY) != pdTRUE) continue;
         if (!key) continue;
+        unsigned batch = 1;
+        char *extra = NULL;
+        while (xQueueReceive(s_work_q, &extra, 0) == pdTRUE) {
+            free(extra);   /* same sweep serves it; free(NULL) is a no-op */
+            extra = NULL;
+            batch++;
+        }
+        if (batch > 1) {
+            ESP_LOGI(TAG, "%u queued notifications coalesced into one sweep", batch);
+        }
+        bool more;
         if (key[0] == '\0') {
             /* Catch-up sweep — same filter the legacy poll uses, runs
              * once after each (re)connect. */
-            arkiv_rpc_poll_once();
+            more = arkiv_rpc_poll_once();
         } else {
-            arkiv_rpc_fetch_and_verify_by_key(key);
+            more = arkiv_rpc_fetch_and_verify_by_key(key);
         }
         free(key);
+        /* Re-arm while the sweep reports commands left behind (dispatch
+         * cap, ESP32-local op, page budget). Their notifications were
+         * consumed by the drain above and nothing else would wake this
+         * task before the 5-min fallback cadence — the panel's row window.
+         * Bounded: a persistent "more" cannot pin the worker. */
+        for (unsigned k = 0; more && k < ARKIV_CMD_MAX_RESWEEPS; ++k) {
+            vTaskDelay(pdMS_TO_TICKS(ARKIV_CMD_RESWEEP_DELAY_MS));
+            more = arkiv_rpc_poll_once();
+        }
     }
 }
 

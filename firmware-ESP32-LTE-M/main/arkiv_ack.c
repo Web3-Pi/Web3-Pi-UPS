@@ -12,10 +12,12 @@
 
 #define TAG "arkiv_ack"
 
-/* Tiny tracker — at most a few in-flight Paranoic commands at once. SEQ is
- * an 8-bit routing nonce; collisions inside the TTL would be a separate
- * upstream bug (allocateSeq backs it with Redis INCR & 0xff). */
-#define SLOTS 4
+/* Tiny tracker — sized to one full cmd sweep (ARKIV_CMD_MAX_PER_SWEEP)
+ * so a burst of queued commands never evicts a mapping whose RESP is still
+ * pending (issue #9). SEQ is an 8-bit routing nonce; collisions inside the
+ * TTL would be a separate upstream bug (allocateSeq backs it with Redis
+ * INCR & 0xff). */
+#define SLOTS ARKIV_ACK_SLOTS
 
 typedef struct {
     bool     used;
@@ -57,7 +59,7 @@ void arkiv_ack_track_pending(uint8_t seq, const char *command_id)
         }
     }
     if (free_slot < 0) {
-        /* Tracker full — evict the oldest. The 4-slot cap is generous; if
+        /* Tracker full — evict the oldest. SLOTS covers a whole sweep; if
          * we ever hit this the upstream cadence is wrong. */
         int64_t oldest = INT64_MAX;
         for (int i = 0; i < SLOTS; ++i) {
@@ -98,8 +100,11 @@ bool arkiv_ack_emit(uint8_t seq, const uint8_t *resp_payload, size_t resp_len)
         return false;
     }
 
-    /* Pull + clear the slot under lock; we don't want to hold it during the
-     * (slow) HTTPS submit. */
+    /* Copy the mapping under lock but leave the slot in place: it is only
+     * cleared once the entity is actually queued (below). A seal/enqueue
+     * failure used to consume the mapping, so the ACK for that command was
+     * lost for good (issue #9); now it survives until its TTL for a later
+     * emit (e.g. the RP2040 re-sending the RESP, or the retried publish). */
     char cmd_id[40];
     ensure_lock();
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -117,7 +122,6 @@ bool arkiv_ack_emit(uint8_t seq, const uint8_t *resp_payload, size_t resp_len)
     }
     strncpy(cmd_id, s_slots[idx].command_id, sizeof(cmd_id) - 1);
     cmd_id[sizeof(cmd_id) - 1] = '\0';
-    s_slots[idx].used = false;
     xSemaphoreGive(s_lock);
 
     /* Convention: first byte of the cmd RESP payload is the result code
@@ -150,8 +154,8 @@ bool arkiv_ack_emit(uint8_t seq, const uint8_t *resp_payload, size_t resp_len)
                                        resp_payload, resp_len,
                                        sealed, sizeof(sealed), &sealed_len, &epoch);
     if (sr != 0) {
-        ESP_LOGW(TAG, "w3pups-ack seal failed (rc=%d cmd=%s) — dropping (fail-closed)",
-                 sr, cmd_id);
+        ESP_LOGW(TAG, "w3pups-ack seal failed (rc=%d cmd=%s) — not emitted "
+                 "(fail-closed), mapping kept for a later attempt", sr, cmd_id);
         return false;
     }
 
@@ -174,9 +178,22 @@ bool arkiv_ack_emit(uint8_t seq, const uint8_t *resp_payload, size_t resp_len)
         15 * 60,  /* 15 min TTL — backend sweep is 30 s, ample headroom */
         attrs, sizeof(attrs) / sizeof(attrs[0]));
     if (!ok) {
-        ESP_LOGW(TAG, "w3pups-ack enqueue failed (cmd=%s code=%lld)", cmd_id, (long long)code);
+        ESP_LOGW(TAG, "w3pups-ack enqueue failed (cmd=%s code=%lld) — mapping kept "
+                 "for a later attempt", cmd_id, (long long)code);
         return false;
     }
+    /* Queued: release the mapping. Re-find it by seq AND command_id — the
+     * slot may have been refreshed with a newer command for the same SEQ
+     * while the lock was dropped, and that one must keep its own mapping. */
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    for (int i = 0; i < SLOTS; ++i) {
+        if (s_slots[i].used && s_slots[i].seq == seq &&
+            strcmp(s_slots[i].command_id, cmd_id) == 0) {
+            s_slots[i].used = false;
+            break;
+        }
+    }
+    xSemaphoreGive(s_lock);
     ESP_LOGI(TAG, "w3pups-ack enqueued (cmd=%s code=%lld seq=%llu)",
              cmd_id, (long long)code, (unsigned long long)ack_seq);
     return true;

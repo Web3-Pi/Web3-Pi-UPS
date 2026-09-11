@@ -25,6 +25,52 @@
 #define ARKIV_HTTP_TIMEOUT_MS   8000
 #define ARKIV_RPC_RESP_CAP      8192
 
+/* w3pups-cmd sweep bounds (issue #9). One arkiv_query page of PAGE_N
+ * entities — each ~0.7 KB on the wire (0x-hex WUPS frame up to 240 B, the
+ * 128-hex sig, the attribute set) — stays far below ARKIV_RPC_RESP_CAP
+ * even with full-size frames; a response over the cap is dropped WHOLE
+ * (the sweep is skipped, never fed a truncated JSON), so the page is sized
+ * for headroom, not throughput. A sweep first GATHERS: the node lists
+ * newest-first and ignores orderBy, so it walks the window
+ * `seq > last_ctr && seq < floor` down the seq axis (at most MAX_PAGES
+ * queries) until a short page proves nothing older is pending, then
+ * dispatches the lowest seqs — at most MAX_PER_SWEEP per sweep. PAGE is
+ * the JSON-RPC hex quantity, PAGE_N the same number (keep in sync). A
+ * sweep that had to stop with commands left behind reports it and the
+ * caller re-arms after RESWEEP_DELAY_MS, at most MAX_RESWEEPS times per
+ * trigger (8 × 8 = 64 commands before the regular cadence takes over). */
+#define ARKIV_CMD_PAGE          "0x6"
+#define ARKIV_CMD_PAGE_N        6
+#define ARKIV_CMD_MAX_PER_SWEEP 8
+#define ARKIV_CMD_MAX_PAGES     3
+#define ARKIV_CMD_RESWEEP_DELAY_MS 1000
+#define ARKIV_CMD_MAX_RESWEEPS  8
+
+/* ACK tracker (arkiv_ack.c): in-flight (inner WUPS SEQ → command_id)
+ * mappings. Sized to a full sweep (MAX_PER_SWEEP) so a burst of queued
+ * commands can never evict a mapping whose RESP is still on its way. */
+#define ARKIV_ACK_SLOTS         8
+
+/* Writer job queue + retry policy (arkiv_writer.cpp). RETRIES counts TOTAL
+ * attempts (first try + 2 retries, one per RETRY_BACKOFF_S entry).
+ * QUEUE_LEN bounds the heap held by queued ack/event jobs (~0.5-1 KB
+ * each). A submit that fails on transport/HTTP grounds (LTE hiccup,
+ * gateway 5xx, node unreachable) is retried IN PLACE — same job — sleeping
+ * RETRY_BACKOFF_S[attempt-1] seconds between attempts, as long as the job
+ * is younger than JOB_MAX_AGE_S (checked before every attempt). When the
+ * failure hit the eth_sendRawTransaction step itself the node may already
+ * hold the tx, so the retry first asks eth_getTransactionByHash and only
+ * resends (fresh nonce) a tx the node never saw — otherwise a lost reply
+ * would create a second identical entity. A JSON-RPC error object from
+ * eth_sendRawTransaction is permanent (bad tx, no funds) and dropped at
+ * once, except the gateway-side codes -32603/-32005 (transient). 240 s
+ * covers the panel's ≤ 5 min command-row window; an ACK older than that
+ * only wastes gas. */
+#define ARKIV_WRITER_QUEUE_LEN       16
+#define ARKIV_WRITER_RETRIES         3
+#define ARKIV_WRITER_RETRY_BACKOFF_S {5, 15}
+#define ARKIV_WRITER_JOB_MAX_AGE_S   240
+
 /*
  * w3pups-cmd entity contract (what the owner's browser wallet writes; the
  * device reads + verifies). Metadata is plaintext by design (plan §11.1):
