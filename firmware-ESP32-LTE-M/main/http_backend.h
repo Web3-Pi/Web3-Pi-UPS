@@ -12,7 +12,7 @@
  *     (works behind 1nce CGNAT, same posture as MQTT/Arkiv).
  *   - Telemetry goes UP in the request body of a periodic signed POST.
  *   - Commands come DOWN in the JSON response body (polling on the telemetry
- *     POST — no server push, no long-poll; cheap on the 500 MB LTE-M plan).
+ *     POST — no server push, no long-poll; cheap on a metered LTE-M data pool).
  *   - Command acks ride UP on the *next* POST.
  *
  * The ESP32 stays a dumb pipe: it serialises the telemetry aggregate it
@@ -20,10 +20,12 @@
  * into the corresponding WUPS frame routed back to the RP2040 (exactly the
  * frames the panel emits for MQTT — see Web3-Pi-UPS-Panel commands.ts).
  *
- * Auth: both directions are HMAC-SHA256 signed with the per-device 32-byte
- * secret (identity_secret_raw). The request signs (Ts || Nonce || raw_body);
- * the server signs (request_Nonce || raw_response_body) and the device verifies
- * it before executing any command — so commands can't be injected even over
+ * Auth: both directions are HMAC-SHA256 signed with the device's HTTP key —
+ * the 16-char Crockford-base32 code shown on the OLED (generated and stored by
+ * http_cfg.c; separate from the MQTT/Arkiv per-device secret). The key bytes
+ * are the ASCII of the code. The request signs (Ts || Nonce || raw_body); the
+ * server signs (request_Nonce || raw_response_body) and the device verifies it
+ * before executing any command — so commands can't be injected even over
  * plain HTTP. TLS is therefore optional (confidentiality only); https:// URLs
  * are validated against the bundled CA store.
  */

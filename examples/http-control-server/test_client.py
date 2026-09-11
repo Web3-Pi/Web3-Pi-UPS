@@ -21,6 +21,14 @@ import sys
 import time
 import urllib.request
 
+# Device receiver limits — mirror the "Receiver limits" block in
+# ../../firmware-ESP32-LTE-M/main/http_backend.c. A response above the byte
+# cap is dropped whole by the device, commands past the count cap are left
+# un-acked, and an over-long id is rejected as bad_id.
+DEVICE_RESPONSE_MAX_BYTES = 2047
+DEVICE_MAX_COMMANDS_PER_RESPONSE = 8
+DEVICE_ID_MAX_CHARS = 47
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -73,14 +81,30 @@ def main():
             # trustworthy if this matches.
             want = hmac.new(secret, nonce.encode() + resp_body,
                             hashlib.sha256).hexdigest()
-            has_cmds = bool(json.loads(resp_body or b"{}").get("commands"))
+            cmds = json.loads(resp_body or b"{}").get("commands") or []
             if resp_sig and hmac.compare_digest(want, resp_sig.lower()):
                 print("response signature: OK")
-            elif has_cmds:
+            elif cmds:
                 print("response signature: MISSING/INVALID — firmware would ignore commands")
                 sys.exit(2)
             else:
                 print("response signature: (none; no commands to verify)")
+            # Would the real device accept this response? Check its limits.
+            if len(resp_body) > DEVICE_RESPONSE_MAX_BYTES:
+                print(f"WARNING: response body is {len(resp_body)} B > "
+                      f"{DEVICE_RESPONSE_MAX_BYTES} B — the device drops it whole "
+                      f"(no commands applied) and reports resp_dropped", file=sys.stderr)
+            if len(cmds) > DEVICE_MAX_COMMANDS_PER_RESPONSE:
+                print(f"WARNING: {len(cmds)} commands > {DEVICE_MAX_COMMANDS_PER_RESPONSE} "
+                      f"— the device applies only the first "
+                      f"{DEVICE_MAX_COMMANDS_PER_RESPONSE}; the rest stay un-acked",
+                      file=sys.stderr)
+            long_ids = [c["id"] for c in cmds if isinstance(c, dict)
+                        and isinstance(c.get("id"), str) and len(c["id"]) > DEVICE_ID_MAX_CHARS]
+            if long_ids:
+                print(f"WARNING: {len(long_ids)} command id(s) longer than "
+                      f"{DEVICE_ID_MAX_CHARS} chars — the device rejects them as bad_id: "
+                      f"{long_ids}", file=sys.stderr)
     except urllib.error.HTTPError as e:
         print(f"HTTP {e.code}: {e.read().decode()}")
         sys.exit(1)

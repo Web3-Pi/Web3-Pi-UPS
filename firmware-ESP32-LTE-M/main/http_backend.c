@@ -39,17 +39,37 @@
 #define HTTP_FRESHNESS_MS   90000   /* drop a cached slot older than this */
 #define HTTP_TIMEOUT_MS     20000
 
-#define HTTP_RESP_MAX       2048    /* response (commands) capture cap */
-/* Telemetry JSON we POST. The v2 power object (21 keys) + host + net + up to
- * ACK_PENDING_MAX acks reach ~960 B worst case (every field at full width),
- * leaving no real headroom under 1 KB; cJSON_PrintPreallocated also needs a
- * few bytes of slack beyond the printed length. 1.5 KB, static (s_body). */
-#define HTTP_BODY_MAX       1536
+/* Receiver limits — the one home for the numbers a server must respect
+ * (mirrored by examples/http-control-server and tools/test_http_cmd_loop.py):
+ *   - response body <= HTTP_RESP_MAX-1 = 2047 B; a larger 2xx body is counted,
+ *     dropped WHOLE (no commands applied) and reported as "resp_dropped"
+ *     {bytes, max} in the next POST — the 2xx still counts as uplink-alive.
+ *   - <= CMDS_PER_RESP_MAX (= ACK_PENDING_MAX = 8) commands applied per
+ *     response; the rest stay un-acked and the server re-sends them.
+ *   - command id: string of 1..ACK_ID_MAX-1 = 47 chars; missing/empty/longer
+ *     → rejected as "bad_id", never truncated into a different id.
+ *   - rejected list: last REJ_MAX = 4 {id, reason} pairs (unsupported_cmd |
+ *     bad_args | bad_id) ride in the next POST; rejected ids are never acked. */
+#define HTTP_RESP_MAX       2048    /* response capture cap: 2047 B + NUL */
+/* Telemetry JSON we POST. Absolute worst case (every field at full width,
+ * 8 acks + 4 rejects with 47-char ids, resp_dropped) prints to 1477 B; the v2
+ * power object + host + net + 8 acks alone is 1081 B. cJSON_PrintPreallocated
+ * needs a few bytes of slack beyond that. If a body ever fails to fit, the
+ * POST loop stalls with nothing drained (build_body() → 0 every cadence) —
+ * so re-check this figure when adding a key or lengthening FW_VERSION_STR.
+ * 2 KB, static (s_body): ~570 B of headroom over the worst case. */
+#define HTTP_BODY_MAX       2048
 #define HTTP_URL_MAX        (HTTP_CFG_URL_MAX + 96)
 
-#define ACK_ID_MAX          32      /* command id string cap (incl. NUL) */
+#define ACK_ID_MAX          48      /* id cap incl. NUL: fits a 36-char UUID;
+                                     * longer ids are rejected, never truncated */
 #define ACK_PENDING_MAX     8
+/* ack_add() evicts the OLDEST pending ack when full: applying more commands
+ * than one POST can ack would lose acks (server re-sends) and, past
+ * EXEC_RING_MAX, wrap the dedup ring and re-execute the oldest. */
+#define CMDS_PER_RESP_MAX   ACK_PENDING_MAX
 #define EXEC_RING_MAX       16
+#define REJ_MAX             4       /* rejected {id, reason} pairs carried */
 
 /* --- telemetry cache (mirrors arkiv_tlm) ------------------------------- */
 
@@ -74,12 +94,22 @@ static int  s_pending_n;
 static char s_executed[EXEC_RING_MAX][ACK_ID_MAX];
 static int  s_exec_idx;
 
+/* Commands we refused (never acked), reported once in the next POST. `reason`
+ * is always a string literal. */
+static struct { char id[ACK_ID_MAX]; const char *reason; } s_rejected[REJ_MAX];
+static int s_rejected_n;
+
+/* Set when a 2xx body overran HTTP_RESP_MAX-1 and was dropped whole; carried
+ * in the next POST as "resp_dropped" and cleared once that POST gets a 2xx. */
+static struct { bool pending; uint32_t bytes; } s_resp_dropped;
+
 static uint8_t s_cmd_seq;
 
 /* --- response capture -------------------------------------------------- */
 
 static char   s_resp[HTTP_RESP_MAX];
-static size_t s_resp_len;
+static size_t s_resp_len;       /* bytes stored in s_resp (<= HTTP_RESP_MAX-1) */
+static size_t s_resp_total;     /* bytes received, incl. those beyond the cap */
 static char   s_resp_sig[65];   /* X-W3PUPS-Sig from the response, if any */
 
 /* Telemetry body scratch (http task only — no lock). File-scope so the
@@ -276,6 +306,42 @@ static void ack_drop_front(int n)
     s_pending_n -= n;
 }
 
+/* Record a refused command for the next POST's "rejected" list. Dedupes by
+ * id; when full drops the oldest (like ack_add). The id is stored cut to
+ * ACK_ID_MAX-1 chars — for "bad_id" that is the point (the server sees the
+ * prefix it can match); every other reason only ever gets an id that fits. */
+static void rej_add(const char *id, const char *reason)
+{
+    char tid[ACK_ID_MAX];
+    snprintf(tid, sizeof(tid), "%s", id);
+    for (int i = 0; i < s_rejected_n; ++i) {
+        if (strcmp(s_rejected[i].id, tid) == 0) {
+            /* Same id again in this window (e.g. several entries without an
+             * id all map to "") — refresh the reason, no second WARN. */
+            ESP_LOGD(TAG, "command id '%s' already rejected: %s", tid, reason);
+            s_rejected[i].reason = reason;
+            return;
+        }
+    }
+    ESP_LOGW(TAG, "rejecting command id '%s': %s", tid, reason);
+    if (s_rejected_n >= REJ_MAX) {
+        memmove(&s_rejected[0], &s_rejected[1], (REJ_MAX - 1) * sizeof(s_rejected[0]));
+        s_rejected_n--;
+    }
+    snprintf(s_rejected[s_rejected_n].id, ACK_ID_MAX, "%s", tid);
+    s_rejected[s_rejected_n].reason = reason;
+    s_rejected_n++;
+}
+
+/* Drop the first `n` rejects (carried in a POST the server accepted). */
+static void rej_drop_front(int n)
+{
+    if (n <= 0) return;
+    if (n > s_rejected_n) n = s_rejected_n;
+    memmove(&s_rejected[0], &s_rejected[n], (s_rejected_n - n) * sizeof(s_rejected[0]));
+    s_rejected_n -= n;
+}
+
 /* --- command → WUPS frame --------------------------------------------- */
 
 /* Encode a complete inner WUPS frame into out[cap]. Returns total bytes. */
@@ -357,6 +423,10 @@ static int build_cmd_payload(const char *cmd, const cJSON *args,
         if (pl_cap < 6) return -1;
         int freq = json_int(args, "freq_hz", 0);
         int dur  = json_int(args, "dur_ms", 0);
+        if (freq < 0) freq = 0;
+        if (freq > 0xFFFF) freq = 0xFFFF;
+        if (dur < 0) dur = 0;
+        if (dur > 0xFFFF) dur = 0xFFFF;
         pl[0] = 1;
         pl[1] = 0;
         pl[2] = (uint8_t)(freq & 0xFF);
@@ -375,8 +445,11 @@ static int build_cmd_payload(const char *cmd, const cJSON *args,
         size_t tl = strlen(text);
         if (tl > 64) tl = 64;
         if (pl_cap < 4 + tl) return -1;
+        int line = json_int(args, "line", 0);
+        if (line < 0) line = 0;
+        if (line > 0xFF) line = 0xFF;
         pl[0] = 1;
-        pl[1] = (uint8_t)json_int(args, "line", 0);
+        pl[1] = (uint8_t)line;
         pl[2] = (uint8_t)tl;
         pl[3] = 0;
         memcpy(pl + 4, text, tl);
@@ -385,6 +458,18 @@ static int build_cmd_payload(const char *cmd, const cJSON *args,
         return (int)(4 + tl);
     }
     return -1;
+}
+
+/* The command names build_cmd_payload() understands — keep the two in sync.
+ * Lets handle_response() tell "unsupported_cmd" from "bad_args". */
+static bool cmd_known(const char *cmd)
+{
+    static const char *const names[] = {
+        "host.shutdown", "host.reset", "power.cycle", "ui.beep", "ui.display_msg",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+        if (strcmp(cmd, names[i]) == 0) return true;
+    return false;
 }
 
 /* Build the WUPS frame for `cmd` and inject it to the RP2040 as a net.downlink
@@ -396,7 +481,7 @@ static bool dispatch_command(const char *cmd, const cJSON *args)
     uint8_t cls = 0, op = 0;
     int plen = build_cmd_payload(cmd, args, &cls, &op, pl, sizeof(pl));
     if (plen < 0) {
-        ESP_LOGW(TAG, "unsupported command '%s' — ignoring", cmd);
+        ESP_LOGW(TAG, "command '%s': payload encoding failed — not dispatched", cmd);
         return false;
     }
 
@@ -546,6 +631,26 @@ static size_t build_body(char *out, size_t cap)
     for (int i = 0; i < s_pending_n; ++i)
         cJSON_AddItemToArray(acks, cJSON_CreateString(s_pending[i]));
 
+    /* rejected — commands refused since the previous POST (never acked), so
+     * the server can drop them. Omitted when empty. */
+    if (s_rejected_n > 0) {
+        cJSON *rej = cJSON_AddArrayToObject(root, "rejected");
+        for (int i = 0; i < s_rejected_n; ++i) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "id",     s_rejected[i].id);
+            cJSON_AddStringToObject(o, "reason", s_rejected[i].reason);
+            cJSON_AddItemToArray(rej, o);
+        }
+    }
+
+    /* resp_dropped — the previous 2xx body exceeded the capture cap and was
+     * discarded whole (no commands applied); tell the server by how much. */
+    if (s_resp_dropped.pending) {
+        cJSON *o = cJSON_AddObjectToObject(root, "resp_dropped");
+        cJSON_AddNumberToObject(o, "bytes", (double)s_resp_dropped.bytes);
+        cJSON_AddNumberToObject(o, "max",   HTTP_RESP_MAX - 1);
+    }
+
     bool ok = cJSON_PrintPreallocated(root, out, (int)cap, false);
     cJSON_Delete(root);
     if (!ok) {
@@ -564,40 +669,65 @@ static void handle_response(const char *json, size_t len,
     if (len == 0) return;
     cJSON *root = cJSON_ParseWithLength(json, len);
     if (!root) {
-        ESP_LOGW(TAG, "response is not valid JSON — ignoring");
+        ESP_LOGW(TAG, "response is not valid JSON (%u B) — ignoring", (unsigned)len);
         return;
     }
     const cJSON *cmds = cJSON_GetObjectItemCaseSensitive(root, "commands");
+    const int n_cmds = cJSON_IsArray(cmds) ? cJSON_GetArraySize(cmds) : 0;
     /* Commands are only honoured if the response carries a valid signature
      * over (request nonce || body). This authenticates the command channel
      * independently of TLS, so plain HTTP cannot be used to inject commands.
      * No commands → no verification needed (nothing to execute). */
-    if (cJSON_IsArray(cmds) && cJSON_GetArraySize(cmds) > 0 &&
+    if (n_cmds > 0 &&
         !verify_response_sig(key, key_len, req_nonce, json, len, resp_sig)) {
         ESP_LOGW(TAG, "response signature missing/invalid — ignoring %d command(s) "
                       "(is the server signing X-W3PUPS-Sig with the device secret?)",
-                 cJSON_GetArraySize(cmds));
+                 n_cmds);
         cJSON_Delete(root);
         return;
     }
-    if (cJSON_IsArray(cmds)) {
-        const cJSON *c = NULL;
-        cJSON_ArrayForEach(c, cmds) {
-            const cJSON *jid  = cJSON_GetObjectItemCaseSensitive(c, "id");
-            const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(c, "cmd");
-            if (!cJSON_IsString(jid) || !cJSON_IsString(jcmd)) continue;
-            const cJSON *args = cJSON_GetObjectItemCaseSensitive(c, "args");
+    if (n_cmds > CMDS_PER_RESP_MAX)
+        ESP_LOGW(TAG, "response carried %d commands, processing the first %d — "
+                      "server should send at most %d per response",
+                 n_cmds, CMDS_PER_RESP_MAX, CMDS_PER_RESP_MAX);
+    /* Entries past CMDS_PER_RESP_MAX are neither applied nor acked; the
+     * server re-sends them next cadence (see "Receiver limits"). */
+    int idx = 0;
+    for (const cJSON *c = (n_cmds > 0) ? cmds->child : NULL;
+         c && idx < CMDS_PER_RESP_MAX; c = c->next, ++idx) {
+        const cJSON *jid  = cJSON_GetObjectItemCaseSensitive(c, "id");
+        const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(c, "cmd");
+        const cJSON *args = cJSON_GetObjectItemCaseSensitive(c, "args");
 
-            if (exec_seen(jid->valuestring)) {
-                /* Already applied — the server just hasn't seen our ack yet.
-                 * Re-ack, do NOT re-execute (idempotent by id, HTTP-1). */
-                ack_add(jid->valuestring);
-                continue;
-            }
-            if (dispatch_command(jcmd->valuestring, args)) {
-                exec_add(jid->valuestring);
-                ack_add(jid->valuestring);
-            }
+        /* id: a string of 1..ACK_ID_MAX-1 chars; anything else → bad_id (with
+         * its first ACK_ID_MAX-1 chars when present), never cut to another id. */
+        const char *id = cJSON_IsString(jid) ? jid->valuestring : "";
+        size_t idl = strlen(id);
+        if (idl == 0 || idl >= ACK_ID_MAX) {
+            rej_add(id, "bad_id");
+            continue;
+        }
+        if (exec_seen(id)) {
+            /* Already applied — the server just hasn't seen our ack yet.
+             * Re-ack, do NOT re-execute (idempotent by id, HTTP-1). Checked
+             * before the payload shape: what ran is acked, whatever the
+             * re-send looks like. */
+            ack_add(id);
+            continue;
+        }
+        if (!cJSON_IsString(jcmd)) {
+            rej_add(id, "bad_args");
+            continue;
+        }
+        if (!cmd_known(jcmd->valuestring)) {
+            rej_add(id, "unsupported_cmd");
+            continue;
+        }
+        if (dispatch_command(jcmd->valuestring, args)) {
+            exec_add(id);
+            ack_add(id);
+        } else {
+            rej_add(id, "bad_args");
         }
     }
     cJSON_Delete(root);
@@ -613,6 +743,9 @@ static esp_err_t resp_evt(esp_http_client_event_t *evt)
             snprintf(s_resp_sig, sizeof(s_resp_sig), "%s", evt->header_value);
         }
     } else if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
+        /* Count every byte; store at most HTTP_RESP_MAX-1. post_once() drops
+         * the whole response when s_resp_total exceeds what was stored. */
+        s_resp_total += (size_t)evt->data_len;
         size_t room = HTTP_RESP_MAX - 1 - s_resp_len;
         if (room) {
             size_t n = (size_t)evt->data_len < room ? (size_t)evt->data_len : room;
@@ -624,7 +757,8 @@ static esp_err_t resp_evt(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-/* One POST cycle. Returns the count of acks carried (to drop on success), or
+/* One POST cycle. Returns 0 when the server answered 2xx (the carried acks /
+ * rejects / resp_dropped are dropped here, then the response is applied), or
  * -1 on a transport/auth failure (nothing dropped, retried next cadence). */
 static int post_once(void)
 {
@@ -654,7 +788,11 @@ static int post_once(void)
     const uint8_t *key = (const uint8_t *)secret;
     const size_t key_len = strlen(secret);
 
-    int acks_in_body = s_pending_n;
+    /* Snapshot what this body carries: a 2xx drops exactly that, never what
+     * handle_response() appends afterwards. */
+    int  acks_in_body    = s_pending_n;
+    int  rej_in_body     = s_rejected_n;
+    bool dropped_in_body = s_resp_dropped.pending;
     size_t body_len = build_body(s_body, sizeof(s_body));
     if (body_len == 0) return -1;
 
@@ -680,6 +818,7 @@ static int post_once(void)
     }
 
     s_resp_len = 0;
+    s_resp_total = 0;
     s_resp[0] = '\0';
     s_resp_sig[0] = '\0';
 
@@ -689,6 +828,10 @@ static int post_once(void)
         .timeout_ms    = HTTP_TIMEOUT_MS,
         .event_handler = resp_evt,
         .crt_bundle_attach = is_https ? esp_crt_bundle_attach : NULL,
+        /* A 3xx is logged, not followed: the signed POST must land on the
+         * configured URL (a redirect would re-POST elsewhere or degrade to a
+         * GET). Point the device at the final URL instead. */
+        .disable_auto_redirect = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) {
@@ -707,22 +850,51 @@ static int post_once(void)
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "POST failed: %s (url=%s)", esp_err_to_name(err), url);
-        return -1;
-    }
-    ESP_LOGI(TAG, "POST %d (%u B body, %u B resp, acks=%d)",
-             status, (unsigned)body_len, (unsigned)s_resp_len, acks_in_body);
-
-    if (status < 200 || status >= 300) {
+        /* A 401 without WWW-Authenticate fails perform() with ESP_ERR_NOT_SUPPORTED
+         * before the body is read; the status is still known — keep the hint.
+         * status == 0 means no response line at all (DNS/TCP/TLS failure). */
+        if (status > 0)
+            ESP_LOGW(TAG, "POST failed: %s (HTTP %d, url=%s)", esp_err_to_name(err), status, url);
+        else
+            ESP_LOGW(TAG, "POST failed: %s (no response, url=%s)", esp_err_to_name(err), url);
         if (status == 401) ESP_LOGW(TAG, "401 — signature/identity rejected");
         return -1;
     }
+    ESP_LOGI(TAG, "POST %d (%u B body, %u B resp, acks=%d, rejected=%d)",
+             status, (unsigned)body_len, (unsigned)s_resp_total,
+             acks_in_body, rej_in_body);
 
-    /* 2xx: the server accepted the acks we carried; drop them. Then apply any
-     * commands it returned (verified against the request nonce + secret). */
+    if (status < 200 || status >= 300) {
+        if (status >= 300 && status < 400)
+            ESP_LOGW(TAG, "redirect %d not followed — point the device at the final "
+                          "URL (redirects are not supported)", status);
+        else if (status == 401)
+            ESP_LOGW(TAG, "401 — signature/identity rejected");
+        else
+            ESP_LOGW(TAG, "server answered %d — nothing dropped, retried next cadence", status);
+        return -1;
+    }
+
+    /* 2xx: the server saw everything this body carried — drop those acks and
+     * rejects and clear the resp_dropped report BEFORE applying the response,
+     * so nothing handle_response() appends is mistaken for already delivered. */
     s_last_success_s = (uint32_t)(esp_timer_get_time() / 1000000);
-    handle_response(s_resp, s_resp_len, key, key_len, nonce_hex, s_resp_sig);
-    return acks_in_body;
+    ack_drop_front(acks_in_body);
+    rej_drop_front(rej_in_body);
+    if (dropped_in_body) s_resp_dropped.pending = false;
+
+    if (s_resp_total > HTTP_RESP_MAX - 1) {
+        /* Overran the capture buffer: the JSON is truncated and unverifiable, so
+         * nothing is applied. Reported so the server shrinks its replies. */
+        ESP_LOGW(TAG, "response too large: %u B received, cap %u B — dropped, no "
+                      "commands applied (server must keep responses <= %u B)",
+                 (unsigned)s_resp_total, (unsigned)(HTTP_RESP_MAX - 1), (unsigned)(HTTP_RESP_MAX - 1));
+        s_resp_dropped.pending = true;
+        s_resp_dropped.bytes   = (uint32_t)s_resp_total;
+    } else {
+        handle_response(s_resp, s_resp_len, key, key_len, nonce_hex, s_resp_sig);
+    }
+    return 0;
 }
 
 /* --- task -------------------------------------------------------------- */
@@ -733,8 +905,7 @@ static void http_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(HTTP_SETTLE_MS));
     ESP_LOGI(TAG, "HTTP control-mode backend running (period=%d ms)", HTTP_PERIOD_MS);
     for (;;) {
-        int dropped = post_once();
-        if (dropped > 0) ack_drop_front(dropped);
+        (void)post_once();      /* 2xx bookkeeping happens inside post_once() */
         vTaskDelay(pdMS_TO_TICKS(HTTP_PERIOD_MS));
     }
 }
