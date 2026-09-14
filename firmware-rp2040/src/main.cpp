@@ -253,7 +253,7 @@ constexpr unsigned long INFO_TTL_MS = 60UL * 1000UL;
 // Firmware version, reported in system.ping RESP / system.hello. The string
 // rides the optional pong tail (protocol.h); the u16 stays as the coarse
 // legacy field. Bump on release.
-#define FW_VERSION_STR "rp2040:1.2.3"
+#define FW_VERSION_STR "rp2040:1.2.4"
 #define FW_VERSION_U16 ((uint16_t)((1u << 8) | 2u))   /* coarse 1.2 */
 
 // UPS-data staleness alert. CH32X pushes power.status at 1 Hz; when that
@@ -1420,7 +1420,7 @@ void wups_on_local_frame(uint8_t inbound_port, const WupsFrame& f) {
   }
 
   // ui.local_reset → the ESP32 is doing a device factory reset and wants the
-  // RP2040-local OLED settings wiped to defaults too (brightest, sound on),
+  // RP2040-local OLED settings wiped to defaults too (dimmest, sound on),
   // so the unit comes back fully "as-new". No payload.
   if (f.cls == WUPS_CLASS_UI && f.op == WUPS_OP_UI_LOCAL_RESET) {
     ui_settings_reset_defaults();

@@ -8,14 +8,22 @@
  * mute gate lives entirely in this module. */
 static constexpr uint8_t BUZZER_PIN = 15;
 
-/* SSD1306 contrast per brightness level. Level 0 stays usable (not blanked);
- * level 3 is the panel's max. */
+/* SSD1306 contrast per brightness level. Level 0 stays usable (not blanked)
+ * and is the factory default (burn-in mitigation); level 5 is the max. */
 static const uint8_t kContrast[UI_BRIGHTNESS_LEVELS] = { 5, 10, 15, 32, 64, 128 };
 
 /* Persisted blob. `magic`+`version` guard against reading uninitialised or
- * stale-layout flash. Sound defaults ON, brightness defaults to brightest. */
+ * stale-layout flash. Sound defaults ON, brightness defaults to dimmest.
+ *
+ * Version history (layout unchanged so far — the version also carries
+ * one-shot migrations of the stored values):
+ *   1  rp2040 <= 1.2.3: brightness default was level 3 ("Lvl 4/6").
+ *   2  rp2040 1.2.4: default lowered to level 0 for burn-in mitigation; a
+ *      v1 blob is migrated in place — brightness forced to the new default,
+ *      sound preserved (the fleet never set brightness deliberately, owner
+ *      decision 2026-09-15). */
 #define UI_SETTINGS_MAGIC   0x57555053UL  /* 'W''U''P''S' */
-#define UI_SETTINGS_VERSION 1
+#define UI_SETTINGS_VERSION 2
 
 struct StoredSettings {
   uint32_t magic;
@@ -37,6 +45,16 @@ void ui_settings_begin(void) {
     s = tmp;
     if (s.brightness >= UI_BRIGHTNESS_LEVELS) s.brightness = UI_BRIGHTNESS_DEFAULT;
     s.sound = s.sound ? 1 : 0;
+  } else if (tmp.magic == UI_SETTINGS_MAGIC && tmp.version == 1) {
+    /* v1 -> v2 migration: same layout, only the brightness policy changed.
+     * Keep the user's sound setting, drop brightness to the new default and
+     * persist once so the next boot takes the fast path. */
+    s.version    = UI_SETTINGS_VERSION;
+    s.brightness = UI_BRIGHTNESS_DEFAULT;
+    s.sound      = tmp.sound ? 1 : 0;
+    s.reserved   = 0;
+    EEPROM.put(0, s);
+    EEPROM.commit();
   } else {
     /* First boot or different layout: seed defaults into flash so the next
      * boot reads a valid blob. */
@@ -79,7 +97,7 @@ void ui_settings_set_sound_enabled(bool enabled) {
 }
 
 void ui_settings_reset_defaults(void) {
-  /* Same values as the static initializer / first-boot seed: brightest,
+  /* Same values as the static initializer / first-boot seed: dimmest,
    * sound on. Persist immediately so the defaults survive the reboot. */
   s.magic      = UI_SETTINGS_MAGIC;
   s.version    = UI_SETTINGS_VERSION;

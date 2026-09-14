@@ -21,9 +21,11 @@
 
 /* Brightness is a small set of discrete levels (a 2-button menu can only
  * cycle, not slide). Level index 0..UI_BRIGHTNESS_LEVELS-1 maps to an
- * SSD1306 contrast value in ui_settings.cpp. Default = brightest. */
+ * SSD1306 contrast value in ui_settings.cpp. Default = level 0 ("Lvl 1/6" in
+ * the menu, contrast 5): the panel runs 24/7 and higher contrast accelerates
+ * OLED burn-in (owner decision 2026-09-14). */
 #define UI_BRIGHTNESS_LEVELS  6
-#define UI_BRIGHTNESS_DEFAULT  (UI_BRIGHTNESS_LEVELS - 3)
+#define UI_BRIGHTNESS_DEFAULT  0
 
 /* Load settings from flash (or seed defaults on first boot / bad magic).
  * Call once in setup() before the first beep and before applying brightness. */
@@ -45,7 +47,7 @@ void ui_settings_set_sound_enabled(bool enabled);
 
 /* Restore brightness + sound to factory defaults and persist. Triggered by
  * the ESP32's WUPS_OP_UI_LOCAL_RESET as part of a device factory reset, so a
- * reset unit comes back fully "as-new" (brightest, sound on). */
+ * reset unit comes back fully "as-new" (dimmest, sound on). */
 void ui_settings_reset_defaults(void);
 
 /* Buzzer helper that honours ui_settings_sound_enabled(). All firmware
