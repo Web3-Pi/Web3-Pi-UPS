@@ -22,9 +22,9 @@
 esp_err_t mqtt_client_start(void);
 
 /*
- * Publish a message via the active client. Wraps esp_mqtt_client_publish
- * while connected; when the link is down (or the publish loses a race with
- * a disconnect) the frame is parked in the esp-mqtt RAM outbox instead
+ * Publish a message via the active client. QoS 1/2 are admitted once to the
+ * SDK outbox; the SDK owns transmission/retry. Connected QoS 0 uses publish;
+ * when the link is down (or a QoS 0 send fails) the frame is parked instead
  * (MISC-9) and flushed automatically on reconnect. The outbox is bounded
  * (32 KB) and entries expire after CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS.
  * Returns msg_id (>= 0) on publish or park, -1 on error, -2 outbox full.

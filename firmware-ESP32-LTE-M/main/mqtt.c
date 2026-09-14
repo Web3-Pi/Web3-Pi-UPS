@@ -4,6 +4,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
+#include <stdatomic.h>
 
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
@@ -22,7 +24,9 @@
  * 35 chars + NUL. 48 leaves room for spec drift. */
 #define TOPIC_BUF_LEN 48
 
-static esp_mqtt_client_handle_t s_client;
+/* Published only after registration. Once published, the object lives until
+ * reboot: start/revive reuse it and never destroy it under producers. */
+static _Atomic(esp_mqtt_client_handle_t) s_client;
 
 /* MISC-9: link state drives publish-vs-enqueue in mqtt_publish_raw(). Set
  * from the esp-mqtt event task; read from the wups_link task. */
@@ -89,7 +93,7 @@ esp_err_t mqtt_client_revive(void)
     return esp_mqtt_client_start(s_client);
 }
 
-static void publish_identify(void)
+static void publish_identify(esp_mqtt_client_handle_t client)
 {
     /* {"imei":"...","fw":"...","hw":"..."} — retained, QoS 1.
      * Backend uses this for anti-clone IMEI lock (ADR-0002) and to populate
@@ -104,7 +108,7 @@ static void publish_identify(void)
         ESP_LOGW(TAG, "identify JSON truncated, skipping publish");
         return;
     }
-    int rc = esp_mqtt_client_publish(s_client, s_topic_identify, body, n,
+    int rc = esp_mqtt_client_publish(client, s_topic_identify, body, n,
                                      /*qos=*/1, /*retain=*/1);
     ESP_LOGI(TAG, "identify published rc=%d body=%s", rc, body);
 }
@@ -125,17 +129,17 @@ static void log_event(int32_t event_id, esp_mqtt_event_handle_t evt)
         /* Subscribe to the per-device downlink command topic. The broker
          * ACL (once strict mode is on) only allows the device to subscribe
          * to its own c/{iccid}/# subtree. */
-        esp_mqtt_client_subscribe(s_client, s_topic_cmd_req, 1);
+        esp_mqtt_client_subscribe(evt->client, s_topic_cmd_req, 1);
         ESP_LOGI(TAG, "subscribed: %s (qos1)", s_topic_cmd_req);
 
         /* Status retained "online": broker remembers we're up so a late
          * subscriber doesn't have to wait for the next message. */
-        esp_mqtt_client_publish(s_client, s_topic_status,
+        esp_mqtt_client_publish(evt->client, s_topic_status,
                                 k_status_online, sizeof(k_status_online) - 1,
                                 /*qos=*/1, /*retain=*/1);
 
         /* Identify retained: IMEI/fw/hw triple for the anti-clone check. */
-        publish_identify();
+        publish_identify(evt->client);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -222,8 +226,9 @@ esp_err_t mqtt_client_start(void)
     /* Re-entrant for the supervisor's failed-start retry (0.8.7): if init
      * already succeeded but start failed, just try starting again — never
      * re-init (that would leak the old handle and its registration). */
-    if (s_client) {
-        return esp_mqtt_client_start(s_client);
+    esp_mqtt_client_handle_t client = atomic_load_explicit(&s_client, memory_order_acquire);
+    if (client) {
+        return esp_mqtt_client_start(client);
     }
     esp_log_level_set("esp-tls", ESP_LOG_VERBOSE);
     esp_log_level_set("esp-tls-mbedtls", ESP_LOG_VERBOSE);
@@ -289,13 +294,13 @@ esp_err_t mqtt_client_start(void)
         .task.stack_size     = 12 * 1024,
     };
 
-    s_client = esp_mqtt_client_init(&cfg);
-    if (!s_client) {
+    client = esp_mqtt_client_init(&cfg);
+    if (!client) {
         ESP_LOGE(TAG, "esp_mqtt_client_init failed");
         return ESP_FAIL;
     }
 
-    esp_err_t err = esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID,
+    esp_err_t err = esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID,
                                                    mqtt_event_handler, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "register_event failed: %s", esp_err_to_name(err));
@@ -304,36 +309,39 @@ esp_err_t mqtt_client_start(void)
          * that later connects would be invisible to the whole firmware
          * (s_connected never set, no subscribe) — destroy and let the
          * supervisor's retry rebuild from scratch. */
-        esp_mqtt_client_destroy(s_client);
-        s_client = NULL;
+        esp_mqtt_client_destroy(client);
         return err;
     }
 
+    atomic_store_explicit(&s_client, client, memory_order_release);
     ESP_LOGI(TAG, "starting iccid=%s broker=%s", iccid, MQTT_BROKER_URI);
-    return esp_mqtt_client_start(s_client);
+    return esp_mqtt_client_start(client);
 }
 
 int mqtt_publish_raw(const char *topic, const void *payload, size_t payload_len,
                      int qos, int retain)
 {
-    if (!s_client) {
+    esp_mqtt_client_handle_t client = atomic_load_explicit(&s_client, memory_order_acquire);
+    if (!client || !topic || !topic[0] || (!payload && payload_len) ||
+        payload_len > INT_MAX || qos < 0 || qos > 2 || retain < 0 || retain > 1) {
         return -1;
     }
-    if (s_connected) {
-        int rc = esp_mqtt_client_publish(s_client, topic,
+    if (qos == 0 && s_connected) {
+        int rc = esp_mqtt_client_publish(client, topic,
                                          (const char *)payload, (int)payload_len,
                                          qos, retain);
         if (rc >= 0) {
             return rc;
         }
-        /* Race: DISCONNECTED landed between the flag check and the publish —
-         * fall through and park the frame in the outbox instead. */
+        /* QoS 0 publish has no outbox insertion, so a failed direct send
+         * may be parked once. QoS 1/2 always take the single enqueue path:
+         * SDK publish inserts those before writing, even when write fails. */
     }
     /* MISC-9: link down — enqueue into the esp-mqtt RAM outbox (store=true)
      * so the client flushes it on reconnect instead of dropping. Bounded by
      * .outbox.limit; entries expire after CONFIG_MQTT_OUTBOX_EXPIRED_TIMEOUT_MS.
      * Covers telemetry/events/cmd-responses generated during LTE dips. */
-    int rc = esp_mqtt_client_enqueue(s_client, topic,
+    int rc = esp_mqtt_client_enqueue(client, topic,
                                      (const char *)payload, (int)payload_len,
                                      qos, retain, /*store=*/true);
     if (rc >= 0) {
