@@ -20,6 +20,15 @@ traffic can use the reserve; at 32 KiB, both wait. Clearing pressure preserves
 retry deadlines and FIFO. Both full (`-2`) and allocation failure (`-1`) leave
 messages pending without duplicate SDK admission or same-class overtaking.
 
+The `probe` case publishes a complete cached net.status v2 frame and delivers
+PUBACK inside SDK enqueue before it returns. It checks the actual ARMING,
+packet-result and health-admission sequence, rejects unrelated and pre-reconnect
+ACKs, and requires a new proof after OTA. With the outbox full and then the owner
+held at its SDK boundary, the independent monitor reaches admission failure at
+the exact virtual 60-second deadline without a producer or diagnostics call
+advancing the state first. This case uses virtual time, not another wall-clock
+15-second hold.
+
 The 100 ms ceiling is a host regression threshold, not a measured ESP32 latency
 guarantee. The UART ACK check is a synthetic next RX-dispatch step; this harness
 does not execute the real UART driver or `wups_rx`. Its controlled monotonic
@@ -36,7 +45,7 @@ to `undefined` or an empty string explicitly on hosts without working ASan.
 `MQTT_TEST_SDK_STALL_MS=0` permits a faster development pass; final regression
 evidence should use the default full 15-second hold. No silent fallback occurs.
 `MQTT_TEST_RUNTIME_CASES=pressure` selects one case; comma-separated names select
-a subset. Omit it to run the complete seven-case suite.
+a subset. Omit it to run the complete eight-case suite.
 
 ## Optional local Linux runner
 
@@ -52,5 +61,6 @@ docker run --rm --network none --read-only --cap-drop ALL \
 
 The mount is read-only, there is no runtime network, and compiled tests live in
 the disposable executable `/tmp`. Building the image downloads public compiler
-packages. The 2026-09-14 Linux GCC 14.2 ASan+UBSan runs passed all seven runtime cases,
-including a real 15,000 ms hold and the separately added SDK pressure case. This is host evidence, not an ESP32 timing result.
+packages. The 2026-09-14 Linux GCC 14.2 ASan+UBSan runs passed all eight runtime cases,
+including a real 15,000 ms hold and the separately added SDK pressure and probe
+cases. This is host evidence, not an ESP32 timing result.

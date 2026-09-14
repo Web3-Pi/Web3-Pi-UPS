@@ -11,6 +11,7 @@
 #include <time.h>
 #include "mqtt.c"
 #include "mqtt_sdk_adapter.h"
+#include "../../common/protocol.h"
 
 struct host_task {
     pthread_t thread;
@@ -40,6 +41,8 @@ static atomic_int host_start_calls, host_reconnect_calls, host_subscribe_calls;
 static atomic_int host_revive_calls, host_restart_hooks;
 static atomic_int host_outbox_bytes, host_enqueue_calls, host_enqueue_failures;
 static atomic_int host_enqueue_failure_result = -2;
+static atomic_bool host_outbox_block, host_early_probe_ack;
+static atomic_int host_probe_enqueue_calls, host_last_probe_id, host_monitor_polls;
 static atomic_int host_owner_idle;
 static atomic_int host_task_creates, host_task_deletes, host_queue_creates, host_queue_deletes;
 static atomic_int host_queue_failures, host_task_fail_at, host_register_failures, host_start_failures;
@@ -162,6 +165,8 @@ void vTaskDelete(TaskHandle_t task)
 void vTaskDelay(TickType_t ticks)
 {
     (void)ticks; assert(!host_critical_depth);
+    if (host_current_task && strcmp(host_current_task->name, "mqtt_health") == 0)
+        atomic_fetch_add(&host_monitor_polls, 1);
     if (atomic_load(&host_stopping)) pthread_exit(NULL);
     host_pause();
 }
@@ -286,7 +291,11 @@ esp_err_t esp_mqtt_client_disconnect(esp_mqtt_client_handle_t client)
     esp_mqtt_event_t e = {0}; host_event(MQTT_EVENT_DISCONNECTED, &e); return ESP_OK;
 }
 int esp_mqtt_client_get_outbox_size(esp_mqtt_client_handle_t client)
-{ host_sdk_boundary(); assert(client->marker == 0xface); return atomic_load(&host_outbox_bytes); }
+{
+    host_sdk_boundary(); assert(client->marker == 0xface);
+    if (atomic_load(&host_outbox_block)) host_sdk_wait();
+    return atomic_load(&host_outbox_bytes);
+}
 int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t client, const char *topic, int qos)
 {
     (void)topic; host_sdk_boundary(); assert(client->marker == 0xface && qos == 1);
@@ -312,7 +321,24 @@ int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t client, const char *topic,
     host_records[index].len = (size_t)len;
     host_records[index].qos = qos; host_records[index].retain = retain;
     pthread_mutex_unlock(&host_records_mutex);
-    return qos ? ++host_next_packet_id : 0;
+    int packet_id = qos ? ++host_next_packet_id : 0;
+    if (qos == 1 && strcmp(topic, s_topic_telemetry) == 0) {
+        atomic_store(&host_last_probe_id, packet_id);
+        atomic_fetch_add(&host_probe_enqueue_calls, 1);
+        if (atomic_load(&host_early_probe_ack)) {
+            /* This is the real runtime's probe SDK call before it has its ID.
+             * An unrelated early PUBACK must not prove health. Matching ACK
+             * also remains buffered until enqueue returns and is admitted. */
+            portENTER_CRITICAL(&s_lock); assert(s_guard.probe_state == MQTT_PROBE_ARMING);
+            portEXIT_CRITICAL(&s_lock);
+            esp_mqtt_event_t ack = {.msg_id = packet_id + 1000};
+            host_event(MQTT_EVENT_PUBLISHED, &ack);
+            mqtt_health_snapshot_t health; mqtt_get_health(&health); assert(!health.proof_fresh);
+            ack.msg_id = packet_id; host_event(MQTT_EVENT_PUBLISHED, &ack);
+            mqtt_get_health(&health); assert(!health.proof_fresh && !health.probe_admitted);
+        }
+    }
+    return packet_id;
 }
 static bool host_recorded(const char *topic)
 {
@@ -638,6 +664,105 @@ static void test_pressure(void)
     host_shutdown();
     puts("PASS actual runtime pressure: 24KiB preserves critical reserve; 32KiB defers all; cleared pressure and SDK full/OOM retries preserve FIFO, metrics and exactly-once SDK admission");
 }
+static bool host_has_proof(void)
+{
+    mqtt_health_snapshot_t health; mqtt_get_health(&health); return health.proof_fresh;
+}
+static mqtt_health_failure_t host_observed_failure(void)
+{
+    /* Inspect without polling: this must have been advanced by a real runtime
+     * task, not by the test's diagnostics accessor. */
+    portENTER_CRITICAL(&s_lock); mqtt_health_failure_t failure = s_health.failure;
+    portEXIT_CRITICAL(&s_lock); return failure;
+}
+static void host_publish_net_frame(void)
+{
+    wups_net_status_v2_t status = {.version = 2, .state = 5, .rssi_dBm = -70};
+    uint8_t frame[WUPS_FRAMING_BYTES + sizeof(status)] = {
+        WUPS_SYNC1, WUPS_SYNC2, WUPS_ADDR_BROADCAST, WUPS_ADDR_ESP32,
+        WUPS_CLASS_NET, WUPS_OP_NET_STATUS, WUPS_FLAG_EVENT, 1, sizeof(status), 0
+    };
+    memcpy(frame + WUPS_HEADER_BYTES, &status, sizeof(status));
+    uint8_t a = 0, b = 0;
+    for (size_t i = 2; i < WUPS_HEADER_BYTES + sizeof(status); ++i) { a += frame[i]; b += a; }
+    frame[sizeof(frame) - 4] = a; frame[sizeof(frame) - 3] = b;
+    frame[sizeof(frame) - 2] = WUPS_END1; frame[sizeof(frame) - 1] = WUPS_END2;
+    mqtt_publish_net_status(frame, sizeof(frame));
+    memset(frame, 0xcc, sizeof(frame)); /* cache and queued snapshot own copies */
+}
+static void test_probe(void)
+{
+    assert(mqtt_runtime_init() == ESP_OK && mqtt_client_start() == ESP_OK);
+    WAIT_FOR(host_recorded("t/0000000000000000000/identify")); host_synchronize_owner();
+    mqtt_health_snapshot_t health; mqtt_get_health(&health);
+    assert(health.connected && !health.proof_fresh && health.probe_due);
+    assert(atomic_load(&host_probe_enqueue_calls) == 0);
+    esp_mqtt_event_t event = {.msg_id = 12345};
+    host_event(MQTT_EVENT_PUBLISHED, &event); assert(!host_has_proof());
+
+    atomic_store(&host_early_probe_ack, true); host_publish_net_frame();
+    WAIT_FOR(host_has_proof()); host_synchronize_owner();
+    assert(atomic_load(&host_probe_enqueue_calls) == 1);
+    int old_id = atomic_load(&host_last_probe_id);
+    mqtt_get_health(&health);
+    assert(!health.probe_pending && health.last_ack_ms == 1000 && health.generation == 1);
+    pthread_mutex_lock(&host_records_mutex);
+    bool valid_frame = false;
+    for (int i = 0; i < host_record_count; ++i) {
+        if (host_records[i].qos == 1 && strcmp(host_records[i].topic, s_topic_telemetry) == 0) {
+            assert(host_records[i].len == WUPS_FRAMING_BYTES + sizeof(wups_net_status_v2_t));
+            assert(host_records[i].payload[0] == WUPS_SYNC1 && host_records[i].payload[10] == 2);
+            assert(host_records[i].retain == 0); valid_frame = true;
+        }
+    }
+    pthread_mutex_unlock(&host_records_mutex); assert(valid_frame);
+
+    atomic_store(&host_early_probe_ack, false);
+    host_event(MQTT_EVENT_DISCONNECTED, &event); host_event(MQTT_EVENT_CONNECTED, &event);
+    assert(!host_has_proof());
+    WAIT_FOR(atomic_load(&host_probe_enqueue_calls) == 2); host_synchronize_owner();
+    int new_id = atomic_load(&host_last_probe_id); assert(new_id != old_id);
+    mqtt_get_health(&health); assert(health.generation == 2 && health.probe_admitted);
+    event.msg_id = old_id; host_event(MQTT_EVENT_PUBLISHED, &event); assert(!host_has_proof());
+    event.msg_id = new_id + 1000; host_event(MQTT_EVENT_PUBLISHED, &event); assert(!host_has_proof());
+    event.msg_id = new_id; host_event(MQTT_EVENT_PUBLISHED, &event); assert(host_has_proof());
+
+    mqtt_ota_state_changed(true); assert(!host_has_proof());
+    event.msg_id = new_id; host_event(MQTT_EVENT_PUBLISHED, &event); assert(!host_has_proof());
+    host_synchronize_owner(); assert(atomic_load(&host_probe_enqueue_calls) == 2);
+    mqtt_get_health(&health); assert(health.ota_active && !health.probe_due);
+    mqtt_ota_state_changed(false); assert(!host_has_proof());
+    WAIT_FOR(atomic_load(&host_probe_enqueue_calls) == 3); host_synchronize_owner();
+    event.msg_id = new_id; host_event(MQTT_EVENT_PUBLISHED, &event); assert(!host_has_proof());
+    new_id = atomic_load(&host_last_probe_id);
+    event.msg_id = new_id; host_event(MQTT_EVENT_PUBLISHED, &event); assert(host_has_proof());
+
+    mqtt_ota_state_changed(true); atomic_store(&host_outbox_bytes, 32 * 1024);
+    mqtt_ota_state_changed(false);
+    host_synchronize_owner();
+    mqtt_get_health(&health);
+    assert(health.probe_due && !health.probe_pending && !health.probe_admitted);
+    assert(atomic_load(&host_probe_enqueue_calls) == 3);
+    mqtt_get_health(&health); uint64_t deadline = health.probe_deadline_ms;
+    assert(deadline == atomic_load(&host_clock_ms) + 60000 && !health.proof_fresh);
+    /* Hold the owner before SDK admission while reported outbox is full.
+     * Only the separate monitor can advance the deadline during this hold. */
+    pthread_mutex_lock(&host_sdk_mutex); host_sdk_block = true; pthread_mutex_unlock(&host_sdk_mutex);
+    atomic_store(&host_sdk_entered, false); atomic_store(&host_outbox_block, true); wake_owner();
+    WAIT_FOR(atomic_load(&host_sdk_entered));
+    assert(atomic_load(&host_probe_enqueue_calls) == 3);
+    int monitor_before = atomic_load(&host_monitor_polls);
+    atomic_store(&host_clock_ms, deadline - 1);
+    WAIT_FOR(atomic_load(&host_monitor_polls) > monitor_before);
+    assert(host_observed_failure() == MQTT_HEALTH_FAILURE_NONE);
+    atomic_store(&host_clock_ms, deadline);
+    WAIT_FOR(host_observed_failure() == MQTT_HEALTH_FAILURE_ADMISSION_TIMEOUT);
+    mqtt_get_health(&health);
+    assert(health.connected && health.degraded && !health.proof_fresh && !health.probe_admitted);
+    assert(health.worker_busy && health.worker_stalled && atomic_load(&host_probe_enqueue_calls) == 3);
+    host_shutdown();
+    puts("PASS actual runtime probes: CONNECT/unrelated/old PUBACK cannot prove health; cached QoS1 frame and early matching PUBACK establish proof only after admission; OTA requires fresh proof; independent monitor expires blocked admission at 60s");
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -648,6 +773,7 @@ int main(int argc, char **argv)
     else if (strcmp(argv[1], "backoff") == 0) test_backoff();
     else if (strcmp(argv[1], "revive") == 0) test_revive();
     else if (strcmp(argv[1], "pressure") == 0) test_pressure();
+    else if (strcmp(argv[1], "probe") == 0) test_probe();
     else assert(false);
     return 0;
 }
