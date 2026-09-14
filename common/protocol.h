@@ -612,7 +612,8 @@ typedef struct WUPS_PACKED {
  *     ("! MODEM / <text> / no uplink") with the error-sound + 10 s reminder
  *     buzzer pattern, button dismiss + 10 min cooldown, 5 min stale TTL;
  *     text capped at 23 chars on the RP2040 (the ESP32 senders allow 24 on
- *     the wire — keep alerts <= 23).
+ *     the wire — keep alerts <= 23). Exception: the OTA text "FW UPDATE"
+ *     drops the "no uplink" line and is silent (RP2040 FW_UPDATE_BANNER_BEEP).
  *   - any other src (RPi host service, HTTP or MQTT downlink — all arrive
  *     with src = RPI): a plain info notice, 40 visible chars (4 rows x 10
  *     cols, '\n' breaks a row; rows break at column 10 with no word wrap,

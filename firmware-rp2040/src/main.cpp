@@ -221,6 +221,12 @@ constexpr unsigned long ALERT_DISMISS_COOLDOWN_MS = 10UL * 60UL * 1000UL;
 constexpr unsigned long ALERT_STALE_TTL_MS        = 5UL * 60UL * 1000UL;
 char netAlertDismissedText[24] = {0};     // [0]=='\0' → no dismissal in effect
 unsigned long netAlertDismissedAtMs = 0;
+// The ESP32 OTA (fw_ota.c ota_ui_banner) raises "FW UPDATE" through the same
+// layer. It is progress, not a failure: rendered without the "no uplink" line,
+// and silent while FW_UPDATE_BANNER_BEEP is 0 (set to 1 to restore the
+// error-sound + 10 s reminder pattern once the firmware is final).
+constexpr const char *FW_UPDATE_BANNER_TEXT = "FW UPDATE";
+#define FW_UPDATE_BANNER_BEEP 0
 
 // --- Info notice (ui.display_msg from a non-ESP32 sender) ------------------
 // ui.display_msg is dispatched on the frame's SRC. Only the ESP32 (modem
@@ -247,7 +253,7 @@ constexpr unsigned long INFO_TTL_MS = 60UL * 1000UL;
 // Firmware version, reported in system.ping RESP / system.hello. The string
 // rides the optional pong tail (protocol.h); the u16 stays as the coarse
 // legacy field. Bump on release.
-#define FW_VERSION_STR "rp2040:1.2.2"
+#define FW_VERSION_STR "rp2040:1.2.3"
 #define FW_VERSION_U16 ((uint16_t)((1u << 8) | 2u))   /* coarse 1.2 */
 
 // UPS-data staleness alert. CH32X pushes power.status at 1 Hz; when that
@@ -2399,8 +2405,12 @@ void loop() {
     // Any button press dismisses the banner (consumed in the loop's button
     // section, which runs before this render on the next pass).
     netAlertOnScreen = true;
+    const bool fwUpdateBanner = strcmp(netAlertText, FW_UPDATE_BANNER_TEXT) == 0;
     unsigned long now = millis();
-    if (!netAlertBeeped) {
+    if (fwUpdateBanner && !FW_UPDATE_BANNER_BEEP) {
+      // Silent OTA banner. netAlertBeeped stays false, so a real alert that
+      // replaces "FW UPDATE" still gets its error sound.
+    } else if (!netAlertBeeped) {
       playErrorSound();
       netAlertBeeped = true;
       netAlertLastReminder = now;
@@ -2419,8 +2429,10 @@ void loop() {
     oled.print(F("MODEM"));
     oled.setCursor(0, 12);
     oled.print(netAlertText);         // e.g. "SIM ERROR" / "NO NETWORK"
-    oled.setCursor(0, 22);
-    oled.print(F("no uplink"));
+    if (!fwUpdateBanner) {
+      oled.setCursor(0, 22);
+      oled.print(F("no uplink"));
+    }
   } else if (infoText[0] != '\0') {
     // Plain info notice from a non-ESP32 sender (host service / HTTP / MQTT
     // downlink). Priority: NO UPS > BAD PSU > MODEM > info notice > dashboard

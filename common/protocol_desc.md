@@ -201,7 +201,8 @@ the agent's config disables the op entirely.
 
 `ui.display_msg` rendering depends on the frame's `SRC` (since rp2040:1.2.2):
 from the ESP32 (modem supervisor / OTA) it is the persistent **MODEM** alert
-banner with buzzer (text ≤ 23 chars); from any other source (RPi host service,
+banner with buzzer (text ≤ 23 chars; the OTA text `FW UPDATE` is shown
+without the "no uplink" line and without buzzer); from any other source (RPi host service,
 HTTP or MQTT downlink — `SRC = 0x01` RPI) it is a plain info notice: 40 visible
 chars (4 rows × 10 cols, `\n` breaks a row — no word wrap, so put `\n` in the
 text for word-aligned rows), 60 s TTL, no alarm (one short chirp when it first
