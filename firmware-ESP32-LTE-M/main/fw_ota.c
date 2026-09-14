@@ -23,6 +23,7 @@
 
 #include "fw_ota.h"
 #include "arkiv_ack.h"
+#include "backend_mode.h"
 #include "identity.h"
 #include "modem.h"
 #include "mqtt.h"
@@ -92,6 +93,17 @@ static const esp_partition_t *s_update_part;
 /* Rollback bookkeeping (see fw_ota.h). */
 static bool s_pending_verify;
 static bool s_marked_valid;
+/* Serializes otadata confirmation and rollback without holding a critical
+ * section over flash operations. A busy validation also blocks a new transfer. */
+static bool s_validation_busy;
+
+typedef enum {
+    OTA_CONFIRM_AUTOMATIC_UPLINK,
+    OTA_CONFIRM_AUTHORIZED_NEXT_UPDATE,
+    OTA_CONFIRM_PHYSICAL_TRANSFER,
+} ota_confirm_reason_t;
+
+static bool confirm_running_image(ota_confirm_reason_t reason);
 
 /* fw_xfer receiver session (path 2). Guarded by s_xfer_lock — REQs run in
  * the wups_rx task, the idle guard on the heartbeat task. */
@@ -116,24 +128,34 @@ static volatile uint8_t  s_resp_result;
  * RP2040; the relay task snapshots + polls it across END(commit=1). */
 static volatile uint32_t s_rp2040_hello_count;
 
-/* Claim arbitration: fw_ota_request runs in the esp-mqtt task, the fw_xfer
- * receiver in the wups_rx task — check-and-set must be atomic. */
+/* Claim arbitration: command execution, local transfer and rollback run in
+ * different tasks. MQTT state hooks are fast and never acquire this mux;
+ * the lock order is this claim mux -> MQTT application mux, never reverse. */
 static portMUX_TYPE s_claim_mux = portMUX_INITIALIZER_UNLOCKED;
 
 bool fw_ota_in_progress(void) { return s_in_progress; }
 
-/* Atomically claim the single "an update is running" slot shared by all
- * three paths. Release is a plain `s_in_progress = false` (single owner). */
+/* Atomically claim the shared update slot and invalidate MQTT proof even for
+ * a transfer that fails before the independent monitor's next sample. */
 static bool claim_in_progress(void)
 {
     bool ok = false;
     portENTER_CRITICAL(&s_claim_mux);
-    if (!s_in_progress) {
+    if (!s_in_progress && !s_validation_busy) {
         s_in_progress = true;
+        mqtt_ota_state_changed(true);
         ok = true;
     }
     portEXIT_CRITICAL(&s_claim_mux);
     return ok;
+}
+
+static void release_in_progress(void)
+{
+    portENTER_CRITICAL(&s_claim_mux);
+    s_in_progress = false;
+    mqtt_ota_state_changed(false);
+    portEXIT_CRITICAL(&s_claim_mux);
 }
 
 /* --- helpers ------------------------------------------------------------- */
@@ -155,7 +177,15 @@ static void emit_status(const char *fmt, ...)
     ESP_LOGI(TAG, "%s", json);
     const char *topic = mqtt_topic_event();
     if (topic[0]) {
-        (void)mqtt_publish_raw(topic, json, (size_t)n, /*qos=*/1, /*retain=*/0);
+        /* Only progress is replaceable. Started/verifying/terminal events
+         * retain their own ordered, reserved admission. All buffers copy. */
+        static const char progress_prefix[] = "{\"fw_update\":\"progress\"";
+        if (strncmp(fmt, progress_prefix, sizeof(progress_prefix) - 1) == 0) {
+            (void)mqtt_publish_snapshot(topic, json, (size_t)n, 1, 0,
+                                        UINT32_C(0xF0000001));
+        } else {
+            (void)mqtt_publish_critical(topic, json, (size_t)n, 1, 0);
+        }
     }
 }
 
@@ -338,7 +368,7 @@ fail:
     emit_status("{\"fw_update\":\"error\",\"stage\":\"%s\",\"detail\":\"%s\"}",
                 stage, detail);
     ota_ui_banner(NULL);
-    s_in_progress = false;   /* clear LAST — modem watchdog resumes now */
+    release_in_progress();   /* clear LAST — modem watchdog resumes now */
     vTaskDelete(NULL);
 }
 
@@ -599,7 +629,7 @@ static void relay_task(void *arg)
     free(buf);
     mbedtls_sha256_free(&sha);
     ota_ui_banner(NULL);
-    s_in_progress = false;   /* clear LAST — modem watchdog resumes now */
+    release_in_progress();   /* clear LAST — modem watchdog resumes now */
     vTaskDelete(NULL);
     return;                  /* unreached */
 
@@ -612,7 +642,7 @@ fail:
     emit_status("{\"fw_update\":\"error\",\"stage\":\"%s\",\"detail\":\"%s\","
                 "\"target\":\"rp2040\"}", stage, detail);
     ota_ui_banner(NULL);
-    s_in_progress = false;   /* clear LAST — modem watchdog resumes now */
+    release_in_progress();   /* clear LAST — modem watchdog resumes now */
     vTaskDelete(NULL);
 }
 
@@ -654,18 +684,14 @@ esp_err_t fw_ota_request(const char *url, const char *sha256_hex,
             return ESP_ERR_INVALID_ARG;
         }
 
-        /* Brick-guard: if the running image is STILL pending-verify (fresh
-         * OTA, no supervision tick yet — e.g. this command arrived within
-         * seconds of MQTT CONNECT), confirm it NOW: an authenticated
-         * fw.update received over MQTT is itself proof of a healthy uplink.
-         * Without this the download would overwrite the only other bootable
-         * slot while rollback is still armed — a rollback then boots a
-         * half-written image and leaves BOTH slots unbootable. */
-        fw_ota_mark_uplink_healthy();
-        if (s_pending_verify) {
+        /* Brick-guard: an accepted, authorized next update explicitly
+         * confirms the current image before overwriting its rollback slot.
+         * This is a separate recovery reason, not broker publication proof.
+         * A failed confirmation must never leave both slots unbootable. */
+        if (!confirm_running_image(OTA_CONFIRM_AUTHORIZED_NEXT_UPDATE)) {
             /* mark-valid failed (otadata write error) — refuse rather than
              * clobber the rollback slot with rollback still armed. The next
-             * healthy supervision tick retries the mark. */
+             * eligible supervision tick or another explicit update retries. */
             ESP_LOGE(TAG, "running image still PENDING_VERIFY — refusing update");
             return ESP_ERR_INVALID_STATE;
         }
@@ -694,7 +720,7 @@ esp_err_t fw_ota_request(const char *url, const char *sha256_hex,
     TaskFunction_t entry = (target == WUPS_FW_TARGET_RP2040) ? relay_task
                                                              : ota_task;
     if (xTaskCreate(entry, "fw_ota", 8192, NULL, 3, NULL) != pdPASS) {
-        s_in_progress = false;
+        release_in_progress();
         ESP_LOGE(TAG, "fw_ota task create failed");
         return ESP_ERR_NO_MEM;
     }
@@ -810,7 +836,7 @@ reply:
             uint16_t n = encode_resp_frame(resp, sizeof(resp), src, seq, result);
             const char *topic = mqtt_topic_cmd_response();
             if (n && topic[0]) {
-                (void)mqtt_publish_raw(topic, resp, n, /*qos=*/1, /*retain=*/0);
+                (void)mqtt_publish_critical(topic, resp, n, /*qos=*/1, /*retain=*/0);
             }
         }
         ESP_LOGI(TAG, "fw.update ACKed (seq=%u result=%u)", seq, result);
@@ -830,7 +856,7 @@ static void xfer_abort_locked(const char *why)
     esp_ota_abort(s_xfer_handle);
     s_xfer_open = false;
     ota_ui_banner(NULL);
-    s_in_progress = false;   /* modem watchdog resumes */
+    release_in_progress();   /* modem watchdog resumes */
 }
 
 static uint8_t xfer_begin(const uint8_t *payload, uint16_t len)
@@ -866,8 +892,7 @@ static uint8_t xfer_begin(const uint8_t *payload, uint16_t len)
      * (physical access is this path's auth model), so confirming the
      * running image first is the right call — it then becomes the rollback
      * target for the image we're about to stage. */
-    fw_ota_mark_uplink_healthy();
-    if (s_pending_verify) {
+    if (!confirm_running_image(OTA_CONFIRM_PHYSICAL_TRANSFER)) {
         ESP_LOGE(TAG, "running image still PENDING_VERIFY — refusing fw_xfer");
         return WUPS_FW_XFER_BUSY;
     }
@@ -881,7 +906,7 @@ static uint8_t xfer_begin(const uint8_t *payload, uint16_t len)
                                   &s_xfer_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
-        s_in_progress = false;
+        release_in_progress();
         return WUPS_FW_XFER_FLASH_ERR;
     }
     s_xfer_part      = part;
@@ -956,7 +981,7 @@ static uint8_t xfer_end(const uint8_t *payload, uint16_t len, bool *reboot)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
         ota_ui_banner(NULL);
-        s_in_progress = false;
+        release_in_progress();
         return (err == ESP_ERR_OTA_VALIDATE_FAILED) ? WUPS_FW_XFER_VERIFY_FAIL
                                                     : WUPS_FW_XFER_FLASH_ERR;
     }
@@ -965,7 +990,7 @@ static uint8_t xfer_end(const uint8_t *payload, uint16_t len, bool *reboot)
     emit_status("{\"fw_update\":\"verifying\",\"via\":\"usb\"}");
     if (!verify_written_image(s_xfer_part, s_xfer_image_len, s_xfer_sha)) {
         ota_ui_banner(NULL);
-        s_in_progress = false;
+        release_in_progress();
         return WUPS_FW_XFER_VERIFY_FAIL;
     }
 
@@ -974,7 +999,7 @@ static uint8_t xfer_end(const uint8_t *payload, uint16_t len, bool *reboot)
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s",
                  esp_err_to_name(err));
         ota_ui_banner(NULL);
-        s_in_progress = false;
+        release_in_progress();
         return WUPS_FW_XFER_FLASH_ERR;
     }
 
@@ -1098,38 +1123,96 @@ void fw_ota_boot_log(void)
     }
 }
 
+static const char *confirm_reason_name(ota_confirm_reason_t reason)
+{
+    switch (reason) {
+    case OTA_CONFIRM_AUTOMATIC_UPLINK:       return "automatic uplink proof";
+    case OTA_CONFIRM_AUTHORIZED_NEXT_UPDATE:return "authorized next update";
+    case OTA_CONFIRM_PHYSICAL_TRANSFER:     return "physical transfer";
+    default:                                return "unknown";
+    }
+}
+
+static bool confirm_running_image(ota_confirm_reason_t reason)
+{
+    bool automatic = reason == OTA_CONFIRM_AUTOMATIC_UPLINK;
+    portENTER_CRITICAL(&s_claim_mux);
+    if (s_validation_busy) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return false;
+    }
+    if (!s_pending_verify) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return true;
+    }
+    if (s_marked_valid || s_in_progress ||
+        (automatic && esp_timer_get_time() >=
+                      (int64_t)FW_OTA_VERIFY_WINDOW_S * 1000000)) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return false;
+    }
+    /* Linearize proof with the validation claim. A short OTA transfer must
+     * not start/end between reading fresh proof and acquiring this claim.
+     * Lock order remains claim -> MQTT; this snapshot performs no SDK I/O. */
+    if (automatic && backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
+        !mqtt_publication_proof_fresh()) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return false;
+    }
+    s_validation_busy = true;
+    portEXIT_CRITICAL(&s_claim_mux);
+
+    /* A late supervisor cannot cancel rollback just because its task ran
+     * before the main heartbeat. Explicit recovery reasons remain separate.
+     * The busy claim serializes otadata without a lock across flash I/O. */
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    portENTER_CRITICAL(&s_claim_mux);
+    if (err == ESP_OK) {
+        s_marked_valid = true;
+        s_pending_verify = false;
+    }
+    s_validation_busy = false;
+    portEXIT_CRITICAL(&s_claim_mux);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "OTA image marked VALID: %s (rollback cancelled)",
+                 confirm_reason_name(reason));
+    } else {
+        /* Retry remains possible; failed writes never manufacture proof or
+         * disarm the rollback deadline. */
+        ESP_LOGE(TAG, "mark_app_valid failed (%s): %s",
+                 confirm_reason_name(reason), esp_err_to_name(err));
+    }
+    return err == ESP_OK;
+}
+
 void fw_ota_mark_uplink_healthy(void)
 {
-    if (!s_pending_verify || s_marked_valid) return;
-    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-    if (err == ESP_OK) {
-        s_marked_valid   = true;
-        s_pending_verify = false;
-        ESP_LOGW(TAG, "uplink healthy — OTA image marked VALID (rollback cancelled)");
-    } else {
-        /* Leave BOTH flags untouched: a transient otadata write failure is
-         * retried on the next healthy tick, and the rollback tick stays
-         * armed as the net. */
-        ESP_LOGE(TAG, "mark_app_valid failed: %s", esp_err_to_name(err));
-    }
+    (void)confirm_running_image(OTA_CONFIRM_AUTOMATIC_UPLINK);
 }
 
 void fw_ota_rollback_tick(void)
 {
-    if (!s_pending_verify || s_marked_valid) return;
-    /* Belt-and-braces: never roll back while a download is writing the
-     * previous slot — rebooting into a half-written image would leave both
-     * slots unbootable. (fw_ota_request refuses to start while pending-
-     * verify, so this should be unreachable.) */
-    if (s_in_progress) return;
-    if (esp_timer_get_time() < (int64_t)FW_OTA_VERIFY_WINDOW_S * 1000000) return;
+    portENTER_CRITICAL(&s_claim_mux);
+    /* Never start rollback while a transfer owns the update slot, or while
+     * confirmation is committing otadata. New transfers cannot claim the
+     * slot once rollback has acquired this validation claim. */
+    if (!s_pending_verify || s_marked_valid || s_validation_busy ||
+        s_in_progress || esp_timer_get_time() <
+                         (int64_t)FW_OTA_VERIFY_WINDOW_S * 1000000) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return;
+    }
+    s_validation_busy = true;
+    portEXIT_CRITICAL(&s_claim_mux);
     ESP_LOGE(TAG, "no healthy uplink %d s after boot on a PENDING_VERIFY "
                   "image — rolling back to the previous slot",
              FW_OTA_VERIFY_WINDOW_S);
     vTaskDelay(pdMS_TO_TICKS(100));   /* flush the log line over USB-CDC */
     esp_ota_mark_app_invalid_rollback_and_reboot();
-    /* unreached on success; if it failed there is no previous valid image —
-     * keep running (better degraded than boot-looping). */
+    /* On failure avoid a reboot loop, preserving the existing behavior. */
+    portENTER_CRITICAL(&s_claim_mux);
     s_marked_valid = true;
+    s_validation_busy = false;
+    portEXIT_CRITICAL(&s_claim_mux);
     ESP_LOGE(TAG, "rollback failed — no valid previous image? staying up");
 }

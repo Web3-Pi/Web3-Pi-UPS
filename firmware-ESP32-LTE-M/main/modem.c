@@ -159,28 +159,6 @@ static bool        s_apn_seeded = false;   /* start APN picked from ICCID prefix
 #define CMUX_ENTRY_FAILS_MAX  2
 #define CMUX_FALLBACK_RETRY_S  (24 * 3600)
 
-/* 0.8.7 — supervisor-driven MQTT reconnect schedule. esp-mqtt runs with
- * auto-reconnect disabled; the supervisor requests every attempt. Normal
- * cadence mirrors the component's old 10 s timer. An unclaimed unit (no
- * EMQX account until the panel claim, ADR-0004) is refused with CONNACK
- * rc=5 on every attempt, and each attempt pays a full TCP+TLS handshake
- * (~5 KB — ~40 MB/day at a 10 s cadence, on a 500 MB SIM plan): once
- * mqtt.c latches the refusal streak, the interval doubles 30→120 s. Cap =
- * 2 min (Robert's pick 2026-08-21): worst-case claim→online latency stays
- * acceptable while the shelf cost drops to ~3 MB/day. While disconnected
- * we tick the supervise loop faster so attempts land near their due time. */
-#define MQTT_RETRY_NORMAL_S    10
-#define AUTH_BACKOFF_MIN_S     30
-#define AUTH_BACKOFF_MAX_S    120
-#define MQTT_DOWN_TICK_MS   10000
-/* Any sustained connect-failure streak (broker down/half-up — same full-TLS
- * cost per attempt as a refusal) joins the same backoff ramp. */
-#define MQTT_FAIL_STREAK_LATCH  6
-/* Reconnect requests rejected this many times in a row while disconnected =
- * the esp-mqtt task is dead (transport re-alloc OOM self-deletes it) —
- * revive it with esp_mqtt_client_start(), which the component only accepts
- * when the task is really gone. */
-#define MQTT_RECONN_REJECTS_MAX 20
 /* Backend-outage hold (probes OK, uplink dead): after this long raise the
  * OLED alert anyway — WITHOUT modem resets — so a genuinely wedged client
  * is never silent forever. Long on purpose: routine backend redeploys must
@@ -200,16 +178,7 @@ static EventGroupHandle_t s_modem_evt;
 static esp_netif_t       *s_ppp_netif;
 static esp_modem_dce_t   *s_dce;
 static bool               s_iccid_known;       /* set true once AT+CCID populated identity */
-static bool               s_mqtt_started;
-
-/* 0.8.7 reconnect-schedule state (see MQTT_RETRY_NORMAL_S and the
- * AUTH_BACKOFF constants above). Owned by the supervisor task; survives
- * PPP re-dials on purpose — an unclaimed unit keeps its backoff ramp
- * across link drops. next_attempt==0 means "not scheduled yet" (client
- * just started / just disconnected) and counts as due immediately. */
-static uint32_t s_mqtt_next_attempt_s;
-static uint32_t s_mqtt_backoff_s = AUTH_BACKOFF_MIN_S;
-static int      s_mqtt_reconn_rejects;   /* consecutive rejected requests */
+static bool               s_initial_connectivity_checked;
 
 void modem_notify_mqtt_down(void)
 {
@@ -400,13 +369,11 @@ static void emit_net_status(uint8_t state, int8_t rssi_dbm,
     if (!flen) return;
 
     switch (backend_mode_get()) {
-    case WUPS_BACKEND_MODE_MQTT: {
-        const char *topic = mqtt_topic_telemetry();
-        if (topic[0]) {
-            (void)mqtt_publish_raw(topic, frame, flen, 0, 0);
-        }
+    case WUPS_BACKEND_MODE_MQTT:
+        /* The owner copies this freshly generated existing frame, including
+         * before topic initialization, and selects occasional QoS 1 probes. */
+        mqtt_publish_net_status(frame, flen);
         break;
-    }
     case WUPS_BACKEND_MODE_HTTP:
         http_backend_observe_telemetry_frame(frame, flen);
         break;
@@ -1228,7 +1195,9 @@ static void uplink_health(bool *up, bool *wd_ok, bool *ota_ok)
 {
     switch (backend_mode_get()) {
     case WUPS_BACKEND_MODE_MQTT:
-        *up = mqtt_is_connected();
+        /* CONNECT alone is not evidence that an uplink publication reached
+         * the broker. The owner also invalidates proof during OTA transfer. */
+        *up = mqtt_publication_proof_fresh();
         *wd_ok = *up;
         *ota_ok = *up;
         if (!*up && mqtt_auth_refused()) {
@@ -1299,119 +1268,26 @@ static teardown_action_t supervise_uplink(void)
     uint32_t last_probe_ok_s = 0;        /* internet-probe OK verdict cache  */
 
     for (;;) {
-        /* While MQTT is down the supervisor owns the retry schedule — tick
-         * faster so attempts land near their due time (and a freshly-
-         * claimed unit's successful CONNECT is noticed promptly). */
-        uint32_t tick_ms = PPP_SUPERVISE_TICK_MS;
-        if (s_mqtt_started && backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
-            !mqtt_is_connected()) {
-            tick_ms = MQTT_DOWN_TICK_MS;
-        }
+        /* MQTT pacing belongs to its independent owner; this task only
+         * supervises PPP and wakes early to observe a reported MQTT drop. */
         EventBits_t bits = xEventGroupWaitBits(s_modem_evt,
                                                EVT_LOST_IP | EVT_PPP_FAIL | EVT_MQTT_DOWN,
                                                pdFALSE, pdFALSE,
-                                               pdMS_TO_TICKS(tick_ms));
+                                               pdMS_TO_TICKS(PPP_SUPERVISE_TICK_MS));
         if (bits & (EVT_LOST_IP | EVT_PPP_FAIL)) {
             ESP_LOGW(MODEM_TAG, "PPP link lost — tearing down DCE");
             return TEARDOWN_NORMAL;
         }
         if (bits & EVT_MQTT_DOWN) {
-            /* Early wake only — the reconnect driver below does the work. */
+            /* Early wake only — the MQTT owner performs recovery. */
             xEventGroupClearBits(s_modem_evt, EVT_MQTT_DOWN);
         }
         uint32_t now = now_s();
 
-        /* 0.8.7 reconnect driver: with esp-mqtt's auto-reconnect disabled,
-         * every attempt is requested from HERE on our own schedule — the
-         * component's old fixed 10 s cadence normally, the doubling
-         * 30→120 s backoff while attempts keep failing (credential refusal
-         * OR a down/half-up broker: both cost a full TLS handshake per
-         * attempt). Runs ABOVE the OTA freeze guard on purpose: an OTA
-         * transfer must not leave the client unrevived. Non-blocking; a
-         * request landing mid-attempt or right after a CONNECT returns
-         * ESP_FAIL and we simply retry at the next due time. */
-        if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT) {
-            if (!s_mqtt_started) {
-                /* mqtt_client_start() failed at GOT_IP (OOM/NVS hiccup) —
-                 * keep retrying from here instead of relying on a modem
-                 * reset to re-enter the GOT_IP branch. */
-                if (s_iccid_known &&
-                    (s_mqtt_next_attempt_s == 0 ||
-                     (int32_t)(now - s_mqtt_next_attempt_s) >= 0)) {
-                    if (mqtt_client_start() == ESP_OK) {
-                        s_mqtt_started = true;
-                        ESP_LOGI(MODEM_TAG, "MQTT client started (supervisor retry)");
-                    } else {
-                        ESP_LOGE(MODEM_TAG, "mqtt_client_start retry failed");
-                    }
-                    s_mqtt_next_attempt_s = now + MQTT_RETRY_NORMAL_S;
-                }
-            } else if (!mqtt_is_connected()) {
-                /* next_attempt==0 (fresh disconnect / just-started client)
-                 * counts as due now: if the client's own first attempt is
-                 * still in flight the request is rejected harmlessly and we
-                 * land on the normal cadence. */
-                if (s_mqtt_next_attempt_s == 0 ||
-                    (int32_t)(now - s_mqtt_next_attempt_s) >= 0) {
-                    esp_err_t rc = mqtt_client_request_reconnect();
-                    if (rc == ESP_OK) {
-                        /* Only an ACCEPTED request pays a TLS handshake —
-                         * only it advances the backoff ramp and its pacing. */
-                        s_mqtt_reconn_rejects = 0;
-                        uint32_t delay_s = MQTT_RETRY_NORMAL_S;
-                        if (mqtt_auth_refused()) {
-                            delay_s = s_mqtt_backoff_s;
-                            s_mqtt_backoff_s =
-                                (s_mqtt_backoff_s * 2 > AUTH_BACKOFF_MAX_S)
-                                    ? AUTH_BACKOFF_MAX_S
-                                    : s_mqtt_backoff_s * 2;
-                            ESP_LOGW(MODEM_TAG,
-                                     "MQTT attempt now; broker refuses credentials "
-                                     "×%u (unclaimed unit or rotated secret; network "
-                                     "OK) — next attempt in %us",
-                                     (unsigned)mqtt_auth_refusals(),
-                                     (unsigned)delay_s);
-                        } else if (mqtt_connect_fail_streak() >= MQTT_FAIL_STREAK_LATCH) {
-                            delay_s = s_mqtt_backoff_s;
-                            s_mqtt_backoff_s =
-                                (s_mqtt_backoff_s * 2 > AUTH_BACKOFF_MAX_S)
-                                    ? AUTH_BACKOFF_MAX_S
-                                    : s_mqtt_backoff_s * 2;
-                            ESP_LOGW(MODEM_TAG,
-                                     "MQTT attempt now; broker unreachable "
-                                     "(×%u fails) — next attempt in %us",
-                                     (unsigned)mqtt_connect_fail_streak(),
-                                     (unsigned)delay_s);
-                        }
-                        s_mqtt_next_attempt_s = now + delay_s;
-                    } else {
-                        /* Rejected request = no handshake paid: retry on the
-                         * SHORT cadence regardless of any latched backoff,
-                         * so a dead esp-mqtt task (transport re-alloc OOM
-                         * self-deletes it; every request rejected) is
-                         * detected in ~20×10 s, not 20×backoff. */
-                        s_mqtt_reconn_rejects++;
-                        if (s_mqtt_reconn_rejects >= MQTT_RECONN_REJECTS_MAX) {
-                            ESP_LOGE(MODEM_TAG,
-                                     "reconnect rejected ×%d while disconnected "
-                                     "— esp-mqtt task presumed dead, reviving",
-                                     s_mqtt_reconn_rejects);
-                            if (mqtt_client_revive() == ESP_OK) {
-                                ESP_LOGI(MODEM_TAG, "esp-mqtt task revived");
-                            }
-                            s_mqtt_reconn_rejects = 0;
-                        } else {
-                            ESP_LOGD(MODEM_TAG,
-                                     "reconnect request not accepted (%s) — "
-                                     "attempt in flight or state changed",
-                                     esp_err_to_name(rc));
-                        }
-                        s_mqtt_next_attempt_s = now + MQTT_RETRY_NORMAL_S;
-                    }
-                }
-            } else {
-                s_mqtt_reconn_rejects = 0;
-            }
+        /* Fast idempotent request only. SDK start/retry/reconnect/revive and
+         * their backoff execute in the MQTT owner, never in the PPP task. */
+        if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT && s_iccid_known) {
+            (void)mqtt_client_start();
         }
 
         /* OTA-1 — while a firmware download runs, the uplink is deliberately
@@ -1426,11 +1302,6 @@ static teardown_action_t supervise_uplink(void)
 
         bool uplink_up = false, wd_healthy = false, ota_proof = false;
         uplink_health(&uplink_up, &wd_healthy, &ota_proof);
-        if (uplink_up) {
-            /* A genuinely-connected backend resets the retry schedule. */
-            s_mqtt_backoff_s = AUTH_BACKOFF_MIN_S;
-            s_mqtt_next_attempt_s = 0;
-        }
         if (wd_healthy) {
             last_healthy_s = now;
             /* OTA-1 rollback — first demonstrably healthy uplink marks a
@@ -1495,30 +1366,36 @@ static teardown_action_t supervise_uplink(void)
             last_clear_s = now;
         }
 
-        /* The watchdog itself: PPP holds an IP but the uplink has been dead
-         * for UPLINK_DEAD_SECS — the zombie-PDP signature. Count it on the
-         * existing NET-stage alert machinery and escalate. 0.8.7: first ask
-         * the internet itself — probes answering means the BACKEND is down,
-         * not the modem, and resetting the modem would only make a whole
-         * fleet hammer the network for the duration of the outage. Probes
-         * failing with PPP up is the genuine zombie PDP → escalate. */
+        /* Preserve the existing disconnected-uplink recovery policy: a DNS
+         * response holds escalation; failed probes permit the established
+         * reset ladder. Neither result identifies the operator/backend root
+         * cause. Connected/degraded MQTT and a stalled worker are held below. */
         if (now - last_healthy_s >= UPLINK_DEAD_SECS) {
+            /* A live MQTT session with stale publication proof, or an SDK
+             * worker stuck in its own call, is handled by the independent
+             * MQTT monitor. A modem reset cannot safely unstick that task.
+             * Keep reporting the outage without counting it as healthy. */
+            mqtt_health_snapshot_t mqtt_health = {0};
+            bool mqtt_owned_fault = false;
+            if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT) {
+                mqtt_get_health(&mqtt_health);
+                mqtt_owned_fault = mqtt_health.connected || mqtt_health.worker_stalled;
+            }
             /* The hold must never cover a client that cannot even attempt
-             * (mqtt_client_start still failing) — that needs the classic
-             * escalation, not patience. */
+             * unless its owner is itself stalled (handled separately above).
+             * Otherwise preserve the previous missing-client escalation. */
             bool client_missing = (backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
-                                   !s_mqtt_started);
+                                   !mqtt_sdk_is_started());
             bool inet_ok = (now - last_probe_ok_s < INET_PROBE_CACHE_S);
-            if (!inet_ok && !client_missing && inet_probe()) {
+            if (!mqtt_owned_fault && !inet_ok && !client_missing && inet_probe()) {
                 last_probe_ok_s = now;
                 inet_ok = true;
                 ESP_LOGW(MODEM_TAG,
                          "uplink dead %us but internet probes answer — "
-                         "backend outage, not a modem problem: holding "
-                         "(no reset)",
+                         "holding modem recovery (cause not yet established)",
                          (unsigned)(now - last_healthy_s));
             }
-            if (inet_ok && !client_missing) {
+            if (mqtt_owned_fault || (inet_ok && !client_missing)) {
                 /* Long hold (wedged client / marathon backend outage):
                  * surface the alert WITHOUT resetting the modem, so the
                  * unit is never silent forever. Re-asserted every tick —
@@ -1527,9 +1404,11 @@ static teardown_action_t supervise_uplink(void)
                 if (now - last_healthy_s >= UPLINK_HOLD_ALERT_S) {
                     if (!s_alert_active) {
                         ESP_LOGE(MODEM_TAG,
-                                 "uplink dead %us with internet OK — raising "
-                                 "'NO UPLINK' alert (still no modem reset)",
-                                 (unsigned)(now - last_healthy_s));
+                                 "uplink dead %us (%s) — raising 'NO UPLINK' "
+                                 "alert without modem reset",
+                                 (unsigned)(now - last_healthy_s),
+                                 mqtt_owned_fault ? "MQTT owner/proof degraded"
+                                                  : "internet probes answer");
                     }
                     s_fail_stage = MODEM_FAIL_UPLINK;
                     s_alert_active = true;
@@ -1557,8 +1436,8 @@ static teardown_action_t supervise_uplink(void)
 /*
  * Long-lived task. Brings PPP up, runs first-boot smoke tests + starts the
  * MQTT client, then watches for PPP_LOST_IP / PPP_FAIL and tears down +
- * recreates the DCE. esp-mqtt has its own reconnect timer, so it stays
- * started across PPP cycles and reconnects on its own once a route exists.
+ * recreates the DCE. The MQTT owner keeps the client across PPP cycles and
+ * owns reconnect timing; this task never waits for an MQTT SDK operation.
  *
  * Backoff: doubles from PPP_BACKOFF_MIN_MS up to PPP_BACKOFF_MAX_MS.
  * If we hit PPP_FAILS_BEFORE_PWRCYCLE bring-ups in a row without an IP we
@@ -1634,49 +1513,35 @@ static void ppp_supervisor_task(void *arg)
                              s_uplink_trips);
                 }
 
-                if (!s_mqtt_started) {
-                    /* Wall-clock time, needed by TLS cert validity check. */
+                if (!s_initial_connectivity_checked) {
+                    /* Do this once per boot, independently of asynchronous
+                     * MQTT startup; a pending request must not rerun probes. */
+                    s_initial_connectivity_checked = true;
                     wait_for_time_sync(15000);
-
-                    /* End-to-end proof from C: hit a public HTTP server
-                     * through lwIP → PPP → modem → 1nce → internet. */
                     run_http_get_test();
+                }
 
-                    /* ADR-0012 — only start the EMQX client when this
-                     * device is actually in MQTT mode. In Arkiv/HTTP mode
-                     * the chain/user-endpoint is the only uplink and an
-                     * extra MQTT client would just burn LTE data. */
-                    const wups_backend_mode_t mode = backend_mode_get();
-                    if (mode == WUPS_BACKEND_MODE_HTTP) {
-                        /* HTTP-2 (§4.18a) — start the HTTP control-mode task.
-                         * It self-paces POSTs to the user-hosted endpoint and
-                         * needs no broker. Idempotent across PPP reconnects. */
-                        ESP_LOGI(MODEM_TAG, "starting HTTP control-mode backend...");
-                        http_backend_start();
-                    } else if (mode != WUPS_BACKEND_MODE_MQTT) {
-                        ESP_LOGI(MODEM_TAG,
-                                 "skipping MQTT client start — backend mode is %s",
-                                 backend_mode_name(mode));
-                    } else if (!s_iccid_known) {
-                        ESP_LOGE(MODEM_TAG,
-                                 "ICCID unknown — refusing to start MQTT. "
-                                 "Check SIM card / AT+CCID handling.");
-                    } else {
-                        ESP_LOGI(MODEM_TAG, "starting MQTT client...");
-                        if (mqtt_client_start() == ESP_OK) {
-                            s_mqtt_started = true;
-                        } else {
-                            ESP_LOGE(MODEM_TAG, "mqtt_client_start failed");
-                        }
-                    }
-                } else {
-                    ESP_LOGI(MODEM_TAG, "PPP reconnected — supervisor will drive the MQTT reconnect");
+                const wups_backend_mode_t mode = backend_mode_get();
+                if (mode == WUPS_BACKEND_MODE_HTTP) {
+                    /* Idempotent across PPP reconnects. */
+                    ESP_LOGI(MODEM_TAG, "starting HTTP control-mode backend...");
+                    http_backend_start();
+                } else if (mode != WUPS_BACKEND_MODE_MQTT) {
+                    ESP_LOGI(MODEM_TAG,
+                             "skipping MQTT client start — backend mode is %s",
+                             backend_mode_name(mode));
+                } else if (!s_iccid_known) {
+                    ESP_LOGE(MODEM_TAG,
+                             "ICCID unknown — refusing to start MQTT. "
+                             "Check SIM card / AT+CCID handling.");
+                } else if (mqtt_client_start() != ESP_OK) {
+                    ESP_LOGW(MODEM_TAG, "MQTT start request unavailable — will retry");
                 }
 
                 /* First net.status of the session, seeded from the CSQ read
                  * during bring-up (the supervision loop refreshes it on CMUX
-                 * sessions). Emitted after the backend start above so the
-                 * MQTT telemetry topic is populated. */
+                 * sessions). The MQTT owner caches the frame even while
+                 * asynchronous topic/client initialization is pending. */
                 emit_net_status(NET_STATE_PPP_UP, s_bringup_rssi_dbm, 0, 0);
 
                 /* Supervise until the link drops or the uplink watchdog

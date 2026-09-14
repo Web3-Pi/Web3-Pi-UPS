@@ -369,6 +369,60 @@ esp_err_t wups_link_trust_wait(uint32_t nonce, uint32_t timeout_ms,
 
 /* --- dispatch ---------------------------------------------------------- */
 
+/* Only recognized complete frames may acquire snapshot/reliable-event
+ * policy. Unknown or future payloads stay opaque FIFO publications. */
+static bool mqtt_wups_frame_valid(const uint8_t *frame, size_t len)
+{
+    if (!frame || len < WUPS_FRAMING_BYTES || len > WUPS_MAX_FRAME ||
+        frame[0] != WUPS_SYNC1 || frame[1] != WUPS_SYNC2 ||
+        frame[len - 2] != WUPS_END1 || frame[len - 1] != WUPS_END2) return false;
+    size_t payload_len = (size_t)frame[8] | ((size_t)frame[9] << 8);
+    if (payload_len + WUPS_FRAMING_BYTES != len) return false;
+    uint8_t a, b;
+    wups_fletcher8(frame + 2, 8 + payload_len, &a, &b);
+    return a == frame[WUPS_HEADER_BYTES + payload_len] &&
+           b == frame[WUPS_HEADER_BYTES + payload_len + 1];
+}
+
+static uint32_t mqtt_wups_snapshot_key(const uint8_t *frame, size_t len)
+{
+    if (!mqtt_wups_frame_valid(frame, len) || frame[6] != WUPS_FLAG_EVENT ||
+        len == WUPS_FRAMING_BYTES) return 0;
+    if (frame[3] != WUPS_ADDR_RPI && frame[3] != WUPS_ADDR_RP2040 &&
+        frame[3] != WUPS_ADDR_CH32X && frame[3] != WUPS_ADDR_ESP32) return 0;
+    size_t payload_len = len - WUPS_FRAMING_BYTES;
+    uint8_t version = frame[WUPS_HEADER_BYTES];
+    bool known = false;
+    if (frame[4] == WUPS_CLASS_POWER && frame[5] == WUPS_OP_PWR_STATUS) {
+        known = (version == 1 && payload_len == sizeof(wups_power_status_v1_t)) ||
+                (version == 2 && payload_len == sizeof(wups_power_status_v2_t));
+    } else if (frame[4] == WUPS_CLASS_HOST && frame[5] == WUPS_OP_HOST_STATUS) {
+        known = version == 1 && payload_len == sizeof(wups_host_status_v1_t);
+    } else if (frame[4] == WUPS_CLASS_NET && frame[5] == WUPS_OP_NET_STATUS) {
+        known = (version == 1 && payload_len == sizeof(wups_net_status_v1_t)) ||
+                (version == 2 && payload_len == sizeof(wups_net_status_v2_t));
+    }
+    return known ? ((uint32_t)frame[3] << 16) | ((uint32_t)frame[4] << 8) | frame[5] : 0;
+}
+
+static bool mqtt_wups_critical_event(const uint8_t *frame, size_t len)
+{
+    if (!mqtt_wups_frame_valid(frame, len) || frame[6] != WUPS_FLAG_EVENT ||
+        len < WUPS_FRAMING_BYTES + 2 || frame[WUPS_HEADER_BYTES] != 1) return false;
+    uint8_t event = frame[WUPS_HEADER_BYTES + 1];
+    if (frame[4] == WUPS_CLASS_POWER && frame[5] == WUPS_OP_PWR_EVENT &&
+        len == WUPS_FRAMING_BYTES + sizeof(wups_power_event_v1_t)) {
+        return event == WUPS_PWR_EVT_MAINS_LOST || event == WUPS_PWR_EVT_MAINS_RESTORED ||
+               event == WUPS_PWR_EVT_CHARGE_LOW || event == WUPS_PWR_EVT_FAULT;
+    }
+    if (frame[4] == WUPS_CLASS_HOST && frame[5] == WUPS_OP_HOST_EVENT &&
+        len == WUPS_FRAMING_BYTES + sizeof(wups_host_event_v1_t)) {
+        return event == WUPS_HOST_EVT_SHUTDOWN_IMMINENT || event == WUPS_HOST_EVT_LOW_DISK ||
+               event == WUPS_HOST_EVT_ETH_SYNCED || event == WUPS_HOST_EVT_ETH_LOST;
+    }
+    return false;
+}
+
 static void handle_net_publish(const uint8_t *payload, uint16_t len)
 {
     if (len < sizeof(wups_net_publish_v1_hdr_t)) {
@@ -410,7 +464,7 @@ static void handle_net_publish(const uint8_t *payload, uint16_t len)
                     ((rel[0] == 't' || rel[0] == 'c') && rel[1] == '/');
     char topic[64];
     if (absolute) {
-        if (hdr.topic_len + 1 > sizeof(topic)) {
+        if ((size_t)hdr.topic_len + 1 > sizeof(topic)) {
             ESP_LOGW(TAG, "net.publish absolute topic too long: %u", hdr.topic_len);
             return;
         }
@@ -495,13 +549,26 @@ static void handle_net_publish(const uint8_t *payload, uint16_t len)
         }
     }
 
-    int rc = mqtt_publish_raw(topic, mqtt_payload, hdr.payload_len,
-                              hdr.qos, hdr.retain);
-    if (rc < 0) {
-        ESP_LOGW(TAG, "mqtt publish %s rc=%d (mqtt not connected?)", topic, rc);
+    uint32_t snapshot_key = !absolute && strcmp(rel, "telemetry") == 0
+        ? mqtt_wups_snapshot_key(mqtt_payload, hdr.payload_len) : 0;
+    bool critical = !absolute && (strcmp(rel, "cmd/response") == 0 ||
+        (strcmp(rel, "event") == 0 && mqtt_wups_critical_event(mqtt_payload, hdr.payload_len)));
+    int rc;
+    if (snapshot_key) {
+        rc = mqtt_publish_snapshot(topic, mqtt_payload, hdr.payload_len,
+                                   hdr.qos, hdr.retain, snapshot_key);
+    } else if (critical) {
+        rc = mqtt_publish_critical(topic, mqtt_payload, hdr.payload_len,
+                                   hdr.qos, hdr.retain);
     } else {
-        ESP_LOGI(TAG, "mqtt publish %s len=%u qos=%u retain=%u msg_id=%d",
-                 topic, hdr.payload_len, hdr.qos, hdr.retain, rc);
+        rc = mqtt_publish_raw(topic, mqtt_payload, hdr.payload_len,
+                              hdr.qos, hdr.retain);
+    }
+    if (rc < 0) {
+        ESP_LOGW(TAG, "mqtt local submission rejected %s rc=%d", topic, rc);
+    } else {
+        ESP_LOGI(TAG, "mqtt locally queued %s len=%u qos=%u retain=%u",
+                 topic, hdr.payload_len, hdr.qos, hdr.retain);
     }
 }
 
@@ -1038,7 +1105,8 @@ static bool try_handle_sys_reset(const uint8_t *frame, size_t frame_len)
     } else {
         const char *topic = mqtt_topic_cmd_response();
         if (topic[0]) {
-            (void)mqtt_publish_raw(topic, resp, sizeof(resp), /*qos=*/1, /*retain=*/0);
+            int rc = mqtt_publish_critical(topic, resp, sizeof(resp), /*qos=*/1, /*retain=*/0);
+            if (rc < 0) ESP_LOGW(TAG, "system.reset response local submission rejected rc=%d", rc);
         }
     }
 
@@ -1056,8 +1124,8 @@ static bool try_handle_sys_reset(const uint8_t *frame, size_t frame_len)
             .name     = "sys_reset",
         };
         if (esp_timer_create(&args, &s_reset_timer) != ESP_OK) {
-            /* Can't schedule — restart inline; the RESP was enqueued QoS1
-             * and will be redelivered from the broker's session if lost. */
+            /* Can't schedule — restart inline. The locally submitted RESP
+             * is best effort and may not reach the broker before reboot. */
             esp_restart();
         }
     }
@@ -1071,7 +1139,7 @@ static bool try_handle_sys_reset(const uint8_t *frame, size_t frame_len)
 /* Forward an arriving MQTT message to RP2040 (hub) as a net.downlink event.
  * The frame carries the topic and the raw payload; RP2040 decides what to
  * do with it (route to CH32X for power commands, to itself for UI/system,
- * etc.). Runs in the MQTT client task context. */
+ * etc.). Runs in the separate MQTT command worker. */
 /* Public wrapper — the Arkiv cmd ingress (arkiv_rpc.c) intercepts the same
  * ESP32-local ops as this MQTT downlink path (Decision C parity). */
 bool wups_link_try_sys_reset(const uint8_t *frame, size_t frame_len)
@@ -1174,8 +1242,8 @@ esp_err_t wups_link_init(void)
     esp_err_t err = uart_bringup();
     if (err != ESP_OK) return err;
 
-    /* 4 KB stack: deframer + occasional mqtt_publish_raw call (which just
-     * enqueues to the MQTT task). Pinned to core 0 — the same core the UART
+    /* 4 KB stack: deframer + bounded application-queue admission (without
+     * SDK calls). Pinned to core 0 — the same core the UART
      * ISR was allocated on (app_main) — so the driver's cross-core
      * rx_buffer_full_flg desync (see uart_bringup) is structurally
      * impossible. */

@@ -94,8 +94,8 @@ static void bal_format(char *out, size_t cap, const arkiv_tlm_balance_t *b)
     const char *hint = b->wei < BAL_WORST_WRITE_WEI ? "\nno gas"
                      : b->wei < BAL_LOW_WEI         ? "\nlow gas" : stale;
     snprintf(out, cap, "BALANCE\n%" PRIu64 ".%06" PRIu64 "\nW3P%s",
-             b->wei / 1000000000000000000ULL,
-             (b->wei % 1000000000000000000ULL) / 1000000000000ULL, hint);
+             (uint64_t)(b->wei / 1000000000000000000ULL),
+             (uint64_t)((b->wei % 1000000000000000000ULL) / 1000000000000ULL), hint);
 }
 /* BAL_FORMAT_END */
 

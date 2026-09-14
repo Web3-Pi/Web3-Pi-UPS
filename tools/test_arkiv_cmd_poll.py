@@ -108,7 +108,8 @@ int arkiv_writer_payload_seal(uint8_t t, uint64_t s, const char *e, const char *
 bool arkiv_writer_enqueue_create_entity(const char *c, const uint8_t *p, size_t n, uint32_t ttl,
     const arkiv_attr_t *a, size_t count)
 { (void)c; (void)p; (void)n; (void)ttl; (void)a; (void)count;
-  if (refresh_during_enqueue) arkiv_ack_track_pending(1, "newer-command-for-same-seq-xxxxx"); return enqueue_ok; }
+  if (refresh_during_enqueue) { arkiv_ack_track_pending(1, "newer-command-for-same-seq-xxxxx"); }
+  return enqueue_ok; }
 static bool cmdauth_arkiv_ready(void) { return true; }
 static int cmdauth_arkiv_claim_state(void) { return ARKIV_CLAIMED; }
 static unsigned ota_seq;   /* fw_ota stub consumes the frame whose SEQ == ota_seq */

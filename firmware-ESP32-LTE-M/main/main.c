@@ -40,6 +40,7 @@
 #include "backend_mode.h"
 #include "fw_ota.h"
 #include "modem.h"
+#include "mqtt.h"
 #include "pmu.h"
 #include "wups_link.h"
 #include "arkiv_crypto_selftest.h"
@@ -164,10 +165,16 @@ void app_main(void)
     ESP_LOGI(TAG, "ensuring modem is powered...");
     modem_ensure_on();
 
+    /* MQTT resources are committed before producers; an allocation failure
+     * leaves MQTT unavailable without disabling the local UART/OTA link. */
+    bool mqtt_runtime_ready = active_mode != WUPS_BACKEND_MODE_MQTT ||
+                              mqtt_runtime_init() == ESP_OK;
+    if (!mqtt_runtime_ready) ESP_LOGW(TAG, "MQTT runtime unavailable; will retry");
+
     /* Bring up the binary protocol link to RP2040 (UART2 with HW flow control,
      * MQTT data → net.downlink hook). Done before PPP/MQTT so RP2040 can
-     * already start talking to us; net.publish from any caller will simply
-     * fail until MQTT connects. */
+     * already start talking to us; bounded MQTT submissions can wait for
+     * the connection once the runtime and topic identity are available. */
     ESP_ERROR_CHECK(wups_link_init());
 
     /* Hand the UART over to the bidirectional bridge. */
@@ -200,16 +207,11 @@ void app_main(void)
      * `arkiv_poll` task stays alive at a 5-minute fallback cadence (see
      * `arkiv_rpc.c poll_task` and web3pi_scope/notes/ARKIV-data-usage.md §E). */
     bool ws_armed = false;
-    /* `mode_confirm_armed` flips false on the first successful post-switch
-     * confirm emit. emit_post_switch_confirm is idempotent (reads NVS,
-     * only does work if prev_mode is set, clears it after success), so
-     * calling it repeatedly while the channel comes up is safe. */
-    bool mode_confirm_armed = true;
-
     /* Keep emitting a heartbeat so the host sees the firmware is still alive
      * even when no AT traffic is happening. */
     uint32_t tick = 0;
     while (true) {
+        if (!mqtt_runtime_ready) mqtt_runtime_ready = mqtt_runtime_init() == ESP_OK;
         if (active_mode == WUPS_BACKEND_MODE_ARKIV && !ws_armed &&
             cmdauth_arkiv_ready() &&
             cmdauth_arkiv_claim_state() == ARKIV_CLAIMED) {
@@ -219,19 +221,9 @@ void app_main(void)
             }
         }
 
-        /* ADR-0012 — post-switch confirm. emit_post_switch_confirm is a
-         * no-op if NVS prev_mode isn't set (i.e. this isn't a post-switch
-         * boot). When it IS set, the helper publishes once via the now-up
-         * channel and clears the NVS marker; subsequent calls become
-         * no-ops. We keep trying on every heartbeat tick until success. */
-        if (mode_confirm_armed) {
-            backend_mode_emit_post_switch_confirm();
-            /* The helper is idempotent: if prev_mode is unset (or cleared
-             * by the successful publish above) further calls do nothing.
-             * Disarm to avoid the NVS open on every tick once we're past
-             * the first ~minute of boot. */
-            if (tick > 12) mode_confirm_armed = false;
-        }
+        /* Admission is asynchronous; keep polling until the helper caches a
+         * terminal success. Do not abandon a pending SDK receipt at 65 s. */
+        backend_mode_emit_post_switch_confirm();
 
         /* OTA-1 rollback safety net: a pending-verify image that never got
          * a healthy uplink rolls itself back after 10 min. No-op otherwise.
