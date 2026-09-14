@@ -36,7 +36,7 @@ jobs:
         env:
           MQTT_TEST_SANITIZERS: address,undefined
         run: |
-          for test in tools/test_mqtt_*.py tools/test_fw_ota_policy.py; do
+          for test in tools/test_mqtt_*.py tools/test_fw_ota_*.py tools/test_modem_*.py; do
             python3 "$test"
           done
           python3 tools/test_wups_deframer.py

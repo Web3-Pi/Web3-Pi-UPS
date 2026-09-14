@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Exercise the actual stopped-task adapter with pinned SDK lifecycle excerpts.
 
-The fixture permits host CI before IDF fetches managed components. When the
-managed SDK is present, its source and excerpts must exactly match the fixture.
+The lifecycle fixture must match the vendored, pinned SDK build inputs, including
+the narrowly scoped resend/abort patch (which does not change lifecycle code).
 MQTT_TEST_SANITIZERS=undefined selects UBSan; an empty value selects plain C.
 """
 from pathlib import Path
@@ -15,9 +15,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "firmware-ESP32-LTE-M/main"
 HOST = ROOT / "tools/mqtt_sdk_adapter_host"
-SDK = ROOT / "firmware-ESP32-LTE-M/managed_components/espressif__mqtt"
+SDK = ROOT / "firmware-ESP32-LTE-M/components/espressif__mqtt"
 SDK_PINS = {
-    "mqtt_client.c": "4b24720b34c2bd44b0857a5251f5392663225c618595229540b35f1529663a9a",
+    "mqtt_client.c": "1a120957d6f8078a0cd27f4febac54389c5dce7f025069cad493e945d005f361",
     "lib/include/mqtt_client_priv.h": "ee8f464f6cbf77a83468126bf22d91833b9c2b8985ba5860381acb99a655c565",
 }
 START_SHA = "a061f3b31aff4ee0ac8cfc8281057547cfca01eebbfe4705b6e69842b4894a91"
@@ -43,11 +43,9 @@ def verify_source():
     cmake = (MAIN / "CMakeLists.txt").read_text()
     for path, expected in SDK_PINS.items():
         assert f"{path}|{expected}" in cmake, "Build must enforce the reviewed SDK pins"
-        if (SDK / path).exists():
-            actual = hashlib.sha256((SDK / path).read_bytes()).hexdigest()
-            assert actual == expected, f"SDK lifecycle source changed: {path}"
-    if (SDK / "mqtt_client.c").exists():
-        assert excerpts((SDK / "mqtt_client.c").read_text()) == (start_fn, cleanup)
+        actual = hashlib.sha256((SDK / path).read_bytes()).hexdigest()
+        assert actual == expected, f"SDK lifecycle source changed: {path}"
+    assert excerpts((SDK / "mqtt_client.c").read_text()) == (start_fn, cleanup)
 
 
 def main():

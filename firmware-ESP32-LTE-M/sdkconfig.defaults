@@ -77,3 +77,6 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 # Health probe correlation requires a non-reusing guarded packet-ID epoch.
 CONFIG_MQTT_MSG_ID_INCREMENTAL=y
+
+# Preserve complete multi-line AT replies also over CMUX.
+CONFIG_ESP_MODEM_USE_INFLATABLE_BUFFER_IF_NEEDED=y

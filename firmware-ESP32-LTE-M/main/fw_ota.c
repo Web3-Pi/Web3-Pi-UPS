@@ -22,6 +22,7 @@
  */
 
 #include "fw_ota.h"
+#include "fw_ota_http_policy.h"
 #include "arkiv_ack.h"
 #include "backend_mode.h"
 #include "identity.h"
@@ -44,6 +45,7 @@
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_tls_errors.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -59,8 +61,8 @@
 #define FW_OTA_URL_MAX \
     (WUPS_MAX_PAYLOAD - sizeof(wups_net_fw_update_v1_hdr_t))   /* 168 */
 
-/* Per-socket-op HTTP timeout. The TOTAL attempt is separately capped by
- * FW_OTA_TIMEOUT_S — a ~0.9 MB image over Cat-M takes minutes. */
+/* Per-socket-op timeout. FW_OTA_TIMEOUT_S is also checked between SDK
+ * operations across all retries; it is not an asynchronous cancellation. */
 #define FW_OTA_HTTP_TIMEOUT_MS  30000
 
 /* SHA-256 read-back chunk (one flash sector). */
@@ -265,6 +267,89 @@ static bool verify_written_image(const esp_partition_t *part, uint32_t len,
     return true;
 }
 
+/* HTTP callbacks run synchronously in the OTA task. Never keep a client
+ * pointer after DISCONNECTED/cleanup, and never log URLs or auth headers. */
+typedef struct {
+    fw_ota_http_response_t response;
+    esp_http_client_handle_t client;
+    uint32_t requested_offset;
+    bool range_fallback;
+    int socket_errno, tls_code, tls_flags;
+    esp_err_t tls_error;
+} ota_http_diag_t;
+
+static void ota_http_capture(ota_http_diag_t *d)
+{
+    if (!d->client) return;
+    int socket_error = esp_http_client_get_errno(d->client);
+    if (socket_error > 0) d->socket_errno = socket_error;
+    int code = 0, flags = 0;
+    esp_err_t error = esp_http_client_get_and_clear_last_tls_error(
+        d->client, &code, &flags);
+    if (error) d->tls_error = error;
+    if (code) d->tls_code = code;
+    d->tls_flags |= flags;
+}
+
+static esp_err_t ota_http_event(esp_http_client_event_t *event)
+{
+    ota_http_diag_t *d = event->user_data;
+    if (!d) return ESP_OK;
+    d->client = event->client;
+    switch (event->event_id) {
+    case HTTP_EVENT_ON_STATUS_CODE:
+        memset(&d->response, 0, sizeof(d->response));
+        d->response.status = esp_http_client_get_status_code(event->client);
+        /* IDF silently retries a rejected Range as a full GET. Remember
+         * this across responses; reject before any flash write and schedule
+         * an explicit new attempt from zero with ordinary HTTP 200. */
+        if (d->requested_offset &&
+            (d->response.status == 200 || d->response.status == 416)) {
+            d->range_fallback = true;
+        }
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        fw_ota_http_header(&d->response, event->header_key, event->header_value);
+        break;
+    case HTTP_EVENT_ERROR:
+        ota_http_capture(d);
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        ota_http_capture(d);
+        d->client = NULL;
+        break;
+    default:
+        break;
+    }
+    return ESP_OK;
+}
+
+static bool ota_http_retryable(esp_err_t err, const ota_http_diag_t *d)
+{
+    /* Keep certificate/handshake failures terminal. A retry never relaxes
+     * authentication or changes the commanded URL, digest or destination. */
+    if (d->tls_flags || d->tls_error == ESP_ERR_MBEDTLS_CERT_PARTLY_OK ||
+        d->tls_error == ESP_ERR_MBEDTLS_X509_CRT_PARSE_FAILED ||
+        d->tls_error == ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED) return false;
+    if (d->response.status >= 400)
+        return fw_ota_http_status_retryable(d->response.status);
+    switch (err) {
+    case ESP_ERR_HTTP_CONNECT:
+    case ESP_ERR_HTTP_CONNECTING:
+    case ESP_ERR_HTTP_WRITE_DATA:
+    case ESP_ERR_HTTP_FETCH_HEADER:
+    case ESP_ERR_HTTP_EAGAIN:
+    case ESP_ERR_HTTP_READ_TIMEOUT:
+    case ESP_ERR_HTTP_CONNECTION_CLOSED:
+    case ESP_ERR_HTTP_INCOMPLETE_DATA:
+        return true;
+    default:
+        /* In particular ESP_FAIL may also mean a flash/local-state error.
+         * The pinned HTTPS OTA component preserves distinct read errors. */
+        return false;
+    }
+}
+
 static void ota_task(void *arg)
 {
     (void)arg;
@@ -273,102 +358,197 @@ static void ota_task(void *arg)
     const char *detail = "";
     const int64_t deadline_us =
         esp_timer_get_time() + (int64_t)FW_OTA_TIMEOUT_S * 1000000;
+    uint32_t checkpoint = 0;
+    unsigned attempt = 0;
+    int last_step_pct = 0;
+    esp_err_t err = ESP_OK;
+    ota_http_diag_t diag = {0};
 
-    ESP_LOGW(TAG, "OTA start: %s (%" PRIu32 " B) -> %s",
-             s_url, s_image_len, s_update_part->label);
+    ESP_LOGW(TAG, "OTA start: %" PRIu32 " B -> %s; max_attempts=%u",
+             s_image_len, s_update_part->label, FW_OTA_MAX_ATTEMPTS);
     ota_ui_banner("FW UPDATE");
     emit_status("{\"fw_update\":\"started\",\"len\":%" PRIu32 ",\"slot\":\"%s\"}",
                 s_image_len, s_update_part->label);
 
-    esp_http_client_config_t http_cfg = {
-        .url               = s_url,
-        .timeout_ms        = FW_OTA_HTTP_TIMEOUT_MS,
-        /* Redirects are followed by esp_http_client's default policy;
-         * the cert bundle covers any LE/public-CA hop. */
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size       = 2048,
-        .keep_alive_enable = true,
-    };
-    esp_https_ota_config_t ota_cfg = {
-        .http_config = &http_cfg,
-        /* partition.staging left NULL — esp_https_ota picks
-         * esp_ota_get_next_update_partition(NULL), the same slot we
-         * captured as s_update_part in fw_ota_request(). */
-    };
-
-    esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
-    if (err != ESP_OK) {
-        detail = esp_err_to_name(err);
-        goto fail;
-    }
-
-    stage = "download";
-    int last_step_pct = 0;
-    while ((err = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+    for (attempt = 1; attempt <= FW_OTA_MAX_ATTEMPTS; ++attempt) {
         if (esp_timer_get_time() >= deadline_us) {
             stage = "timeout";
             detail = "OTA time cap exceeded";
             goto fail;
         }
-        int read = esp_https_ota_get_image_len_read(handle);
-        int pct = (int)(((int64_t)read * 100) / (int64_t)s_image_len);
-        if (pct >= last_step_pct + 25 && pct < 100) {
-            last_step_pct = pct - (pct % 25);
-            emit_status("{\"fw_update\":\"progress\",\"pct\":%d}", last_step_pct);
+        /* Only successfully written bytes survive abort. Header reads and
+         * failed writes never advance this checkpoint. A tiny prefix is
+         * restarted because IDF requires 1024 B to resume an app image. */
+        if (checkpoint < FW_OTA_RESUME_MIN) checkpoint = 0;
+        const uint32_t offset = checkpoint;
+        diag = (ota_http_diag_t){.requested_offset = offset};
+        stage = "begin";
+        esp_http_client_config_t http_cfg = {
+            .url = s_url,
+            .timeout_ms = FW_OTA_HTTP_TIMEOUT_MS,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .buffer_size = 2048,
+            .keep_alive_enable = true,
+            .keep_alive_idle = 60,
+            .keep_alive_interval = 10,
+            .keep_alive_count = 3,
+            .event_handler = ota_http_event,
+            .user_data = &diag,
+        };
+        esp_https_ota_config_t ota_cfg = {
+            .http_config = &http_cfg,
+            .ota_resumption = offset != 0,
+            .ota_image_bytes_written = offset,
+            .partition.staging = s_update_part,
+        };
+        ESP_LOGI(TAG, "OTA attempt=%u/%u offset=%" PRIu32 "/%" PRIu32,
+                 attempt, FW_OTA_MAX_ATTEMPTS, offset, s_image_len);
+        err = esp_https_ota_begin(&ota_cfg, &handle);
+        bool retry = false;
+        if (err != ESP_OK) {
+            /* begin owns cleanup on failure. ERROR can precede CONNECTED,
+             * so cleanup need not emit DISCONNECTED before freeing client. */
+            diag.client = NULL;
+            detail = esp_err_to_name(err);
+            retry = ota_http_retryable(err, &diag);
+            goto attempt_failed;
         }
-    }
-    if (err != ESP_OK) {
-        detail = esp_err_to_name(err);
-        goto fail;
-    }
-    if (!esp_https_ota_is_complete_data_received(handle)) {
-        detail = "incomplete data";
-        goto fail;
+        if (esp_timer_get_time() >= deadline_us) {
+            stage = "timeout";
+            detail = "OTA time cap exceeded";
+            goto attempt_failed;
+        }
+        /* Validate BEFORE perform(): esp_ota_begin/write only happen there.
+         * A same-size object changed between requests still fails the final
+         * full-flash SHA, before finish can select it as the boot image. */
+        stage = "response";
+        if (diag.range_fallback) {
+            checkpoint = 0;
+            detail = "server rejected Range; restart from zero";
+            retry = !diag.tls_flags &&
+                    (diag.response.status == 200 || diag.response.status == 206);
+            goto attempt_failed;
+        }
+        if (!fw_ota_http_response_valid(&diag.response, offset, s_image_len) ||
+            !diag.client || esp_http_client_is_chunked_response(diag.client) ||
+            esp_http_client_get_transport_type(diag.client) != HTTP_TRANSPORT_OVER_SSL) {
+            detail = "invalid HTTP status, range or length";
+            goto attempt_failed;
+        }
+        stage = "download";
+        int64_t progress_us = esp_timer_get_time();
+        for (;;) {
+            if (esp_timer_get_time() >= deadline_us) {
+                stage = "timeout";
+                detail = "OTA time cap exceeded";
+                goto attempt_failed;
+            }
+            err = esp_https_ota_perform(handle);
+            if (err != ESP_OK && err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+                ota_http_capture(&diag);
+                detail = esp_err_to_name(err);
+                retry = ota_http_retryable(err, &diag);
+                goto attempt_failed;
+            }
+            if (esp_timer_get_time() >= deadline_us) {
+                stage = "timeout";
+                detail = "OTA time cap exceeded";
+                goto attempt_failed;
+            }
+            int read = esp_https_ota_get_image_len_read(handle);
+            if (read < 0 || (uint32_t)read < checkpoint ||
+                (uint32_t)read > s_image_len) {
+                detail = "invalid written byte count";
+                goto attempt_failed;
+            }
+            if ((uint32_t)read > checkpoint) {
+                checkpoint = (uint32_t)read;
+                progress_us = esp_timer_get_time();
+            }
+            int pct = (int)(((uint64_t)checkpoint * 100) / s_image_len);
+            if (pct >= last_step_pct + 25 && pct < 100) {
+                last_step_pct = pct - (pct % 25);
+                emit_status("{\"fw_update\":\"progress\",\"pct\":%d}", last_step_pct);
+            }
+            if (err == ESP_OK) break;
+            if (esp_timer_get_time() - progress_us >= INT64_C(90000000)) {
+                detail = "no download progress for 90s";
+                retry = true;
+                goto attempt_failed;
+            }
+        }
+        if (!esp_https_ota_is_complete_data_received(handle) || checkpoint != s_image_len) {
+            detail = "incomplete data";
+            retry = checkpoint < s_image_len;
+            goto attempt_failed;
+        }
+        break;
+
+attempt_failed:
+        ota_http_capture(&diag);
+        ESP_LOGW(TAG, "OTA attempt=%u stage=%s written=%" PRIu32 "/%" PRIu32
+                 " http=%d err=%s errno=%d tls=0x%x code=%d flags=0x%x detail=%s",
+                 attempt, stage, checkpoint, s_image_len, diag.response.status,
+                 esp_err_to_name(err), diag.socket_errno, (unsigned)diag.tls_error,
+                 diag.tls_code, (unsigned)diag.tls_flags, detail);
+        if (handle) {
+            esp_https_ota_abort(handle);
+            handle = NULL;
+        }
+        diag.client = NULL;
+        unsigned delay_s = fw_ota_retry_delay_s(attempt);
+        if (!retry || !delay_s || checkpoint >= s_image_len) goto fail;
+        if (esp_timer_get_time() + (int64_t)delay_s * 1000000 >= deadline_us) {
+            stage = "timeout";
+            detail = "OTA time cap exceeded";
+            goto fail;
+        }
+        emit_status("{\"fw_update\":\"retry\",\"attempt\":%u,\"offset\":%" PRIu32
+                    ",\"delay_s\":%u}", attempt + 1, checkpoint, delay_s);
+        /* Keep the OTA claim throughout the backoff: no competing updater,
+         * mark-valid decision or modem watchdog reset can race these writes. */
+        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
     }
 
-    stage = "verify";
-    int len_read = esp_https_ota_get_image_len_read(handle);
-    if (len_read < 0 || (uint32_t)len_read != s_image_len) {
-        ESP_LOGE(TAG, "length mismatch: got %d, commanded %" PRIu32,
-                 len_read, s_image_len);
-        detail = "length mismatch";
+    if (esp_timer_get_time() >= deadline_us) {
+        stage = "timeout";
+        detail = "OTA time cap exceeded";
         goto fail;
     }
+    stage = "verify";
     emit_status("{\"fw_update\":\"verifying\"}");
     if (!verify_written_image(s_update_part, s_image_len, s_sha_expected)) {
         detail = "sha256 mismatch";
         goto fail;
     }
-
-    /* Digest good — let esp_https_ota validate the image and flip the boot
-     * partition. From here a failure means we did NOT change the boot slot. */
+    if (esp_timer_get_time() >= deadline_us) {
+        stage = "timeout";
+        detail = "OTA time cap exceeded";
+        goto fail;
+    }
     stage = "finish";
     err = esp_https_ota_finish(handle);
     handle = NULL;
+    diag.client = NULL;
     if (err != ESP_OK) {
         detail = esp_err_to_name(err);
         goto fail;
     }
-
     ESP_LOGW(TAG, "OTA complete — rebooting into %s (rollback armed)",
              s_update_part->label);
     emit_status("{\"fw_update\":\"rebooting\"}");
-    /* Give esp-mqtt time to flush the QoS-1 status over PPP+TLS (same
-     * rationale as backend_mode's pre-reboot flush). The OLED banner is
-     * left up — the reboot + RP2040 banner TTL clear it. */
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
-    /* unreached */
 
 fail:
-    ESP_LOGE(TAG, "OTA failed at %s: %s", stage, detail);
-    if (handle) {
-        esp_https_ota_abort(handle);
-    }
+    ESP_LOGE(TAG, "OTA failed at %s after attempt=%u written=%" PRIu32 ": %s",
+             stage, attempt, checkpoint, detail);
+    if (handle) esp_https_ota_abort(handle);
+    diag.client = NULL;
     emit_status("{\"fw_update\":\"error\",\"stage\":\"%s\",\"detail\":\"%s\"}",
                 stage, detail);
     ota_ui_banner(NULL);
-    release_in_progress();   /* clear LAST — modem watchdog resumes now */
+    release_in_progress();
     vTaskDelete(NULL);
 }
 
