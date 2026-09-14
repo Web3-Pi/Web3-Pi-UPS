@@ -1,65 +1,111 @@
 # Web3 Pi UPS — firmware-ESP32-LTE-M
 
-Firmware for the **LTE-M expansion card** for Web3 Pi UPS.
-Provides independent cellular connectivity (NB-IoT / Cat-M) so the UPS
-can keep talking to the internet even when the local network goes down.
+Firmware for the **W3P MODEM V1 LTE-M expansion card** for Web3 Pi UPS.
+Provides cellular telemetry, authenticated commands and firmware updates over
+MQTT, HTTP or Arkiv, independently of the Raspberry Pi's local network.
+
+The current firmware uses **LTE Cat-M1 only**, on **B3 (1800 MHz) and B20
+(800 MHz)**. NB-IoT selection is disabled. See the
+[0.8.14 integration and validation notes](docs/RELEASE-0.8.14.md).
 
 ## Hardware
 
-Prototyped on the [LilyGo T-SIM7080G-S3](https://lilygo.cc/en-us/products/t-sim7080-s3) dev board:
+The committed defaults target the W3P MODEM V1 M.2 card:
 
-- **MCU**: ESP32-S3-WROOM-1 (Xtensa, 16 MB Flash, OPI PSRAM)
-- **Modem**: SimCom SIM7080G (NB-IoT + Cat-M1, **no** 2G/3G/4G fallback)
-- **PMU**: X-Powers AXP2101 (I²C, Li-Ion charging, solar input, controls every rail)
-- **SIM**: 1nce (M2M)
+- **MCU:** ESP32-S3FH4R2, 4 MB flash; PSRAM is disabled.
+- **Modem:** SIMCom SIM7080G, controlled over UART1 at 115200 baud.
+- **Power:** hardware supplies the modem's 3.8 V rail; this card has no AXP2101
+  PMU. The LilyGo PMU path is disabled.
+- **UPS link:** UART2 carries the WUPS protocol to the RP2040.
 
-After we're done prototyping on the dev board, our hardware engineer will
-design a dedicated **M.2 2232** card that plugs into the Web3 Pi UPS expansion
-slot (custom pinout — not NVMe). Communication with the RP2040 inside the
-UPS goes over UART.
+| Modem signal | ESP32 GPIO |
+|---|---|
+| PWRKEY control | 1 |
+| ESP32 TX → modem RX | 2 |
+| ESP32 RX ← modem TX | 4 |
+| DTR, held low | 5 |
+| RI, currently unused by firmware | 6 |
 
-Pinout, power-domain notes, datasheet warnings, and peripheral datasheets:
-[docs/info.md](docs/info.md).
+The M.2 connector uses a custom pinout. The earlier
+[LilyGo board notes](docs/info.md) and
+[LilyGo schematic](docs/T-SIM7080G_Schematic.pdf) are prototype references;
+their flash size, GPIO assignments and PMU setup differ from this target.
 
 ## Current state
 
-Skeleton:
-- boots on ESP32-S3,
-- minimal init (chip info + a heartbeat every 5 s),
-- the full AI ↔ device dev loop works end-to-end (build + flash + monitor + log
-  driven from Claude Code; see [docs/dev-loop.md](docs/dev-loop.md)).
+The firmware establishes PPP using `esp_modem`, supervises the selected backend,
+exchanges telemetry and commands with the RP2040, and supports ESP32 HTTPS OTA
+and relayed RP2040 updates. MQTT producers use bounded application queues;
+an independent monitor checks fresh publication proof. ESP32 OTA has bounded
+download retries, checked HTTP Range resumption and rollback protection.
 
-Roadmap:
-1. **PMU init** — AXP2101 over I²C: DC3 (modem main, 3.0 V), BLDO1 (level shifter, 3.3 V — **must not be turned off**), TS-pin disabled.
-2. **Modem power-on** — pulse PWRKEY on GPIO41, bring up UART1 @ 115200 on pins 4/5.
-3. **AT pass-through** — bridge USB-CDC ⇄ UART1 for hands-on AT exploration.
-4. **PPP** — via the `esp_modem` component from ESP-IDF (supports SIM7080G as a SIM7000/SIM7070 variant); `esp_netif` provides a ready-to-use IP interface.
-5. **MQTT** — via `esp-mqtt` over the PPP TCP/IP stack.
-6. **Arkiv** — on the same stack.
+The modem's radio configuration is read back and verified before registration.
+`CSCLK=0`, `CPSMS=0` and disabled LTE-M eDRX keep the UART and data path available.
+The firmware reads these settings before changing them, avoids redundant
+persistent writes, and verifies the active PSM/eDRX state after registration.
+
+APN selection uses the existing fleet classification: the five known original
+SIM ICCIDs use `iot.1nce.net`; other SIMs use `sensor.net`. The selected APN is
+shared by the DCE configuration and `AT+CGDCONT` from the first connection;
+retries retain it. This restores both fleet profiles when integrating the
+earlier old-SIM-only test image.
+
+Full `AT+CEREG?`, `AT+COPS?` and `AT+CPSI?` replies are logged at startup and
+during CMUX supervision. Additional diagnostics include `AT+CGDCONT?`,
+`AT+CPSMS?`, `AT+CPSMRDP`, `AT+CEDRXS?`, `AT+CEDRX?`, `AT+CEDRXRDP`,
+`AT+CSCLK?`, `AT+CPSMCFG?` and `AT+CPSMCFGEXT?`. Captures are bounded and report
+completion/truncation status. UTC correlation is labelled synchronized only
+after SNTP confirmation; earlier captures are marked unsynchronized.
+Optional diagnostics yield to OTA and PPP loss. Plain DATA-mode fallback has
+no concurrent AT channel, so periodic modem diagnostics are unavailable there.
+
+See [MQTT resilience and its verification limits](docs/MQTT-RESILIENCE.md) for
+queue ownership, recovery and image-confirmation behavior. Short bench tests
+and host fault injection do not establish that field LTE outages are resolved.
 
 ## Requirements
 
-- **ESP-IDF v6.0** installed via [EIM](https://github.com/espressif/idf-im-cli).
+- **ESP-IDF v6.0.2**, with its ESP32-S3 compiler and Python dependencies.
 - macOS / Linux. Windows untested (Bash wrappers, POSIX signals).
-- LilyGo T-SIM7080G-S3 connected over **USB-C** (the ESP32-S3 programming port — *not* the Micro-USB which goes straight to the modem).
+- For flashing or monitoring, USB access to the ESP32-S3 programming/console
+  interface on the W3P MODEM V1 card.
 
 ## Build / flash / monitor
 
-We use local copies of the tools from [ESP32-Ai-Dev-Loop](../../ESP32-Ai-Dev-Loop/) (separate repo, MIT-licensed). Full description in [docs/dev-loop.md](docs/dev-loop.md).
+From this directory, with ESP-IDF v6.0.2 activated:
+
+```sh
+idf.py set-target esp32s3       # first build in a fresh checkout
+idf.py build
+```
+
+`tools/idf` is a local wrapper around the same commands. It currently refers to
+the maintainer's EIM installation and v6.0.2 checkout; use an activated `idf.py`
+directly on another machine. The wrapper coordinates with `tools/serial-monitor`
+when an operation needs the serial port:
 
 ```sh
 # Pane A: serial monitor in the foreground (log → logs/serial.log)
 tools/serial-monitor --truncate
 
 # Pane B: build + flash (the monitor yields the port automatically and reconnects after the flash)
-tools/idf set-target esp32s3       # once, on the first build after cloning
 tools/idf build
 tools/idf flash
 ```
 
-If you have a stale `sdkconfig` from before `sdkconfig.defaults` landed
-(symptom: `flash=2 MB` in the boot banner instead of 16 MB), delete it
-and run `tools/idf reconfigure` to regenerate it from the defaults.
+The generated `sdkconfig` is ignored by Git. For a clean build from the committed
+defaults, preserve any intentional local overrides, remove the stale generated
+configuration, then reconfigure. Verify **4 MB flash**, the custom two-slot
+partition table, rollback support and the incremental MQTT packet-ID option.
+
+The component lock and local MQTT/HTTPS OTA components are part of the build.
+Do not remove the local overrides or change their source hashes to bypass a
+configuration error; the patches and adapter must be reviewed together.
+
+Production Arkiv images require the locally supplied, gitignored
+`main/arkiv_ws_token.h`. Fresh public checkouts and CI compile with the committed
+placeholder instead: WSS push cannot connect and command handling falls back
+to HTTP polling. Keep the real header out of commits and source archives.
 
 ### One-time migration to the two-OTA partition table (OTA-1)
 
@@ -88,24 +134,24 @@ Reset without reflashing (e.g. after a menuconfig change that affects hardware s
 tools/reset
 ```
 
-For an AI client, the Claude Code MCP integration is configured at the
-monorepo level in `Web3-Pi-UPS-Mono-Repo/.mcp.json`. In a Claude Code
-session you'll see native tool calls
-`mcp__esp-idf-lte-m__build_project`, `flash_project`, `set_target`,
-`clean_project`.
-
 ## Layout
 
 ```
 firmware-ESP32-LTE-M/
 ├── CMakeLists.txt           # top-level ESP-IDF project
 ├── README.md                # this file
+├── version.txt              # ESP-IDF application version
+├── components/              # local components, including reviewed SDK patches
 ├── main/
 │   ├── CMakeLists.txt
-│   └── main.c               # entry point + heartbeat (skeleton)
+│   ├── main.c               # application initialization and supervision
+│   ├── modem.c              # SIM7080G, registration, PPP and diagnostics
+│   ├── mqtt.c               # SDK owner, producer queues and health monitor
+│   └── fw_ota.c             # ESP32 OTA and RP2040 update relay
 ├── docs/
-│   ├── info.md              # board overview, pinout, power domains, datasheet notes
-│   ├── dev-loop.md          # pointer to ESP32-Ai-Dev-Loop
+│   ├── RELEASE-0.8.14.md     # integrated changes and validation evidence
+│   ├── MQTT-RESILIENCE.md    # behavior, tests and remaining hardware gates
+│   ├── info.md              # historical LilyGo prototype reference
 │   ├── datasheets/          # PDFs: ESP32-S3-WROOM + SIM7080G (AT, MQTT, TCP/UDP, SSL, SPEC)
 │   ├── T-SIM7080G_Schematic.pdf
 │   └── LilyGo-T-SIM7080G/   # optional local clone of the upstream repo (gitignored)
@@ -121,9 +167,13 @@ firmware-ESP32-LTE-M/
 
 In this repo:
 
-- [docs/info.md](docs/info.md) — board overview, pinout, power domains, datasheet warnings
-- [docs/dev-loop.md](docs/dev-loop.md) — pointer to [ESP32-Ai-Dev-Loop](../../ESP32-Ai-Dev-Loop/), full description of the dev loop
-- [docs/T-SIM7080G_Schematic.pdf](docs/T-SIM7080G_Schematic.pdf) — board schematic (handy for verifying pinout / power domains)
+- [0.8.14 integration notes](docs/RELEASE-0.8.14.md) — modem/PPP/MQTT/OTA changes and validation
+- [MQTT resilience](docs/MQTT-RESILIENCE.md) — ownership, proof, recovery and tests
+- [MQTT stopped-task adapter](../docs/mqtt-sdk-adapter.md) — pinned SDK contract
+- [Local MQTT patch](components/espressif__mqtt/WEB3PI_PATCH.md) and
+  [local HTTPS OTA patch](components/esp_https_ota/PROVENANCE.md) — provenance and regressions
+- [docs/info.md](docs/info.md) — historical LilyGo prototype pinout and power domains
+- [docs/T-SIM7080G_Schematic.pdf](docs/T-SIM7080G_Schematic.pdf) — LilyGo prototype schematic
 - [docs/datasheets/](docs/datasheets/) — the datasheets we actually use:
   - [ESP32-S3-WROOM-1/1U Datasheet](docs/datasheets/esp32-s3-wroom-1_wroom-1u_datasheet_en.pdf)
   - [SIM7080G AT Command Manual V1.05](docs/datasheets/SIM7070_SIM7080_SIM7090_AT_Command_Manual_V1.05.pdf) — the canonical AT reference

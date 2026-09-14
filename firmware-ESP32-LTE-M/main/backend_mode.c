@@ -42,6 +42,13 @@
 
 static wups_backend_mode_t s_cur_mode = WUPS_BACKEND_MODE_MQTT;
 
+/* Owned only by the main heartbeat's post-switch confirmation helper.
+ * MQTT receipt means SDK admission, not broker delivery. Keep that fact
+ * across an NVS write failure so retrying persistence cannot re-submit it. */
+static uint64_t s_confirm_receipt;
+static bool s_confirm_sdk_accepted;
+static bool s_confirm_done;
+
 /* --- helpers -------------------------------------------------------------- */
 
 const char *backend_mode_name(wups_backend_mode_t mode)
@@ -113,7 +120,7 @@ static uint16_t encode_mqtt_frame(uint8_t *out, size_t cap,
 /* Publish over MQTT (only meaningful when current mode is MQTT). */
 static esp_err_t emit_via_mqtt(wups_backend_mode_t from,
                                wups_backend_mode_t to,
-                               bool pending)
+                               bool pending, uint64_t *receipt)
 {
     uint8_t payload[4];
     build_mode_changed_payload(payload, from, to, pending);
@@ -131,7 +138,9 @@ static esp_err_t emit_via_mqtt(wups_backend_mode_t from,
     /* QoS 1 + retain=false: we want at-least-once delivery on the live
      * channel, but the event is a point-in-time signal — replaying a
      * stale "switching to arkiv" weeks later would be misleading. */
-    int rc = mqtt_publish_raw(topic, frame, n, /* qos */ 1, /* retain */ false);
+    int rc = receipt
+        ? mqtt_publish_tracked(topic, frame, n, 1, false, receipt)
+        : mqtt_publish_critical(topic, frame, n, 1, false);
     return rc >= 0 ? ESP_OK : ESP_FAIL;
 }
 
@@ -183,7 +192,7 @@ static esp_err_t emit_via_arkiv(wups_backend_mode_t from,
 }
 
 /* Dispatch the mode_changed event over whichever channel is active.
- * Returns ESP_OK if anything was published, ESP_ERR_NOT_SUPPORTED for
+ * Returns ESP_OK if locally submitted, ESP_ERR_NOT_SUPPORTED for
  * HTTP (no channel to our backend in that mode), other errors otherwise. */
 static esp_err_t emit_mode_changed(wups_backend_mode_t from,
                                    wups_backend_mode_t to,
@@ -191,7 +200,7 @@ static esp_err_t emit_mode_changed(wups_backend_mode_t from,
 {
     switch (s_cur_mode) {
         case WUPS_BACKEND_MODE_MQTT:
-            return emit_via_mqtt(from, to, pending);
+            return emit_via_mqtt(from, to, pending, NULL);
         case WUPS_BACKEND_MODE_ARKIV:
             return emit_via_arkiv(from, to, pending);
         case WUPS_BACKEND_MODE_HTTP:
@@ -272,7 +281,7 @@ esp_err_t backend_mode_request_switch(wups_backend_mode_t new_mode)
      *     switch happen until/unless the new channel reports back. */
     esp_err_t emit_err = emit_mode_changed(s_cur_mode, new_mode, /* pending */ true);
     if (emit_err != ESP_OK) {
-        ESP_LOGW(TAG, "pre-switch hint not delivered (%s) — proceeding with switch anyway",
+        ESP_LOGW(TAG, "pre-switch hint submission failed (%s) — proceeding with switch anyway",
                  esp_err_to_name(emit_err));
     } else {
         /* Give the MQTT/Arkiv stack time to actually flush the frame
@@ -283,7 +292,7 @@ esp_err_t backend_mode_request_switch(wups_backend_mode_t new_mode)
          * hint. 2 s is conservative but the user-visible switch already
          * takes ~10 s end-to-end (modem boot dominates) so this doesn't
          * regress UX. */
-        ESP_LOGI(TAG, "pre-switch hint emitted — flushing for 2 s before reboot");
+        ESP_LOGI(TAG, "pre-switch hint submitted — allowing 2 s to flush before reboot (delivery unconfirmed)");
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
@@ -352,51 +361,92 @@ void backend_mode_factory_reset(void)
     esp_restart();
 }
 
+static bool clear_post_switch_marker(void)
+{
+    nvs_handle_t wh;
+    if (nvs_open(NS_MODE, NVS_READWRITE, &wh) != ESP_OK) return false;
+    esp_err_t erase_err = nvs_erase_key(wh, KEY_PREV_MODE);
+    bool cleared = (erase_err == ESP_OK || erase_err == ESP_ERR_NVS_NOT_FOUND) &&
+                   nvs_commit(wh) == ESP_OK;
+    nvs_close(wh);
+    if (!cleared) ESP_LOGW(TAG, "post-switch confirm marker persistence deferred");
+    return cleared;
+}
+
 void backend_mode_emit_post_switch_confirm(void)
 {
+    if (s_confirm_done) return;
+    if (s_confirm_sdk_accepted) {
+        s_confirm_done = clear_post_switch_marker();
+        return;
+    }
     /* Read prev_mode; if set, this boot is a post-switch boot and we
      * should announce ourselves on the NEW channel. Idempotent — we
-     * only clear the NVS marker AFTER a successful emit so that a
+     * only clear the MQTT marker AFTER SDK admission so that a
      * caller polling us from a heartbeat loop can retry while the
      * channel comes up. */
     nvs_handle_t rh;
-    if (nvs_open(NS_MODE, NVS_READONLY, &rh) != ESP_OK) return;
+    esp_err_t open_err = nvs_open(NS_MODE, NVS_READONLY, &rh);
+    if (open_err != ESP_OK) {
+        if (open_err == ESP_ERR_NVS_NOT_FOUND) s_confirm_done = true;
+        return;
+    }
     uint8_t prev = WUPS_BACKEND_MODE_UNKNOWN;
     esp_err_t err = nvs_get_u8(rh, KEY_PREV_MODE, &prev);
     nvs_close(rh);
-    if (err != ESP_OK) return;
-    if (!is_known_mode(prev) || prev == s_cur_mode) {
-        /* Stale / invalid marker — silently clear so we don't keep
-         * doing the NVS read on every heartbeat tick. */
-        nvs_handle_t wh;
-        if (nvs_open(NS_MODE, NVS_READWRITE, &wh) == ESP_OK) {
-            nvs_erase_key(wh, KEY_PREV_MODE);
-            nvs_commit(wh);
-            nvs_close(wh);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            if (s_confirm_receipt) mqtt_receipt_forget(s_confirm_receipt);
+            s_confirm_receipt = 0;
+            s_confirm_done = true;
         }
         return;
     }
-
-    esp_err_t emit_err = emit_mode_changed((wups_backend_mode_t)prev,
-                                           s_cur_mode,
-                                           /* pending */ false);
-    if (emit_err != ESP_OK) {
-        /* Quiet log — caller is polling us from the heartbeat loop, so
-         * a "not ready yet" emit is expected for the first several ticks
-         * after a mode switch (PPP+MQTT or PPP+Arkiv WS startup). */
-        ESP_LOGD(TAG, "post-switch confirm deferred (%s)", esp_err_to_name(emit_err));
+    if (!is_known_mode(prev) || prev == s_cur_mode) {
+        /* Stale / invalid marker — silently clear so we don't keep
+         * doing the NVS read on every heartbeat tick. */
+        s_confirm_done = clear_post_switch_marker();
+        if (s_confirm_receipt) mqtt_receipt_forget(s_confirm_receipt);
+        s_confirm_receipt = 0;
         return;
     }
 
-    ESP_LOGI(TAG, "post-switch confirm sent: %s -> %s",
-             backend_mode_name((wups_backend_mode_t)prev),
-             backend_mode_name(s_cur_mode));
-    /* Success — clear the marker so we don't re-emit on the next tick or
-     * the next clean boot. */
-    nvs_handle_t wh;
-    if (nvs_open(NS_MODE, NVS_READWRITE, &wh) == ESP_OK) {
-        nvs_erase_key(wh, KEY_PREV_MODE);
-        nvs_commit(wh);
-        nvs_close(wh);
+    if (s_cur_mode == WUPS_BACKEND_MODE_MQTT) {
+        if (!s_confirm_sdk_accepted) {
+            if (!s_confirm_receipt) {
+                esp_err_t submit_err = emit_via_mqtt((wups_backend_mode_t)prev,
+                                                     s_cur_mode, false,
+                                                     &s_confirm_receipt);
+                if (submit_err == ESP_OK) {
+                    ESP_LOGI(TAG, "post-switch confirm submitted locally; awaiting SDK admission");
+                } else {
+                    ESP_LOGD(TAG, "post-switch confirm submission deferred (%s)",
+                             esp_err_to_name(submit_err));
+                }
+                return;
+            }
+            mqtt_receipt_status_t status = mqtt_receipt_take(s_confirm_receipt);
+            if (status == MQTT_RECEIPT_PENDING) return;
+            s_confirm_receipt = 0; /* terminal receipts are released by take */
+            if (status != MQTT_RECEIPT_SDK_ACCEPTED) {
+                ESP_LOGW(TAG, "post-switch confirm was not admitted by MQTT SDK; retry deferred");
+                return;
+            }
+            s_confirm_sdk_accepted = true;
+            ESP_LOGI(TAG, "post-switch confirm admitted by MQTT SDK; broker delivery unconfirmed");
+        }
+    } else {
+        esp_err_t emit_err = emit_mode_changed((wups_backend_mode_t)prev,
+                                               s_cur_mode, false);
+        if (emit_err != ESP_OK) {
+            ESP_LOGD(TAG, "post-switch confirm deferred (%s)", esp_err_to_name(emit_err));
+            return;
+        }
+        ESP_LOGI(TAG, "post-switch confirm submitted to %s",
+                 backend_mode_name(s_cur_mode));
     }
+
+    /* MQTT SDK now owns transmission/retry. NVS clearing is not evidence
+     * of a broker ACK; preserve the previous SDK-admission boundary. */
+    s_confirm_done = clear_post_switch_marker();
 }

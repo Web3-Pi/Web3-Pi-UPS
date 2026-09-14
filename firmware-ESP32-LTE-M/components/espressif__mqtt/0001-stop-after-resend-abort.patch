@@ -1,0 +1,48 @@
+--- a/mqtt_client.c
++++ b/mqtt_client.c
+@@ -1,3 +1,7 @@
++/* Modified by Web3-Pi, 2026-09-14: terminate the CONNECTED iteration after
++ * resend failure; abort once if retransmitted PUBREL construction fails.
++ * See WEB3PI_PATCH.md and 0001-stop-after-resend-abort.patch for provenance.
++ */
+ #include <stdint.h>
+ #include <stdlib.h>
+ #include <time.h>
+@@ -1589,6 +1593,7 @@
+         }
+         if (client->mqtt_state.connection.outbound_message.length == 0) {
+             ESP_LOGE(TAG, "Publish response message PUBREL cannot be created");
++            esp_mqtt_abort_connection(client);
+             return ESP_FAIL;
+         }
+ 
+@@ -1763,6 +1768,9 @@
+                         }
+ #endif
+                     }
++                } else {
++                    // The resend helper aborted the transport; stop this connected iteration.
++                    break;
+                 }
+                 // resend other "transmitted" messages after 1s
+             } else if (has_timed_out(last_retransmit, client->config->message_retransmit_timeout)) {
+@@ -1775,6 +1783,9 @@
+                             esp_mqtt5_increment_packet_counter(client);
+                         }
+ #endif
++                    } else {
++                        // Do not send another outbox item or PING on the closed transport.
++                        break;
+                     }
+                 }
+                 item = outbox_dequeue(client->outbox, ACKNOWLEDGED, &msg_tick);
+@@ -1785,6 +1796,9 @@
+                             esp_mqtt5_increment_packet_counter(client);
+                         }
+ #endif
++                    } else {
++                        // Do not send another outbox item or PING on the closed transport.
++                        break;
+                     }
+                 }
+             }

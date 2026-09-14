@@ -1,0 +1,82 @@
+--- a/src/esp_https_ota.c
++++ b/src/esp_https_ota.c
+@@ -2,6 +2,10 @@
+  * SPDX-FileCopyrightText: 2017-2026 Espressif Systems (Shanghai) CO LTD
+  *
+  * SPDX-License-Identifier: Apache-2.0
++ *
++ * Modified by Web3-Pi, 2026-09-14: return distinct HTTP transport errors
++ * instead of spinning on an incomplete image header. See PROVENANCE.md
++ * and 0001-return-header-transport-errors.patch for scope and provenance.
+  */
+ 
+ #include <stdio.h>
+@@ -606,18 +610,22 @@
+                                           data_read_size);
+         if (data_read < 0) {
+             if (data_read == -ESP_ERR_HTTP_EAGAIN) {
+-                ESP_LOGD(TAG, "ESP_ERR_HTTP_EAGAIN invoked: Call timed out before data was ready");
+-                continue;
++                ESP_LOGD(TAG, "Image header read timed out; caller must abort and retry");
++                return ESP_ERR_HTTP_EAGAIN;
+             }
+             ESP_LOGE(TAG, "Connection closed, errno = %d", errno);
+-            break;
++            return ESP_ERR_HTTP_CONNECTION_CLOSED;
++        }
++        if (data_read == 0) {
++            ESP_LOGE(TAG, "Connection closed before complete image headers were received");
++            return ESP_ERR_HTTP_INCOMPLETE_DATA;
+         }
+         data_read_size -= data_read;
+         bytes_read += data_read;
+     }
+     if (data_read_size > 0) {
+         ESP_LOGE(TAG, "Complete headers were not received");
+-        return ESP_FAIL;
++        return ESP_ERR_HTTP_INCOMPLETE_DATA;
+     }
+     handle->binary_file_len = bytes_read;
+     return ESP_OK;
+@@ -661,8 +669,9 @@
+         ESP_RETURN_ON_ERROR(ret, TAG, "partition read failed %d", ret);
+         img_info = (void *) handle->ota_upgrade_buf;
+     } else {
+-        if (read_header(handle) != ESP_OK) {
+-            return ESP_FAIL;
++        esp_err_t header_err = read_header(handle);
++        if (header_err != ESP_OK) {
++            return header_err;
+         }
+         img_info = (void *)&handle->ota_upgrade_buf[offset];
+     }
+@@ -759,8 +768,9 @@
+             if (handle->binary_file_len) {
+                 binary_file_len = handle->binary_file_len;
+             } else {
+-                if (read_header(handle) != ESP_OK) {
+-                    return ESP_FAIL;
++                esp_err_t header_err = read_header(handle);
++                if (header_err != ESP_OK) {
++                    return header_err;
+                 }
+                 binary_file_len = IMAGE_HEADER_SIZE;
+             }
+@@ -817,7 +827,7 @@
+                  */
+                 if (!esp_http_client_is_complete_data_received(handle->http_client)) {
+                     ESP_LOGE(TAG, "Connection closed before complete data was received!");
+-                    return ESP_FAIL;
++                    return ESP_ERR_HTTP_INCOMPLETE_DATA;
+                 }
+                 ESP_LOGD(TAG, "Connection closed");
+             } else if (data_read > 0) {
+@@ -842,7 +852,7 @@
+                     return ESP_ERR_HTTPS_OTA_IN_PROGRESS;
+                 }
+                 ESP_LOGE(TAG, "data read %d, errno %d", data_read, errno);
+-                return ESP_FAIL;
++                return ESP_ERR_HTTP_CONNECTION_CLOSED;
+             }
+ #if CONFIG_ESP_HTTPS_OTA_ENABLE_PARTIAL_DOWNLOAD
+             if (!handle->partial_http_download || (handle->partial_http_download && handle->image_length == handle->binary_file_len))

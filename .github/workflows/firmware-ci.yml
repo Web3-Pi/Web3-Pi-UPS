@@ -11,6 +11,7 @@ on:
       - 'firmware-ESP32-LTE-M/**'
       - 'firmware-ch32x/**'
       - 'common/**'
+      - 'tools/**'
       - '.github/workflows/firmware-ci.yml'
   pull_request:
     paths:
@@ -18,10 +19,31 @@ on:
       - 'firmware-ESP32-LTE-M/**'
       - 'firmware-ch32x/**'
       - 'common/**'
+      - 'tools/**'
       - '.github/workflows/firmware-ci.yml'
   workflow_dispatch:
 
 jobs:
+  host-regressions:
+    name: MQTT, OTA and protocol host regressions (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test actual MQTT modules and adapters
+        env:
+          MQTT_TEST_SANITIZERS: address,undefined
+        run: |
+          for test in tools/test_mqtt_*.py tools/test_fw_ota_*.py tools/test_modem_*.py; do
+            python3 "$test"
+          done
+          python3 tools/test_wups_deframer.py
+          python3 tools/test_http_cmd_loop.py
+          cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I firmware-ESP32-LTE-M/main tools/test_power_status_decode.c -o /tmp/power-status-test
+          /tmp/power-status-test
+
   rp2040:
     name: RP2040 (PlatformIO / arduino-pico 5.6.1)
     runs-on: ubuntu-latest
@@ -59,6 +81,7 @@ jobs:
           esp_idf_version: v6.0.2
           target: esp32s3
           path: firmware-ESP32-LTE-M
+          command: idf.py build && python3 ../tools/test_arkiv_balance.py && python3 ../tools/test_arkiv_cmd_poll.py
       - uses: actions/upload-artifact@v7
         with:
           name: esp32-firmware

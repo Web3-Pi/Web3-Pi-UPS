@@ -1,4 +1,8 @@
 #include "modem.h"
+#include "modem_radio_policy.h"
+#include "modem_awake_policy.h"
+#include "modem_support_diag.h"
+#include "modem_diag_clock.h"
 #include "mqtt.h"
 #include "identity.h"
 #include "backend_mode.h"
@@ -40,12 +44,12 @@
 
 /* W3P MODEM V1 (M.2) pinout — ESP32-S3FH4R2 ↔ SIM7080G UART1.
  * (Was LilyGo T-SIM7080G-S3: PWRKEY=41, DTR=42, RI=3, RX=4, TX=5. GPIO3 is a
- *  strapping pin and is left NC on the M.2 card.) Only PWRKEY/TX/RX are used
- *  in software; DTR/RI are routed but not driven here. */
+ *  strapping pin and is left NC on the M.2 card.) DTR is held low to keep
+ *  the AT UART awake; RI is routed but not handled here. */
 #define MODEM_PWR_GPIO     1   /* ESP_PWRKEY    → SIM7080G PWRKEY */
 #define MODEM_TX_GPIO      2   /* ESP_UART1_TXD : ESP TX → Modem RX */
 #define MODEM_RX_GPIO      4   /* ESP_UART1_RXD : ESP RX ← Modem TX */
-#define MODEM_DTR_GPIO     5   /* ESP_UART1_DTR (not driven in SW) */
+#define MODEM_DTR_GPIO     5   /* ESP_UART1_DTR -> SIM7080G via TXB0108 */
 #define MODEM_RI_GPIO      6   /* ESP_UART1_RI  (not driven in SW) */
 
 #define MODEM_UART        UART_NUM_1
@@ -66,21 +70,18 @@
  *   "AT\r\r\nOK\r\n"      -> path alive, translator working. */
 #define MODEM_UART_DIAG   0
 
-/* Attach/PDP APN candidates, tried round-robin: the LTE attach carries the
- * CGDCONT cid-1 APN, and a wrong one is torn down by the core right after
- * attach (same-second Update+Purge in the 1NCE portal, device stuck at
- * CEREG stat=2). New-batch SIMs (2026-08) use sensor.net, the original
- * batch iot.1nce.net — every registration timeout advances to the next
- * candidate, so either batch registers by the second 90 s round. */
-static const char *s_apn_candidates[] = { "sensor.net", "iot.1nce.net" };
-static size_t      s_apn_idx = 0;
-static bool        s_apn_seeded = false;   /* start APN picked from ICCID prefix */
-#define APN_CANDIDATE_COUNT (sizeof(s_apn_candidates) / sizeof(s_apn_candidates[0]))
+/* Select the fleet APN once after reading the SIM identity. Registration
+ * failures must not rotate away from the SIM's configured APN. The first
+ * DCE is created before ICCID is available, so its cached PDP context must
+ * be synchronized with this selection before RF resume and PPP setup. */
+static const char *s_apn = "sensor.net";
+static bool s_apn_seeded = false;
 
 #define EVT_GOT_IP        BIT0
 #define EVT_LOST_IP       BIT1
 #define EVT_PPP_FAIL      BIT2
 #define EVT_MQTT_DOWN     BIT3   /* 0.8.7: early supervisor wake on MQTT drop */
+#define EVT_PPP_CHANGED   (EVT_GOT_IP | EVT_LOST_IP | EVT_PPP_FAIL)
 
 /* Supervisor backoff: start short, cap at 60s. After this many consecutive
  * bring-up failures we give the modem a full PWRKEY power cycle, since the
@@ -159,28 +160,6 @@ static bool        s_apn_seeded = false;   /* start APN picked from ICCID prefix
 #define CMUX_ENTRY_FAILS_MAX  2
 #define CMUX_FALLBACK_RETRY_S  (24 * 3600)
 
-/* 0.8.7 — supervisor-driven MQTT reconnect schedule. esp-mqtt runs with
- * auto-reconnect disabled; the supervisor requests every attempt. Normal
- * cadence mirrors the component's old 10 s timer. An unclaimed unit (no
- * EMQX account until the panel claim, ADR-0004) is refused with CONNACK
- * rc=5 on every attempt, and each attempt pays a full TCP+TLS handshake
- * (~5 KB — ~40 MB/day at a 10 s cadence, on a 500 MB SIM plan): once
- * mqtt.c latches the refusal streak, the interval doubles 30→120 s. Cap =
- * 2 min (Robert's pick 2026-08-21): worst-case claim→online latency stays
- * acceptable while the shelf cost drops to ~3 MB/day. While disconnected
- * we tick the supervise loop faster so attempts land near their due time. */
-#define MQTT_RETRY_NORMAL_S    10
-#define AUTH_BACKOFF_MIN_S     30
-#define AUTH_BACKOFF_MAX_S    120
-#define MQTT_DOWN_TICK_MS   10000
-/* Any sustained connect-failure streak (broker down/half-up — same full-TLS
- * cost per attempt as a refusal) joins the same backoff ramp. */
-#define MQTT_FAIL_STREAK_LATCH  6
-/* Reconnect requests rejected this many times in a row while disconnected =
- * the esp-mqtt task is dead (transport re-alloc OOM self-deletes it) —
- * revive it with esp_mqtt_client_start(), which the component only accepts
- * when the task is really gone. */
-#define MQTT_RECONN_REJECTS_MAX 20
 /* Backend-outage hold (probes OK, uplink dead): after this long raise the
  * OLED alert anyway — WITHOUT modem resets — so a genuinely wedged client
  * is never silent forever. Long on purpose: routine backend redeploys must
@@ -200,16 +179,7 @@ static EventGroupHandle_t s_modem_evt;
 static esp_netif_t       *s_ppp_netif;
 static esp_modem_dce_t   *s_dce;
 static bool               s_iccid_known;       /* set true once AT+CCID populated identity */
-static bool               s_mqtt_started;
-
-/* 0.8.7 reconnect-schedule state (see MQTT_RETRY_NORMAL_S and the
- * AUTH_BACKOFF constants above). Owned by the supervisor task; survives
- * PPP re-dials on purpose — an unclaimed unit keeps its backoff ramp
- * across link drops. next_attempt==0 means "not scheduled yet" (client
- * just started / just disconnected) and counts as due immediately. */
-static uint32_t s_mqtt_next_attempt_s;
-static uint32_t s_mqtt_backoff_s = AUTH_BACKOFF_MIN_S;
-static int      s_mqtt_reconn_rejects;   /* consecutive rejected requests */
+static bool               s_initial_connectivity_checked;
 
 void modem_notify_mqtt_down(void)
 {
@@ -218,11 +188,159 @@ void modem_notify_mqtt_down(void)
     }
 }
 
-/* PPP holds an IP right now — single-word read, safe from any task. Used by
- * fw_ota to refuse an update with no link (OTA-1). */
-static volatile bool      s_ppp_up;
+/* PPP lifecycle state: event bits are wakeups, never an unordered history
+ * of success/failure. The default event loop serializes the two callbacks;
+ * this short lock also orders their observations against supervisor actions.
+ * No SDK, logging or FreeRTOS event-group call is made while holding it.
+ * attempt/sequence identify LOCAL observations, not SDK session identifiers:
+ * esp-netif keeps one netif and its LOST_IP timer across DCE recreation. */
+typedef enum {
+    PPP_PREPARING = 0,  /* no new dial yet; previous-session events ignored */
+    PPP_STARTING,       /* dialing, awaiting the first address */
+    PPP_UP,
+    PPP_DOWN,
+    PPP_STOPPING,       /* intentional teardown has committed */
+} ppp_phase_t;
 
-bool modem_ppp_is_up(void) { return s_ppp_up; }
+typedef enum {
+    PPP_OBS_NONE = 0,
+    PPP_OBS_GOT_IP,
+    PPP_OBS_LOST_IP,
+    PPP_OBS_ERROR,
+} ppp_observation_t;
+
+typedef struct {
+    ppp_phase_t phase;
+    ppp_observation_t observation;
+    int32_t error;
+    uint32_t attempt;
+    uint32_t sequence;
+    bool had_ip;
+} ppp_event_state_t;
+
+static portMUX_TYPE s_ppp_event_lock = portMUX_INITIALIZER_UNLOCKED;
+static ppp_event_state_t s_ppp_state = {.phase = PPP_STOPPING};
+/* END PPP lifecycle state */
+
+static ppp_event_state_t ppp_events_snapshot(void)
+{
+    portENTER_CRITICAL(&s_ppp_event_lock);
+    ppp_event_state_t state = s_ppp_state;
+    portEXIT_CRITICAL(&s_ppp_event_lock);
+    return state;
+}
+
+/* Called from OTA and diagnostics as well as the supervisor. */
+bool modem_ppp_is_up(void)
+{
+    return ppp_events_snapshot().phase == PPP_UP;
+}
+
+static void ppp_events_begin_attempt(void)
+{
+    /* Clear notifications before resetting the state. A late wakeup from a
+     * previous callback is harmless: decisions always read the state below. */
+    xEventGroupClearBits(s_modem_evt, EVT_PPP_CHANGED);
+    portENTER_CRITICAL(&s_ppp_event_lock);
+    s_ppp_state.attempt++;
+    s_ppp_state.sequence++;
+    s_ppp_state.phase = PPP_PREPARING;
+    s_ppp_state.observation = PPP_OBS_NONE;
+    s_ppp_state.error = 0;
+    s_ppp_state.had_ip = false;
+    portEXIT_CRITICAL(&s_ppp_event_lock);
+}
+
+static void ppp_events_start_dial(void)
+{
+    /* Before either CMUX or DATA can start PPP, never after GOT_IP. Events
+     * during registration belonged to a netif with no new PPP session. */
+    portENTER_CRITICAL(&s_ppp_event_lock);
+    s_ppp_state.phase = PPP_STARTING;
+    s_ppp_state.observation = PPP_OBS_NONE;
+    s_ppp_state.error = 0;
+    s_ppp_state.had_ip = false;
+    s_ppp_state.sequence++;
+    portEXIT_CRITICAL(&s_ppp_event_lock);
+}
+
+static void ppp_events_begin_stop(void)
+{
+    portENTER_CRITICAL(&s_ppp_event_lock);
+    s_ppp_state.phase = PPP_STOPPING;
+    s_ppp_state.sequence++;
+    portEXIT_CRITICAL(&s_ppp_event_lock);
+}
+
+static bool ppp_events_take_loss(void)
+{
+    /* Recheck and commit together. A newer GOT before this decision wins;
+     * a GOT after it cannot resurrect a DCE already selected for teardown. */
+    portENTER_CRITICAL(&s_ppp_event_lock);
+    bool lost = s_ppp_state.phase == PPP_DOWN;
+    if (lost) {
+        s_ppp_state.phase = PPP_STOPPING;
+        s_ppp_state.sequence++;
+    }
+    portEXIT_CRITICAL(&s_ppp_event_lock);
+    return lost;
+}
+
+static bool ppp_events_observe(ppp_observation_t observation, int32_t error)
+{
+    portENTER_CRITICAL(&s_ppp_event_lock);
+    ppp_phase_t before = s_ppp_state.phase;
+    bool accepted = before != PPP_STOPPING && before != PPP_PREPARING;
+    s_ppp_state.sequence++;
+    if (accepted) {
+        s_ppp_state.observation = observation;
+        s_ppp_state.error = error;
+        if (observation == PPP_OBS_GOT_IP) {
+            s_ppp_state.phase = PPP_UP;
+            s_ppp_state.had_ip = true;
+        } else if (observation == PPP_OBS_ERROR || s_ppp_state.had_ip) {
+            s_ppp_state.phase = PPP_DOWN;
+        }
+        /* LOST before this attempt's first GOT is not evidence that a fresh
+         * connection failed. The previous netif's 120s timer can fire even
+         * during the new dial. Keep waiting for GOT or the bounded timeout.
+         * Do not let such LOST erase a preceding explicit terminal error. */
+    }
+    ppp_event_state_t state = s_ppp_state;
+    portEXIT_CRITICAL(&s_ppp_event_lock);
+    ESP_LOGI(MODEM_TAG,
+             "PPP event attempt=%u seq=%u obs=%d error=%ld phase=%d->%d %s",
+             (unsigned)state.attempt, (unsigned)state.sequence,
+             (int)observation, (long)error, (int)before, (int)state.phase,
+             accepted ? "applied" : "ignored outside active dial/session");
+    if (accepted) {
+        EventBits_t wake = observation == PPP_OBS_GOT_IP ? EVT_GOT_IP :
+                          observation == PPP_OBS_LOST_IP ? EVT_LOST_IP : EVT_PPP_FAIL;
+        xEventGroupSetBits(s_modem_evt, wake);
+    }
+    return accepted;
+}
+
+static ppp_phase_t ppp_events_wait_for_link(uint32_t timeout_ms)
+{
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    for (;;) {
+        const int64_t remaining = deadline - esp_timer_get_time();
+        portENTER_CRITICAL(&s_ppp_event_lock);
+        ppp_phase_t phase = s_ppp_state.phase;
+        if (phase == PPP_DOWN || (remaining <= 0 && phase != PPP_UP)) {
+            s_ppp_state.phase = PPP_STOPPING;
+            s_ppp_state.sequence++;
+        }
+        portEXIT_CRITICAL(&s_ppp_event_lock);
+        if (phase == PPP_UP || phase == PPP_DOWN) return phase;
+        if (remaining <= 0) return PPP_STARTING; /* timeout, no IP */
+        TickType_t wait = pdMS_TO_TICKS((uint32_t)((remaining + 999) / 1000));
+        if (wait == 0) wait = 1;
+        (void)xEventGroupWaitBits(s_modem_evt, EVT_PPP_CHANGED,
+                                  pdTRUE, pdFALSE, wait);
+    }
+}
 
 /* CMUX session state. `s_cmux_active` = the current DCE runs PPP + AT
  * multiplexed (so we may poll AT while data flows). `s_cmux_dirty` = a CMUX
@@ -276,6 +394,8 @@ static inline uint32_t now_s(void)
 typedef enum {
     MODEM_FAIL_NONE = 0,
     MODEM_FAIL_AT,     /* modem never answered AT                    */
+    MODEM_FAIL_RADIO,   /* strict LTE-M / B3+B20 policy not verified */
+    MODEM_FAIL_AWAKE,   /* CSCLK / PSM / CAT-M eDRX off not verified */
     MODEM_FAIL_SIM,    /* AT ok, but no SIM/ICCID (CPIN/CCID failed) */
     MODEM_FAIL_NET,    /* SIM ok, but no registration / no PPP IP    */
     MODEM_FAIL_UPLINK, /* 0.8.7: internet fine, backend unreachable  */
@@ -289,6 +409,8 @@ static int          s_alert_clear_pending;  /* recovery clears still to re-send 
 static const char *modem_fail_msg(modem_fail_t f)
 {
     switch (f) {
+    case MODEM_FAIL_RADIO:  return "RADIO CONFIG";
+    case MODEM_FAIL_AWAKE:  return "MODEM CONFIG";
     case MODEM_FAIL_SIM:    return "SIM ERROR";
     case MODEM_FAIL_NET:    return "NO NETWORK";
     case MODEM_FAIL_UPLINK: return "NO UPLINK";
@@ -330,6 +452,126 @@ static int8_t csq_to_dbm(int csq)
     return (int8_t)(-113 + 2 * csq);
 }
 
+/* Full AT replies: esp_modem_at() returns only the last non-terminal line
+ * (and caps it at 128 bytes), losing CAT-M in the two-line CBANDCFG reply.
+ * This collector is owned only by ppp_sup. esp_modem_command() serializes
+ * commands and detaches its callback under line_lock before returning.
+ * The inflatable DTE option is required for cumulative replies also in CMUX.
+ * Logging is restricted to these radio/status commands: never credentials. */
+#if !CONFIG_ESP_MODEM_USE_INFLATABLE_BUFFER_IF_NEEDED
+#error "Full modem diagnostics require cumulative CMUX response buffering"
+#endif
+static struct {
+    char data[MODEM_RADIO_RESPONSE_CAPACITY];
+    size_t length;
+    bool invalid;
+} s_radio_reply;
+
+static esp_err_t radio_reply_cb(uint8_t *data, size_t length)
+{
+    if (!data) {
+        s_radio_reply.invalid = length != 0;
+        return length ? ESP_FAIL : ESP_ERR_NOT_FINISHED;
+    }
+    if (length >= sizeof(s_radio_reply.data) || memchr(data, '\0', length)) {
+        s_radio_reply.invalid = true;
+        return ESP_FAIL;
+    }
+    for (size_t i = 0; i < length; ++i) {
+        if ((data[i] < 32 && data[i] != '\r' && data[i] != '\n' && data[i] != '\t') ||
+            data[i] > 126) {
+            s_radio_reply.invalid = true;
+            return ESP_FAIL;
+        }
+    }
+    memcpy(s_radio_reply.data, data, length);
+    s_radio_reply.data[length] = '\0';
+    s_radio_reply.length = length;
+    modem_radio_response_status_t status =
+        modem_radio_response_status(s_radio_reply.data, length);
+    if (status == MODEM_RADIO_RESPONSE_ERROR) return ESP_FAIL;
+    return status == MODEM_RADIO_RESPONSE_OK ? ESP_OK : ESP_ERR_NOT_FINISHED;
+}
+
+static bool radio_at(void *context, const char *command, char *response,
+                     size_t capacity, unsigned timeout_ms)
+{
+    (void)context;
+    char wire[80];
+    int n = snprintf(wire, sizeof(wire), "%s\r", command);
+    if (!response || capacity == 0 || n < 0 || (size_t)n >= sizeof(wire)) return false;
+    response[0] = '\0';
+    memset(&s_radio_reply, 0, sizeof(s_radio_reply));
+    modem_diag_clock_log(command);
+    esp_err_t rc = esp_modem_command(s_dce, wire, radio_reply_cb, timeout_ms);
+    bool complete = rc == ESP_OK && !s_radio_reply.invalid &&
+        s_radio_reply.length < capacity &&
+        modem_radio_response_status(s_radio_reply.data, s_radio_reply.length) ==
+            MODEM_RADIO_RESPONSE_OK;
+    ESP_LOGI(MODEM_TAG, "AT reply begin [%s] rc=%s complete=%d bytes=%u",
+             command, esp_err_to_name(rc), complete, (unsigned)s_radio_reply.length);
+    /* One timestamped line per response line. Preserve every field, remove
+     * only CR/LF framing. Reject binary replies instead of injecting controls. */
+    if (!s_radio_reply.invalid) {
+        const char *p = s_radio_reply.data;
+        while (*p) {
+            size_t len = strcspn(p, "\r\n");
+            if (len) ESP_LOGI(MODEM_TAG, "AT [%s] %.*s", command, (int)len, p);
+            p += len;
+            while (*p == '\r' || *p == '\n') ++p;
+        }
+    }
+    ESP_LOGI(MODEM_TAG, "AT reply end [%s]%s", command,
+             s_radio_reply.invalid ? " INVALID/OVERSIZE" : "");
+    if (complete) memcpy(response, s_radio_reply.data, s_radio_reply.length + 1);
+    return complete;
+}
+
+/* Read-only support diagnostics share the supervisor's AT ownership. Check
+ * again before every command: OTA or PPP loss can arrive during a snapshot.
+ * Before PPP there is no data stream; live sessions require the CMUX channel. */
+static bool modem_support_diag_ready(void *context)
+{
+    const bool live_ppp = *(const bool *)context;
+    if (!s_dce || fw_ota_in_progress()) return false;
+    if (!live_ppp) return true;
+    return s_cmux_active && modem_ppp_is_up();
+}
+
+static void modem_support_snapshot(bool live_ppp)
+{
+    modem_support_diag_run(s_dce, modem_support_diag_ready, &live_ppp);
+}
+
+/* Network-provided values can lag registration. Retry only the two
+ * read-only checks; never rewrite settings or reset RF between attempts.
+ * At most 3 * (2 * 3 s) + 2 * 1 s waiting, then the usual paced retry. */
+static bool modem_awake_check_before_ppp(void)
+{
+    for (unsigned attempt = 0; attempt < 3; ++attempt) {
+        if (modem_awake_verify_active(radio_at, NULL)) {
+            ESP_LOGI(MODEM_TAG, "awake policy verified: CSCLK=0 PSM=0 CAT-M eDRX=0");
+            return true;
+        }
+        ESP_LOGW(MODEM_TAG, "awake runtime readback not confirmed (%u/3)", attempt + 1);
+        if (attempt + 1 < 3) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    char reply[MODEM_RADIO_RESPONSE_CAPACITY];
+    (void)radio_at(NULL, "AT+CFUN=4", reply, sizeof(reply), 10000);
+    ESP_LOGE(MODEM_TAG, "awake policy runtime state unknown/enabled; PPP blocked, RF-off requested");
+    s_fail_stage = MODEM_FAIL_AWAKE;
+    return false;
+}
+
+static void modem_network_snapshot(const char *reason)
+{
+    char reply[MODEM_RADIO_RESPONSE_CAPACITY];
+    ESP_LOGI(MODEM_TAG, "network snapshot: %s", reason);
+    (void)radio_at(NULL, "AT+CEREG?", reply, sizeof(reply), 3000);
+    (void)radio_at(NULL, "AT+COPS?", reply, sizeof(reply), 3000);
+    (void)radio_at(NULL, "AT+CPSI?", reply, sizeof(reply), 3000);
+}
+
 /* Optional RSRP/RSRQ from AT+CPSI? (Cat-M form ends ...,<RSRQ>,<RSRP>,
  * <RSSI>,<RSSNR>). Parsed defensively: SIM7080G FW revisions differ on
  * whether RSRP/RSRQ come in dB(m) or tenths, so out-of-range raw values are
@@ -337,14 +579,27 @@ static int8_t csq_to_dbm(int csq)
  * Outputs are left untouched (0 = unknown) on any surprise. */
 static void poll_cpsi(int8_t *rsrp_out, int8_t *rsrq_out)
 {
-    char out[160] = {0};
-    if (esp_modem_at(s_dce, "AT+CPSI?", out, 3000) != ESP_OK || !out[0]) return;
-    if (!strstr(out, "LTE")) return;        /* "NO SERVICE" / GSM / parse guard */
+    char out[MODEM_RADIO_RESPONSE_CAPACITY] = {0};
+    if (!radio_at(NULL, "AT+CPSI?", out, sizeof(out), 3000)) return;
+    /* Full replies can include unrelated comma-separated URCs. Restrict the
+     * signal parser to the CPSI line before looking at its numeric tail. */
+    char *cpsi = NULL;
+    for (char *line = out; *line;) {
+        size_t len = strcspn(line, "\r\n");
+        if (strncmp(line, "+CPSI:", 6) == 0) {
+            line[len] = '\0';
+            cpsi = line;
+            break;
+        }
+        line += len;
+        while (*line == '\r' || *line == '\n') ++line;
+    }
+    if (!cpsi || !strstr(cpsi, "LTE")) return; /* no service / other RAT */
 
     /* Collect the integer value of every comma field, keep the tail. */
     long vals[20];
     int  n = 0;
-    for (char *p = strchr(out, ','); p && n < 20; p = strchr(p + 1, ',')) {
+    for (char *p = strchr(cpsi, ','); p && n < 20; p = strchr(p + 1, ',')) {
         vals[n++] = strtol(p + 1, NULL, 10);
     }
     if (n < 4) return;
@@ -400,13 +655,11 @@ static void emit_net_status(uint8_t state, int8_t rssi_dbm,
     if (!flen) return;
 
     switch (backend_mode_get()) {
-    case WUPS_BACKEND_MODE_MQTT: {
-        const char *topic = mqtt_topic_telemetry();
-        if (topic[0]) {
-            (void)mqtt_publish_raw(topic, frame, flen, 0, 0);
-        }
+    case WUPS_BACKEND_MODE_MQTT:
+        /* The owner copies this freshly generated existing frame, including
+         * before topic initialization, and selects occasional QoS 1 probes. */
+        mqtt_publish_net_status(frame, flen);
         break;
-    }
     case WUPS_BACKEND_MODE_HTTP:
         http_backend_observe_telemetry_frame(frame, flen);
         break;
@@ -428,20 +681,24 @@ static void emit_net_status(uint8_t state, int8_t rssi_dbm,
 
 esp_err_t modem_init(void)
 {
-    /* PWRKEY GPIO: default LOW (= PWRKEY released through inverting transistor). */
-    gpio_config_t pwr_cfg = {
-        .pin_bit_mask = (1ULL << MODEM_PWR_GPIO),
+    /* Preload LOW before enabling either output: PWRKEY stays released
+     * through Q501; DTR wakes a UART left in CSCLK=1 by an earlier image.
+     * Keep DTR LOW across modem resets/redials. It does not wake PSM. */
+    esp_err_t err = gpio_set_level(MODEM_PWR_GPIO, 0);
+    if (err != ESP_OK) return err;
+    err = gpio_set_level(MODEM_DTR_GPIO, 0);
+    if (err != ESP_OK) return err;
+    gpio_config_t pin_cfg = {
+        .pin_bit_mask = (1ULL << MODEM_PWR_GPIO) | (1ULL << MODEM_DTR_GPIO),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    esp_err_t err = gpio_config(&pwr_cfg);
+    err = gpio_config(&pin_cfg);
     if (err != ESP_OK) return err;
-    gpio_set_level(MODEM_PWR_GPIO, 0);
-
-    ESP_LOGI(MODEM_TAG, "GPIO%d (PWRKEY) configured; UART will be owned by esp_modem",
-             MODEM_PWR_GPIO);
+    ESP_LOGI(MODEM_TAG, "GPIO%d PWRKEY released, GPIO%d DTR held LOW; UART owned by esp_modem",
+             MODEM_PWR_GPIO, MODEM_DTR_GPIO);
     return ESP_OK;
 }
 
@@ -595,11 +852,17 @@ void modem_ensure_on(void)
 static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg;
-    if (base != IP_EVENT) return;
+    if (base != IP_EVENT ||
+        (id != IP_EVENT_PPP_GOT_IP && id != IP_EVENT_PPP_LOST_IP) ||
+        !data || !s_ppp_netif) return;
+    /* Both PPP IP events use ip_event_got_ip_t, including the delayed
+     * esp-netif LOST_IP timer. Never apply another interface's events. */
+    const ip_event_got_ip_t *e = (const ip_event_got_ip_t *)data;
+    if (e->esp_netif != s_ppp_netif) return;
 
     switch (id) {
     case IP_EVENT_PPP_GOT_IP: {
-        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        if (!ppp_events_observe(PPP_OBS_GOT_IP, 0)) return;
         ESP_LOGI(MODEM_TAG, "PPP got IP: " IPSTR " gw=" IPSTR " mask=" IPSTR,
                  IP2STR(&e->ip_info.ip),
                  IP2STR(&e->ip_info.gw),
@@ -611,14 +874,11 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
         if (esp_netif_get_dns_info(s_ppp_netif, ESP_NETIF_DNS_BACKUP, &dns) == ESP_OK) {
             ESP_LOGI(MODEM_TAG, "PPP DNS backup: " IPSTR, IP2STR(&dns.ip.u_addr.ip4));
         }
-        s_ppp_up = true;
-        xEventGroupSetBits(s_modem_evt, EVT_GOT_IP);
         break;
     }
     case IP_EVENT_PPP_LOST_IP:
+        if (!ppp_events_observe(PPP_OBS_LOST_IP, 0)) return;
         ESP_LOGW(MODEM_TAG, "PPP lost IP");
-        s_ppp_up = false;
-        xEventGroupSetBits(s_modem_evt, EVT_LOST_IP);
         break;
     default:
         break;
@@ -627,12 +887,22 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
 
 static void on_netif_ppp_status(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)arg; (void)data;
-    if (base != NETIF_PPP_STATUS) return;
-    /* PHASE_DEAD = link broken */
-    if (id == NETIF_PPP_ERRORUSER) {
-        ESP_LOGW(MODEM_TAG, "PPP error from user / disconnect");
-        xEventGroupSetBits(s_modem_evt, EVT_PPP_FAIL);
+    (void)arg;
+    if (base != NETIF_PPP_STATUS || !data || !s_ppp_netif) return;
+    /* IDF 6.0.2 on_ppp_status_changed posts errors 1..12 with an
+     * esp_netif_t* payload (NOT ip_event_got_ip_t). NONE and phase changes
+     * are not failures. PPPERR_CONNECT normally arrives via LOST_IP instead.
+     * The separate CONNECT_FAILED(0x200) post in this SDK has a different,
+     * malformed payload; do not treat its copied bytes as a netif pointer.
+     * A start that produces no valid event remains bounded by the IP wait. */
+    if (id < NETIF_PPP_ERRORPARAM || id > NETIF_PPP_ERRORLOOPBACK) return;
+    esp_netif_t *event_netif;
+    memcpy(&event_netif, data, sizeof(event_netif));
+    if (event_netif != s_ppp_netif) return;
+    if (ppp_events_observe(PPP_OBS_ERROR, id)) {
+        ESP_LOGW(MODEM_TAG, "PPP terminal error %ld", (long)id);
+    } else if (id == NETIF_PPP_ERRORUSER) {
+        ESP_LOGI(MODEM_TAG, "PPP user disconnect outside active dial/session (expected stop)");
     }
 }
 
@@ -647,6 +917,8 @@ static void on_netif_ppp_status(void *arg, esp_event_base_t base, int32_t id, vo
 static esp_err_t wait_for_time_sync(uint32_t timeout_ms)
 {
     esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    /* A late sync after the initial wait times out must still anchor logs. */
+    cfg.sync_cb = modem_diag_clock_sync;
     esp_err_t err = esp_netif_sntp_init(&cfg);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(MODEM_TAG, "esp_netif_sntp_init failed: %s", esp_err_to_name(err));
@@ -777,7 +1049,7 @@ static int s_reg_timeout_streak = 0;
 
 /* Create the DCE, sync at AT level, log identity, and switch to data (PPP)
  * mode. On success the DCE is owned by `s_dce` and the PPP layer is racing
- * to acquire an IP — caller waits on EVT_GOT_IP / EVT_PPP_FAIL. */
+ * to acquire an IP — caller waits for the ordered PPP lifecycle state. */
 static esp_err_t ppp_bringup_dce(void)
 {
     /* DTE = Data Terminal Equipment side (us) — UART parameters. */
@@ -794,7 +1066,7 @@ static esp_err_t ppp_bringup_dce(void)
      * SIM auto-provisions the radio APN, but the application PPP context
      * still needs an explicit APN at PDP-context activation time. */
     esp_modem_dce_config_t dce_cfg =
-        ESP_MODEM_DCE_DEFAULT_CONFIG(s_apn_candidates[s_apn_idx]);
+        ESP_MODEM_DCE_DEFAULT_CONFIG(s_apn);
 
     /* SIM7080G isn't a separate DCE class; SIM7070 covers the same AT set
      * (the SIM7070/SIM7080/SIM7090 family share commands and the V1.05 AT
@@ -829,6 +1101,18 @@ static esp_err_t ppp_bringup_dce(void)
      * actual cause ("SIM not inserted" vs "SIM busy" vs a wedged modem)
      * instead of a bare rc=-1. Best-effort — ignore result and response. */
     esp_modem_at(s_dce, "AT+CMEE=2", NULL, 1000);
+
+    if (!modem_radio_prepare(radio_at, NULL)) {
+        ESP_LOGE(MODEM_TAG, "radio policy failed; PPP blocked, RF-off requested");
+        s_fail_stage = MODEM_FAIL_RADIO;
+        return ESP_FAIL;
+    }
+
+    if (!modem_awake_prepare(radio_at, NULL)) {
+        ESP_LOGE(MODEM_TAG, "awake policy configuration not confirmed; PPP blocked, RF-off requested");
+        s_fail_stage = MODEM_FAIL_AWAKE;
+        return ESP_FAIL;
+    }
 
     /* A few sanity-check at-level reads before going to data mode. */
     char buf[64] = {0};
@@ -939,32 +1223,43 @@ static esp_err_t ppp_bringup_dce(void)
         }
     }
 
-    /* Seed the starting APN from the SIM card. The OLD (iot.1nce.net) fleet
-     * is a closed set of exactly these five cards, listed in full; every
-     * other card — the 2026-08 production batch and anything newer —
-     * defaults to sensor.net. A wrong guess still converges via the
-     * rotate-on-timeout below. Seeded once per boot. */
-    static const char *OLD_BATCH_ICCIDS[] = {
-        "8988228066614189920",
-        "8988280666000338870",
-        "8988280666000338871",
-        "8988228066618136967",
-        "8988228066618136966",
-    };
+    /* The original fleet is this exact five-card set. All other cards use
+     * sensor.net. Identity is fixed for the boot, and retries retain its APN
+     * even when registration fails. Do not seed from an invalid identity. */
+    if (!s_iccid_known) {
+        ESP_LOGE(MODEM_TAG, "ICCID invalid — refusing to select an APN");
+        s_fail_stage = MODEM_FAIL_SIM;
+        return ESP_FAIL;
+    }
     if (!s_apn_seeded) {
-        s_apn_seeded = true;
+        static const char *const old_batch_iccids[] = {
+            "8988228066614189920",
+            "8988280666000338870",
+            "8988280666000338871",
+            "8988228066618136967",
+            "8988228066618136966",
+        };
         const char *iccid = identity_iccid();
-        bool old_batch = false;
         for (size_t i = 0;
-             i < sizeof(OLD_BATCH_ICCIDS) / sizeof(OLD_BATCH_ICCIDS[0]); i++) {
-            if (strcmp(iccid, OLD_BATCH_ICCIDS[i]) == 0) {
-                old_batch = true;
+             i < sizeof(old_batch_iccids) / sizeof(old_batch_iccids[0]); ++i) {
+            if (strcmp(iccid, old_batch_iccids[i]) == 0) {
+                s_apn = "iot.1nce.net";
                 break;
             }
         }
-        s_apn_idx = old_batch ? 1 : 0;   /* 1 = iot.1nce.net, 0 = sensor.net */
-        ESP_LOGI(MODEM_TAG, "APN seeded from ICCID list: %s",
-                 s_apn_candidates[s_apn_idx]);
+        s_apn_seeded = true;
+        ESP_LOGI(MODEM_TAG, "APN selected from ICCID list: %s", s_apn);
+    }
+
+    /* esp_modem copied the APN when the DCE was created, before the first
+     * ICCID read. Updating only CGDCONT would let setup_data_mode() restore
+     * that stale APN after registration. Update both on every new DCE. */
+    esp_err_t apn_err = esp_modem_set_apn(s_dce, s_apn);
+    if (apn_err != ESP_OK) {
+        ESP_LOGE(MODEM_TAG, "DCE APN synchronization failed: %s",
+                 esp_err_to_name(apn_err));
+        s_fail_stage = MODEM_FAIL_NET;
+        return apn_err;
     }
 
     /* Program the attach APN BEFORE waiting for registration. The LTE attach
@@ -977,13 +1272,22 @@ static esp_err_t ppp_bringup_dce(void)
     {
         char apn_cmd[64];
         snprintf(apn_cmd, sizeof apn_cmd, "AT+CGDCONT=1,\"IP\",\"%s\"",
-                 s_apn_candidates[s_apn_idx]);
+                 s_apn);
         if (esp_modem_at(s_dce, apn_cmd, NULL, 3000) == ESP_OK) {
-            ESP_LOGI(MODEM_TAG, "attach APN set: %s", s_apn_candidates[s_apn_idx]);
+            ESP_LOGI(MODEM_TAG, "attach APN set: %s", s_apn);
         } else {
             ESP_LOGW(MODEM_TAG, "AT+CGDCONT failed — attach uses modem's stored APN");
         }
     }
+
+    /* Common gate covers CMUX and its plain-DATA fallback on every retry. */
+    if (!modem_radio_resume(radio_at, NULL)) {
+        ESP_LOGE(MODEM_TAG, "radio readback/resume failed; PPP blocked, RF-off requested");
+        s_fail_stage = MODEM_FAIL_RADIO;
+        return ESP_FAIL;
+    }
+    ESP_LOGI(MODEM_TAG, "radio policy verified: LTE-M only, CAT-M bands B3+B20, no NB-IoT fallback");
+    modem_network_snapshot("radio ready / before registration");
 
     /* Switch to CMUX mode — PPP (data channel) and an AT command channel run
      * concurrently, which is what lets the post-GOT_IP supervision loop poll
@@ -1001,50 +1305,53 @@ static esp_err_t ppp_bringup_dce(void)
         ESP_LOGI(MODEM_TAG, "daily CMUX retry — re-arming one entry attempt");
         s_cmux_entry_fails = CMUX_ENTRY_FAILS_MAX - 1;
     }
-    esp_err_t err;
-    if (s_cmux_entry_fails < CMUX_ENTRY_FAILS_MAX) {
-        /* The CMUX transition ends in the ATD*99# dial, which fails whenever
-         * the modem isn't network-registered — a routine LTE outage, not a
-         * CMUX defect. Gate on registration so only failures of a registered
-         * modem count toward the DATA fallback. Crucially: WAIT for it. A
-         * freshly booted modem needs tens of seconds of UNINTERRUPTED Cat-M
-         * network search; failing fast here fed the 2-fail power-cycle,
-         * which restarted the search every ~45 s and looped forever
-         * (bench 2026-07-22). */
-        {
-            const int64_t reg_deadline =
-                esp_timer_get_time() + (int64_t)MODEM_REG_WAIT_MS * 1000;
-            int stat = -1, poll = 0;
-            bool registered = false;
-            for (;;) {
-                stat = modem_reg_stat();
-                registered = (stat == 1 || stat == 5);
-                if (registered || esp_timer_get_time() >= reg_deadline) break;
-                if ((poll++ % 3) == 0) {
-                    int csq = 99, ber = 99;
-                    (void)esp_modem_get_signal_quality(s_dce, &csq, &ber);
-                    ESP_LOGI(MODEM_TAG,
-                             "waiting for network registration (stat=%d rssi=%d)...",
-                             stat, csq);
-                }
-                vTaskDelay(pdMS_TO_TICKS(3000));
+    /* Both modes need a registered network to verify negotiated sleep state. */
+    /* Both CMUX and DATA end in the ATD*99# dial, which fails whenever
+     * the modem isn't network-registered — a routine LTE outage, not a
+     * CMUX defect. Gate on registration so only failures of a registered
+     * modem count toward the DATA fallback. Crucially: WAIT for it. A
+     * freshly booted modem needs tens of seconds of UNINTERRUPTED Cat-M
+     * network search; failing fast here fed the 2-fail power-cycle,
+     * which restarted the search every ~45 s and looped forever
+     * (bench 2026-07-22). */
+    {
+        const int64_t reg_deadline =
+            esp_timer_get_time() + (int64_t)MODEM_REG_WAIT_MS * 1000;
+        int stat = -1, poll = 0;
+        bool registered = false;
+        for (;;) {
+            stat = modem_reg_stat();
+            registered = (stat == 1 || stat == 5);
+            if (registered || esp_timer_get_time() >= reg_deadline) break;
+            if ((poll++ % 3) == 0) {
+                int csq = 99, ber = 99;
+                (void)esp_modem_get_signal_quality(s_dce, &csq, &ber);
+                ESP_LOGI(MODEM_TAG,
+                         "waiting for network registration (stat=%d rssi=%d)...",
+                         stat, csq);
             }
-            if (!registered) {
-                ESP_LOGW(MODEM_TAG, "no network registration within %d s "
-                                    "(last stat=%d) — failing bring-up before "
-                                    "the mode switch",
-                         MODEM_REG_WAIT_MS / 1000, stat);
-                s_fail_stage = MODEM_FAIL_NET;
-                s_reg_timeout_streak++;
-                /* Wrong attach APN produces exactly this timeout — rotate to
-                 * the next candidate so the following round tries it. */
-                s_apn_idx = (s_apn_idx + 1) % APN_CANDIDATE_COUNT;
-                ESP_LOGW(MODEM_TAG, "next bring-up will try attach APN \"%s\"",
-                         s_apn_candidates[s_apn_idx]);
-                return ESP_FAIL;
-            }
-            s_reg_timeout_streak = 0;
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
+        if (!registered) {
+            ESP_LOGW(MODEM_TAG, "no network registration within %d s "
+                                "(last stat=%d) — failing bring-up before "
+                                "the mode switch",
+                     MODEM_REG_WAIT_MS / 1000, stat);
+            modem_network_snapshot("registration timeout");
+            s_fail_stage = MODEM_FAIL_NET;
+            s_reg_timeout_streak++;
+            ESP_LOGW(MODEM_TAG, "next bring-up keeps fixed APN \"%s\"",
+                     s_apn);
+            return ESP_FAIL;
+        }
+        s_reg_timeout_streak = 0;
+    }
+    if (!modem_awake_check_before_ppp()) return ESP_FAIL;
+    modem_network_snapshot("registered / before PPP");
+    modem_support_snapshot(false);
+    esp_err_t err;
+    ppp_events_start_dial();
+    if (s_cmux_entry_fails < CMUX_ENTRY_FAILS_MAX) {
         ESP_LOGI(MODEM_TAG, "switching modem to CMUX mode (PPP + AT channel)...");
         err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_CMUX);
         if (err != ESP_OK) {
@@ -1066,6 +1373,7 @@ static esp_err_t ppp_bringup_dce(void)
     } else {
         /* CMUX fallback — plain data (PPP) mode, no AT channel. */
         ESP_LOGI(MODEM_TAG, "switching modem to PPP/data mode (CMUX fallback)...");
+        ESP_LOGW(MODEM_TAG, "periodic AT diagnostics unavailable in DATA mode; see pre-PPP snapshot");
         err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DATA);
         if (err != ESP_OK) {
             ESP_LOGE(MODEM_TAG, "esp_modem_set_mode(DATA) failed: %s", esp_err_to_name(err));
@@ -1088,7 +1396,9 @@ static esp_err_t ppp_bringup_dce(void)
  * dead too, escalate to a PWRKEY power-cycle. */
 static void ppp_teardown_dce(teardown_action_t action)
 {
-    s_ppp_up = false;
+    /* Commit intentional stop before any command can provoke PPP_ERRORUSER.
+     * Late IP callbacks cannot resurrect this DCE during destroy/backoff. */
+    ppp_events_begin_stop();
     bool fresh_boot_wait = false;               /* modem rebooting after CFUN=1,1 */
     bool pwrcycle = (action == TEARDOWN_PWRCYCLE);
     bool was_cmux = s_cmux_active;
@@ -1228,7 +1538,9 @@ static void uplink_health(bool *up, bool *wd_ok, bool *ota_ok)
 {
     switch (backend_mode_get()) {
     case WUPS_BACKEND_MODE_MQTT:
-        *up = mqtt_is_connected();
+        /* CONNECT alone is not evidence that an uplink publication reached
+         * the broker. The owner also invalidates proof during OTA transfer. */
+        *up = mqtt_publication_proof_fresh();
         *wd_ok = *up;
         *ota_ok = *up;
         if (!*up && mqtt_auth_refused()) {
@@ -1296,122 +1608,35 @@ static teardown_action_t supervise_uplink(void)
 {
     uint32_t last_healthy_s  = now_s();  /* watchdog timer starts at GOT_IP */
     uint32_t last_clear_s    = now_s();  /* GOT_IP path just sent a clear    */
+    uint32_t last_radio_snapshot_s = now_s();
+    uint32_t last_radio_poll_s = now_s();
+    bool radio_snapshot_pending = false;
+    int8_t last_rsrp = 0, last_rsrq = 0;
     uint32_t last_probe_ok_s = 0;        /* internet-probe OK verdict cache  */
 
     for (;;) {
-        /* While MQTT is down the supervisor owns the retry schedule — tick
-         * faster so attempts land near their due time (and a freshly-
-         * claimed unit's successful CONNECT is noticed promptly). */
-        uint32_t tick_ms = PPP_SUPERVISE_TICK_MS;
-        if (s_mqtt_started && backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
-            !mqtt_is_connected()) {
-            tick_ms = MQTT_DOWN_TICK_MS;
-        }
+        /* MQTT pacing belongs to its independent owner; this task only
+         * supervises PPP and wakes early to observe a reported MQTT drop. */
         EventBits_t bits = xEventGroupWaitBits(s_modem_evt,
-                                               EVT_LOST_IP | EVT_PPP_FAIL | EVT_MQTT_DOWN,
-                                               pdFALSE, pdFALSE,
-                                               pdMS_TO_TICKS(tick_ms));
-        if (bits & (EVT_LOST_IP | EVT_PPP_FAIL)) {
+                                               EVT_PPP_CHANGED | EVT_MQTT_DOWN,
+                                               pdTRUE, pdFALSE,
+                                               pdMS_TO_TICKS(PPP_SUPERVISE_TICK_MS));
+        if (ppp_events_take_loss()) {
+            ESP_LOGW(MODEM_TAG, "PPP loss: last radio snapshot %us ago; see preceding AT replies",
+                     (unsigned)(now_s() - last_radio_snapshot_s));
             ESP_LOGW(MODEM_TAG, "PPP link lost — tearing down DCE");
             return TEARDOWN_NORMAL;
         }
         if (bits & EVT_MQTT_DOWN) {
-            /* Early wake only — the reconnect driver below does the work. */
-            xEventGroupClearBits(s_modem_evt, EVT_MQTT_DOWN);
+            /* Early wake only — the MQTT owner performs recovery. */
+            radio_snapshot_pending = true;
         }
         uint32_t now = now_s();
 
-        /* 0.8.7 reconnect driver: with esp-mqtt's auto-reconnect disabled,
-         * every attempt is requested from HERE on our own schedule — the
-         * component's old fixed 10 s cadence normally, the doubling
-         * 30→120 s backoff while attempts keep failing (credential refusal
-         * OR a down/half-up broker: both cost a full TLS handshake per
-         * attempt). Runs ABOVE the OTA freeze guard on purpose: an OTA
-         * transfer must not leave the client unrevived. Non-blocking; a
-         * request landing mid-attempt or right after a CONNECT returns
-         * ESP_FAIL and we simply retry at the next due time. */
-        if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT) {
-            if (!s_mqtt_started) {
-                /* mqtt_client_start() failed at GOT_IP (OOM/NVS hiccup) —
-                 * keep retrying from here instead of relying on a modem
-                 * reset to re-enter the GOT_IP branch. */
-                if (s_iccid_known &&
-                    (s_mqtt_next_attempt_s == 0 ||
-                     (int32_t)(now - s_mqtt_next_attempt_s) >= 0)) {
-                    if (mqtt_client_start() == ESP_OK) {
-                        s_mqtt_started = true;
-                        ESP_LOGI(MODEM_TAG, "MQTT client started (supervisor retry)");
-                    } else {
-                        ESP_LOGE(MODEM_TAG, "mqtt_client_start retry failed");
-                    }
-                    s_mqtt_next_attempt_s = now + MQTT_RETRY_NORMAL_S;
-                }
-            } else if (!mqtt_is_connected()) {
-                /* next_attempt==0 (fresh disconnect / just-started client)
-                 * counts as due now: if the client's own first attempt is
-                 * still in flight the request is rejected harmlessly and we
-                 * land on the normal cadence. */
-                if (s_mqtt_next_attempt_s == 0 ||
-                    (int32_t)(now - s_mqtt_next_attempt_s) >= 0) {
-                    esp_err_t rc = mqtt_client_request_reconnect();
-                    if (rc == ESP_OK) {
-                        /* Only an ACCEPTED request pays a TLS handshake —
-                         * only it advances the backoff ramp and its pacing. */
-                        s_mqtt_reconn_rejects = 0;
-                        uint32_t delay_s = MQTT_RETRY_NORMAL_S;
-                        if (mqtt_auth_refused()) {
-                            delay_s = s_mqtt_backoff_s;
-                            s_mqtt_backoff_s =
-                                (s_mqtt_backoff_s * 2 > AUTH_BACKOFF_MAX_S)
-                                    ? AUTH_BACKOFF_MAX_S
-                                    : s_mqtt_backoff_s * 2;
-                            ESP_LOGW(MODEM_TAG,
-                                     "MQTT attempt now; broker refuses credentials "
-                                     "×%u (unclaimed unit or rotated secret; network "
-                                     "OK) — next attempt in %us",
-                                     (unsigned)mqtt_auth_refusals(),
-                                     (unsigned)delay_s);
-                        } else if (mqtt_connect_fail_streak() >= MQTT_FAIL_STREAK_LATCH) {
-                            delay_s = s_mqtt_backoff_s;
-                            s_mqtt_backoff_s =
-                                (s_mqtt_backoff_s * 2 > AUTH_BACKOFF_MAX_S)
-                                    ? AUTH_BACKOFF_MAX_S
-                                    : s_mqtt_backoff_s * 2;
-                            ESP_LOGW(MODEM_TAG,
-                                     "MQTT attempt now; broker unreachable "
-                                     "(×%u fails) — next attempt in %us",
-                                     (unsigned)mqtt_connect_fail_streak(),
-                                     (unsigned)delay_s);
-                        }
-                        s_mqtt_next_attempt_s = now + delay_s;
-                    } else {
-                        /* Rejected request = no handshake paid: retry on the
-                         * SHORT cadence regardless of any latched backoff,
-                         * so a dead esp-mqtt task (transport re-alloc OOM
-                         * self-deletes it; every request rejected) is
-                         * detected in ~20×10 s, not 20×backoff. */
-                        s_mqtt_reconn_rejects++;
-                        if (s_mqtt_reconn_rejects >= MQTT_RECONN_REJECTS_MAX) {
-                            ESP_LOGE(MODEM_TAG,
-                                     "reconnect rejected ×%d while disconnected "
-                                     "— esp-mqtt task presumed dead, reviving",
-                                     s_mqtt_reconn_rejects);
-                            if (mqtt_client_revive() == ESP_OK) {
-                                ESP_LOGI(MODEM_TAG, "esp-mqtt task revived");
-                            }
-                            s_mqtt_reconn_rejects = 0;
-                        } else {
-                            ESP_LOGD(MODEM_TAG,
-                                     "reconnect request not accepted (%s) — "
-                                     "attempt in flight or state changed",
-                                     esp_err_to_name(rc));
-                        }
-                        s_mqtt_next_attempt_s = now + MQTT_RETRY_NORMAL_S;
-                    }
-                }
-            } else {
-                s_mqtt_reconn_rejects = 0;
-            }
+        /* Fast idempotent request only. SDK start/retry/reconnect/revive and
+         * their backoff execute in the MQTT owner, never in the PPP task. */
+        if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT && s_iccid_known) {
+            (void)mqtt_client_start();
         }
 
         /* OTA-1 — while a firmware download runs, the uplink is deliberately
@@ -1426,11 +1651,6 @@ static teardown_action_t supervise_uplink(void)
 
         bool uplink_up = false, wd_healthy = false, ota_proof = false;
         uplink_health(&uplink_up, &wd_healthy, &ota_proof);
-        if (uplink_up) {
-            /* A genuinely-connected backend resets the retry schedule. */
-            s_mqtt_backoff_s = AUTH_BACKOFF_MIN_S;
-            s_mqtt_next_attempt_s = 0;
-        }
         if (wd_healthy) {
             last_healthy_s = now;
             /* OTA-1 rollback — first demonstrably healthy uplink marks a
@@ -1468,19 +1688,55 @@ static teardown_action_t supervise_uplink(void)
         /* Signal-quality poll — CMUX sessions only (the DATA fallback has no
          * AT channel while PPP runs). rsrp/rsrq stay 0 (unknown) unless
          * AT+CPSI? parses cleanly. */
-        int8_t rssi = s_ns_last_rssi, rsrp = 0, rsrq = 0;
-        if (s_cmux_active) {
+        int8_t rssi = s_ns_last_rssi, rsrp = last_rsrp, rsrq = last_rsrq;
+        if (s_cmux_active && now - last_radio_poll_s >= 30) {
+            last_radio_poll_s = now;
             int csq = 99, ber = 99;
             if (esp_modem_get_signal_quality(s_dce, &csq, &ber) == ESP_OK) {
                 rssi = csq_to_dbm(csq);
             }
+            bool support_due = false;
+            /* Existing CPSI cadence (30 s); COPS/CEREG once per minute,
+             * or on MQTT drop, rate limited to one snapshot per 30 s.
+             * No AT is sent on a live plain-DATA PPP channel. */
+            if (now - last_radio_snapshot_s >= 60 ||
+                (radio_snapshot_pending && now - last_radio_snapshot_s >= 30)) {
+                char reply[MODEM_RADIO_RESPONSE_CAPACITY];
+                ESP_LOGI(MODEM_TAG, "network snapshot: %s",
+                         radio_snapshot_pending ? "MQTT disconnected" : "periodic");
+                (void)radio_at(NULL, "AT+CEREG?", reply, sizeof(reply), 3000);
+                (void)radio_at(NULL, "AT+COPS?", reply, sizeof(reply), 3000);
+                last_radio_snapshot_s = now;
+                support_due = true;
+                radio_snapshot_pending = false;
+            }
+            rsrp = rsrq = 0;
             poll_cpsi(&rsrp, &rsrq);
+            last_rsrp = rsrp;
+            last_rsrq = rsrq;
+            /* Collect the radio snapshot first. Optional APN/PSM/eDRX reads
+             * have a bounded batch and yield to OTA/PPP loss per command.
+             * Failures are diagnostic only, never a recovery trigger. */
+            if (support_due) modem_support_snapshot(true);
         }
+        /* Events can arrive while a bounded AT read is in progress. Do not
+         * run stale health/probe/reset decisions after optional diagnostics. */
+        if (ppp_events_take_loss()) {
+            ESP_LOGW(MODEM_TAG, "PPP loss during diagnostics — yielding to recovery");
+            return TEARDOWN_NORMAL;
+        }
+        if (fw_ota_in_progress()) {
+            last_healthy_s = now_s();
+            continue;
+        }
+        now = now_s();
         uint8_t state = uplink_up ? NET_STATE_MQTT_UP : NET_STATE_PPP_UP;
         int rssi_delta = (int)rssi - (int)s_ns_last_rssi;
         if (state != s_ns_last_state ||
             abs(rssi_delta) > NET_STATUS_RSSI_DELTA_DB ||
             now - s_ns_last_emit_s >= NET_STATUS_EMIT_PERIOD_S) {
+            /* Also anchors the DATA fallback, which has no live AT channel. */
+            modem_diag_clock_log("net.status");
             emit_net_status(state, rssi, rsrp, rsrq);
         }
 
@@ -1495,30 +1751,36 @@ static teardown_action_t supervise_uplink(void)
             last_clear_s = now;
         }
 
-        /* The watchdog itself: PPP holds an IP but the uplink has been dead
-         * for UPLINK_DEAD_SECS — the zombie-PDP signature. Count it on the
-         * existing NET-stage alert machinery and escalate. 0.8.7: first ask
-         * the internet itself — probes answering means the BACKEND is down,
-         * not the modem, and resetting the modem would only make a whole
-         * fleet hammer the network for the duration of the outage. Probes
-         * failing with PPP up is the genuine zombie PDP → escalate. */
+        /* Preserve the existing disconnected-uplink recovery policy: a DNS
+         * response holds escalation; failed probes permit the established
+         * reset ladder. Neither result identifies the operator/backend root
+         * cause. Connected/degraded MQTT and a stalled worker are held below. */
         if (now - last_healthy_s >= UPLINK_DEAD_SECS) {
+            /* A live MQTT session with stale publication proof, or an SDK
+             * worker stuck in its own call, is handled by the independent
+             * MQTT monitor. A modem reset cannot safely unstick that task.
+             * Keep reporting the outage without counting it as healthy. */
+            mqtt_health_snapshot_t mqtt_health = {0};
+            bool mqtt_owned_fault = false;
+            if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT) {
+                mqtt_get_health(&mqtt_health);
+                mqtt_owned_fault = mqtt_health.connected || mqtt_health.worker_stalled;
+            }
             /* The hold must never cover a client that cannot even attempt
-             * (mqtt_client_start still failing) — that needs the classic
-             * escalation, not patience. */
+             * unless its owner is itself stalled (handled separately above).
+             * Otherwise preserve the previous missing-client escalation. */
             bool client_missing = (backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
-                                   !s_mqtt_started);
+                                   !mqtt_sdk_is_started());
             bool inet_ok = (now - last_probe_ok_s < INET_PROBE_CACHE_S);
-            if (!inet_ok && !client_missing && inet_probe()) {
+            if (!mqtt_owned_fault && !inet_ok && !client_missing && inet_probe()) {
                 last_probe_ok_s = now;
                 inet_ok = true;
                 ESP_LOGW(MODEM_TAG,
                          "uplink dead %us but internet probes answer — "
-                         "backend outage, not a modem problem: holding "
-                         "(no reset)",
+                         "holding modem recovery (cause not yet established)",
                          (unsigned)(now - last_healthy_s));
             }
-            if (inet_ok && !client_missing) {
+            if (mqtt_owned_fault || (inet_ok && !client_missing)) {
                 /* Long hold (wedged client / marathon backend outage):
                  * surface the alert WITHOUT resetting the modem, so the
                  * unit is never silent forever. Re-asserted every tick —
@@ -1527,9 +1789,11 @@ static teardown_action_t supervise_uplink(void)
                 if (now - last_healthy_s >= UPLINK_HOLD_ALERT_S) {
                     if (!s_alert_active) {
                         ESP_LOGE(MODEM_TAG,
-                                 "uplink dead %us with internet OK — raising "
-                                 "'NO UPLINK' alert (still no modem reset)",
-                                 (unsigned)(now - last_healthy_s));
+                                 "uplink dead %us (%s) — raising 'NO UPLINK' "
+                                 "alert without modem reset",
+                                 (unsigned)(now - last_healthy_s),
+                                 mqtt_owned_fault ? "MQTT owner/proof degraded"
+                                                  : "internet probes answer");
                     }
                     s_fail_stage = MODEM_FAIL_UPLINK;
                     s_alert_active = true;
@@ -1537,6 +1801,21 @@ static teardown_action_t supervise_uplink(void)
                 }
                 continue;
             }
+            if (ppp_events_take_loss())
+                return TEARDOWN_NORMAL;
+            if (fw_ota_in_progress()) {
+                last_healthy_s = now_s();
+                continue;
+            }
+            if (s_cmux_active) modem_network_snapshot("uplink recovery");
+            /* The final AT snapshot can overlap a new OTA or a real loss. */
+            if (ppp_events_take_loss())
+                return TEARDOWN_NORMAL;
+            if (fw_ota_in_progress()) {
+                last_healthy_s = now_s();
+                continue;
+            }
+            now = now_s();
             s_uplink_trips++;
             s_fail_stage = MODEM_FAIL_NET;
             s_fails_since_ok++;
@@ -1557,8 +1836,8 @@ static teardown_action_t supervise_uplink(void)
 /*
  * Long-lived task. Brings PPP up, runs first-boot smoke tests + starts the
  * MQTT client, then watches for PPP_LOST_IP / PPP_FAIL and tears down +
- * recreates the DCE. esp-mqtt has its own reconnect timer, so it stays
- * started across PPP cycles and reconnects on its own once a route exists.
+ * recreates the DCE. The MQTT owner keeps the client across PPP cycles and
+ * owns reconnect timing; this task never waits for an MQTT SDK operation.
  *
  * Backoff: doubles from PPP_BACKOFF_MIN_MS up to PPP_BACKOFF_MAX_MS.
  * If we hit PPP_FAILS_BEFORE_PWRCYCLE bring-ups in a row without an IP we
@@ -1587,21 +1866,14 @@ static void ppp_supervisor_task(void *arg)
     int      consecutive_fails = 0;
 
     for (;;) {
-        /* Clear any stale event bits from a previous iteration so we don't
-         * trip on a LOST_IP that was already serviced. */
-        xEventGroupClearBits(s_modem_evt,
-                             EVT_GOT_IP | EVT_LOST_IP | EVT_PPP_FAIL);
+        ppp_events_begin_attempt();
 
         teardown_action_t teardown = TEARDOWN_NORMAL;
         esp_err_t err = ppp_bringup_dce();
         if (err == ESP_OK) {
-            EventBits_t bits = xEventGroupWaitBits(
-                s_modem_evt,
-                EVT_GOT_IP | EVT_PPP_FAIL,
-                pdFALSE, pdFALSE,
-                pdMS_TO_TICKS(PPP_GOT_IP_TIMEOUT_MS));
+            ppp_phase_t phase = ppp_events_wait_for_link(PPP_GOT_IP_TIMEOUT_MS);
 
-            if (bits & EVT_GOT_IP) {
+            if (phase == PPP_UP) {
                 ESP_LOGI(MODEM_TAG, "PPP up — TCP/IP stack is on the cellular interface");
                 consecutive_fails = 0;
                 backoff_ms = PPP_BACKOFF_MIN_MS;
@@ -1634,56 +1906,48 @@ static void ppp_supervisor_task(void *arg)
                              s_uplink_trips);
                 }
 
-                if (!s_mqtt_started) {
-                    /* Wall-clock time, needed by TLS cert validity check. */
+                if (s_cmux_active) modem_network_snapshot("PPP up");
+                if (ppp_events_take_loss()) goto stop_ppp;
+
+                if (!s_initial_connectivity_checked) {
+                    /* Do this once per boot, independently of asynchronous
+                     * MQTT startup; a pending request must not rerun probes. */
+                    s_initial_connectivity_checked = true;
                     wait_for_time_sync(15000);
-
-                    /* End-to-end proof from C: hit a public HTTP server
-                     * through lwIP → PPP → modem → 1nce → internet. */
+                    if (ppp_events_take_loss()) goto stop_ppp;
                     run_http_get_test();
+                }
+                if (ppp_events_take_loss()) goto stop_ppp;
 
-                    /* ADR-0012 — only start the EMQX client when this
-                     * device is actually in MQTT mode. In Arkiv/HTTP mode
-                     * the chain/user-endpoint is the only uplink and an
-                     * extra MQTT client would just burn LTE data. */
-                    const wups_backend_mode_t mode = backend_mode_get();
-                    if (mode == WUPS_BACKEND_MODE_HTTP) {
-                        /* HTTP-2 (§4.18a) — start the HTTP control-mode task.
-                         * It self-paces POSTs to the user-hosted endpoint and
-                         * needs no broker. Idempotent across PPP reconnects. */
-                        ESP_LOGI(MODEM_TAG, "starting HTTP control-mode backend...");
-                        http_backend_start();
-                    } else if (mode != WUPS_BACKEND_MODE_MQTT) {
-                        ESP_LOGI(MODEM_TAG,
-                                 "skipping MQTT client start — backend mode is %s",
-                                 backend_mode_name(mode));
-                    } else if (!s_iccid_known) {
-                        ESP_LOGE(MODEM_TAG,
-                                 "ICCID unknown — refusing to start MQTT. "
-                                 "Check SIM card / AT+CCID handling.");
-                    } else {
-                        ESP_LOGI(MODEM_TAG, "starting MQTT client...");
-                        if (mqtt_client_start() == ESP_OK) {
-                            s_mqtt_started = true;
-                        } else {
-                            ESP_LOGE(MODEM_TAG, "mqtt_client_start failed");
-                        }
-                    }
-                } else {
-                    ESP_LOGI(MODEM_TAG, "PPP reconnected — supervisor will drive the MQTT reconnect");
+                const wups_backend_mode_t mode = backend_mode_get();
+                if (mode == WUPS_BACKEND_MODE_HTTP) {
+                    /* Idempotent across PPP reconnects. */
+                    ESP_LOGI(MODEM_TAG, "starting HTTP control-mode backend...");
+                    http_backend_start();
+                } else if (mode != WUPS_BACKEND_MODE_MQTT) {
+                    ESP_LOGI(MODEM_TAG,
+                             "skipping MQTT client start — backend mode is %s",
+                             backend_mode_name(mode));
+                } else if (!s_iccid_known) {
+                    ESP_LOGE(MODEM_TAG,
+                             "ICCID unknown — refusing to start MQTT. "
+                             "Check SIM card / AT+CCID handling.");
+                } else if (mqtt_client_start() != ESP_OK) {
+                    ESP_LOGW(MODEM_TAG, "MQTT start request unavailable — will retry");
                 }
 
                 /* First net.status of the session, seeded from the CSQ read
                  * during bring-up (the supervision loop refreshes it on CMUX
-                 * sessions). Emitted after the backend start above so the
-                 * MQTT telemetry topic is populated. */
+                 * sessions). The MQTT owner caches the frame even while
+                 * asynchronous topic/client initialization is pending. */
+                modem_diag_clock_log("PPP ready");
                 emit_net_status(NET_STATE_PPP_UP, s_bringup_rssi_dbm, 0, 0);
 
                 /* Supervise until the link drops or the uplink watchdog
                  * trips (see supervise_uplink). Either way, we tear down
                  * and rebuild. */
                 teardown = supervise_uplink();
-            } else if (bits & EVT_PPP_FAIL) {
+            } else if (phase == PPP_DOWN) {
                 ESP_LOGE(MODEM_TAG, "PPP setup failed");
                 s_fail_stage = MODEM_FAIL_NET;   /* ICCID was read; radio/network side */
                 consecutive_fails++;
@@ -1700,6 +1964,7 @@ static void ppp_supervisor_task(void *arg)
             s_fails_since_ok++;
         }
 
+stop_ppp:
         ppp_teardown_dce(teardown);
 
         /* When degraded, power-cycle the modem more often: a hot-inserted SIM
@@ -1714,7 +1979,8 @@ static void ppp_supervisor_task(void *arg)
              * against a wedged radio stack. */
             pwrcycle_thresh = REG_TIMEOUT_PWRCYCLE_EVERY;
         }
-        if (consecutive_fails >= pwrcycle_thresh) {
+        if (s_fail_stage != MODEM_FAIL_RADIO && s_fail_stage != MODEM_FAIL_AWAKE &&
+            consecutive_fails >= pwrcycle_thresh) {
             ESP_LOGW(MODEM_TAG,
                      "%d bring-up failures — power-cycling modem",
                      consecutive_fails);
@@ -1744,7 +2010,9 @@ static void ppp_supervisor_task(void *arg)
 
         /* Cap the backoff short while degraded so we keep retrying (and
          * re-cycling) frequently until the fault clears; normal cap otherwise. */
-        uint32_t backoff_cap = s_alert_active ? 10000u : PPP_BACKOFF_MAX_MS;
+        uint32_t backoff_cap = s_alert_active && s_fail_stage != MODEM_FAIL_RADIO &&
+                              s_fail_stage != MODEM_FAIL_AWAKE
+            ? 10000u : PPP_BACKOFF_MAX_MS;
         if (backoff_ms > backoff_cap) backoff_ms = backoff_cap;
         ESP_LOGI(MODEM_TAG, "backing off %u ms before retry",
                  (unsigned)backoff_ms);

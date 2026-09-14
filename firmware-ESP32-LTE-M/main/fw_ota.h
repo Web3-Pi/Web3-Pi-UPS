@@ -45,15 +45,16 @@
  *
  * Rollback: with CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE the freshly booted
  * OTA image is ESP_OTA_IMG_PENDING_VERIFY. modem.c's supervision loop calls
- * fw_ota_mark_uplink_healthy() on the first healthy uplink (one-shot cancel
- * of the rollback); main.c's heartbeat calls fw_ota_rollback_tick() so an
+ * fw_ota_mark_uplink_healthy() on fresh publication proof in MQTT mode
+ * (one-shot cancel of rollback); main.c calls fw_ota_rollback_tick() so an
  * image that never gets a healthy uplink within FW_OTA_VERIFY_WINDOW_S
  * rolls itself back (esp_ota_mark_app_invalid_rollback_and_reboot). Both
  * are no-ops when the running app is not pending-verify.
  *
  * Brick-guard: fw_ota_request() confirms a still-pending-verify image
- * before starting (an authenticated fw.update over MQTT proves the uplink)
- * and refuses the update if that fails, and fw_ota_rollback_tick() never
+ * before starting (explicit authorized-next-update confirmation, distinct
+ * from PUBACK proof). Physical transfer has its own explicit reason. Each
+ * refuses the update if confirmation fails, and fw_ota_rollback_tick() never
  * fires while a download runs — so the rollback can never reboot into a
  * slot that esp_https_ota is half-way through overwriting.
  */
@@ -103,8 +104,11 @@ bool fw_ota_try_handle_downlink(const uint8_t *frame, size_t frame_len);
  * app_main). Also latches whether this image is pending-verify. */
 void fw_ota_boot_log(void);
 
-/* Cancel rollback (mark app valid) — call when the uplink is seen healthy.
- * One-shot on success; a failed otadata write is retried on a later call.
+/* Automatic confirmation: mark valid only BEFORE the 600 s boot deadline and
+ * outside an active transfer. MQTT additionally requires current publication
+ * proof; HTTP/Arkiv keep their caller-selected health criteria. A failed flash
+ * write may retry within the same window. Explicit next-update/physical
+ * recovery reasons are handled internally by their respective brick guards.
  * No-op when not pending-verify / already marked. */
 void fw_ota_mark_uplink_healthy(void);
 

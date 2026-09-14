@@ -22,7 +22,9 @@
  */
 
 #include "fw_ota.h"
+#include "fw_ota_http_policy.h"
 #include "arkiv_ack.h"
+#include "backend_mode.h"
 #include "identity.h"
 #include "modem.h"
 #include "mqtt.h"
@@ -43,6 +45,7 @@
 #include "esp_partition.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_tls_errors.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -58,8 +61,8 @@
 #define FW_OTA_URL_MAX \
     (WUPS_MAX_PAYLOAD - sizeof(wups_net_fw_update_v1_hdr_t))   /* 168 */
 
-/* Per-socket-op HTTP timeout. The TOTAL attempt is separately capped by
- * FW_OTA_TIMEOUT_S — a ~0.9 MB image over Cat-M takes minutes. */
+/* Per-socket-op timeout. FW_OTA_TIMEOUT_S is also checked between SDK
+ * operations across all retries; it is not an asynchronous cancellation. */
 #define FW_OTA_HTTP_TIMEOUT_MS  30000
 
 /* SHA-256 read-back chunk (one flash sector). */
@@ -92,6 +95,17 @@ static const esp_partition_t *s_update_part;
 /* Rollback bookkeeping (see fw_ota.h). */
 static bool s_pending_verify;
 static bool s_marked_valid;
+/* Serializes otadata confirmation and rollback without holding a critical
+ * section over flash operations. A busy validation also blocks a new transfer. */
+static bool s_validation_busy;
+
+typedef enum {
+    OTA_CONFIRM_AUTOMATIC_UPLINK,
+    OTA_CONFIRM_AUTHORIZED_NEXT_UPDATE,
+    OTA_CONFIRM_PHYSICAL_TRANSFER,
+} ota_confirm_reason_t;
+
+static bool confirm_running_image(ota_confirm_reason_t reason);
 
 /* fw_xfer receiver session (path 2). Guarded by s_xfer_lock — REQs run in
  * the wups_rx task, the idle guard on the heartbeat task. */
@@ -116,24 +130,34 @@ static volatile uint8_t  s_resp_result;
  * RP2040; the relay task snapshots + polls it across END(commit=1). */
 static volatile uint32_t s_rp2040_hello_count;
 
-/* Claim arbitration: fw_ota_request runs in the esp-mqtt task, the fw_xfer
- * receiver in the wups_rx task — check-and-set must be atomic. */
+/* Claim arbitration: command execution, local transfer and rollback run in
+ * different tasks. MQTT state hooks are fast and never acquire this mux;
+ * the lock order is this claim mux -> MQTT application mux, never reverse. */
 static portMUX_TYPE s_claim_mux = portMUX_INITIALIZER_UNLOCKED;
 
 bool fw_ota_in_progress(void) { return s_in_progress; }
 
-/* Atomically claim the single "an update is running" slot shared by all
- * three paths. Release is a plain `s_in_progress = false` (single owner). */
+/* Atomically claim the shared update slot and invalidate MQTT proof even for
+ * a transfer that fails before the independent monitor's next sample. */
 static bool claim_in_progress(void)
 {
     bool ok = false;
     portENTER_CRITICAL(&s_claim_mux);
-    if (!s_in_progress) {
+    if (!s_in_progress && !s_validation_busy) {
         s_in_progress = true;
+        mqtt_ota_state_changed(true);
         ok = true;
     }
     portEXIT_CRITICAL(&s_claim_mux);
     return ok;
+}
+
+static void release_in_progress(void)
+{
+    portENTER_CRITICAL(&s_claim_mux);
+    s_in_progress = false;
+    mqtt_ota_state_changed(false);
+    portEXIT_CRITICAL(&s_claim_mux);
 }
 
 /* --- helpers ------------------------------------------------------------- */
@@ -155,7 +179,15 @@ static void emit_status(const char *fmt, ...)
     ESP_LOGI(TAG, "%s", json);
     const char *topic = mqtt_topic_event();
     if (topic[0]) {
-        (void)mqtt_publish_raw(topic, json, (size_t)n, /*qos=*/1, /*retain=*/0);
+        /* Only progress is replaceable. Started/verifying/terminal events
+         * retain their own ordered, reserved admission. All buffers copy. */
+        static const char progress_prefix[] = "{\"fw_update\":\"progress\"";
+        if (strncmp(fmt, progress_prefix, sizeof(progress_prefix) - 1) == 0) {
+            (void)mqtt_publish_snapshot(topic, json, (size_t)n, 1, 0,
+                                        UINT32_C(0xF0000001));
+        } else {
+            (void)mqtt_publish_critical(topic, json, (size_t)n, 1, 0);
+        }
     }
 }
 
@@ -235,6 +267,89 @@ static bool verify_written_image(const esp_partition_t *part, uint32_t len,
     return true;
 }
 
+/* HTTP callbacks run synchronously in the OTA task. Never keep a client
+ * pointer after DISCONNECTED/cleanup, and never log URLs or auth headers. */
+typedef struct {
+    fw_ota_http_response_t response;
+    esp_http_client_handle_t client;
+    uint32_t requested_offset;
+    bool range_fallback;
+    int socket_errno, tls_code, tls_flags;
+    esp_err_t tls_error;
+} ota_http_diag_t;
+
+static void ota_http_capture(ota_http_diag_t *d)
+{
+    if (!d->client) return;
+    int socket_error = esp_http_client_get_errno(d->client);
+    if (socket_error > 0) d->socket_errno = socket_error;
+    int code = 0, flags = 0;
+    esp_err_t error = esp_http_client_get_and_clear_last_tls_error(
+        d->client, &code, &flags);
+    if (error) d->tls_error = error;
+    if (code) d->tls_code = code;
+    d->tls_flags |= flags;
+}
+
+static esp_err_t ota_http_event(esp_http_client_event_t *event)
+{
+    ota_http_diag_t *d = event->user_data;
+    if (!d) return ESP_OK;
+    d->client = event->client;
+    switch (event->event_id) {
+    case HTTP_EVENT_ON_STATUS_CODE:
+        memset(&d->response, 0, sizeof(d->response));
+        d->response.status = esp_http_client_get_status_code(event->client);
+        /* IDF silently retries a rejected Range as a full GET. Remember
+         * this across responses; reject before any flash write and schedule
+         * an explicit new attempt from zero with ordinary HTTP 200. */
+        if (d->requested_offset &&
+            (d->response.status == 200 || d->response.status == 416)) {
+            d->range_fallback = true;
+        }
+        break;
+    case HTTP_EVENT_ON_HEADER:
+        fw_ota_http_header(&d->response, event->header_key, event->header_value);
+        break;
+    case HTTP_EVENT_ERROR:
+        ota_http_capture(d);
+        break;
+    case HTTP_EVENT_DISCONNECTED:
+        ota_http_capture(d);
+        d->client = NULL;
+        break;
+    default:
+        break;
+    }
+    return ESP_OK;
+}
+
+static bool ota_http_retryable(esp_err_t err, const ota_http_diag_t *d)
+{
+    /* Keep certificate/handshake failures terminal. A retry never relaxes
+     * authentication or changes the commanded URL, digest or destination. */
+    if (d->tls_flags || d->tls_error == ESP_ERR_MBEDTLS_CERT_PARTLY_OK ||
+        d->tls_error == ESP_ERR_MBEDTLS_X509_CRT_PARSE_FAILED ||
+        d->tls_error == ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED) return false;
+    if (d->response.status >= 400)
+        return fw_ota_http_status_retryable(d->response.status);
+    switch (err) {
+    case ESP_ERR_HTTP_CONNECT:
+    case ESP_ERR_HTTP_CONNECTING:
+    case ESP_ERR_HTTP_WRITE_DATA:
+    case ESP_ERR_HTTP_FETCH_HEADER:
+    case ESP_ERR_HTTP_EAGAIN:
+    case ESP_ERR_HTTP_READ_TIMEOUT:
+    case ESP_ERR_HTTP_CONNECTION_CLOSED:
+    case ESP_ERR_HTTP_INCOMPLETE_DATA:
+        return true;
+    default:
+        /* In particular ESP_FAIL may also mean a flash/local-state error.
+         * The pinned HTTPS OTA component preserves distinct read errors. */
+        return false;
+    }
+}
+
 static void ota_task(void *arg)
 {
     (void)arg;
@@ -243,102 +358,197 @@ static void ota_task(void *arg)
     const char *detail = "";
     const int64_t deadline_us =
         esp_timer_get_time() + (int64_t)FW_OTA_TIMEOUT_S * 1000000;
+    uint32_t checkpoint = 0;
+    unsigned attempt = 0;
+    int last_step_pct = 0;
+    esp_err_t err = ESP_OK;
+    ota_http_diag_t diag = {0};
 
-    ESP_LOGW(TAG, "OTA start: %s (%" PRIu32 " B) -> %s",
-             s_url, s_image_len, s_update_part->label);
+    ESP_LOGW(TAG, "OTA start: %" PRIu32 " B -> %s; max_attempts=%u",
+             s_image_len, s_update_part->label, FW_OTA_MAX_ATTEMPTS);
     ota_ui_banner("FW UPDATE");
     emit_status("{\"fw_update\":\"started\",\"len\":%" PRIu32 ",\"slot\":\"%s\"}",
                 s_image_len, s_update_part->label);
 
-    esp_http_client_config_t http_cfg = {
-        .url               = s_url,
-        .timeout_ms        = FW_OTA_HTTP_TIMEOUT_MS,
-        /* Redirects are followed by esp_http_client's default policy;
-         * the cert bundle covers any LE/public-CA hop. */
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .buffer_size       = 2048,
-        .keep_alive_enable = true,
-    };
-    esp_https_ota_config_t ota_cfg = {
-        .http_config = &http_cfg,
-        /* partition.staging left NULL — esp_https_ota picks
-         * esp_ota_get_next_update_partition(NULL), the same slot we
-         * captured as s_update_part in fw_ota_request(). */
-    };
-
-    esp_err_t err = esp_https_ota_begin(&ota_cfg, &handle);
-    if (err != ESP_OK) {
-        detail = esp_err_to_name(err);
-        goto fail;
-    }
-
-    stage = "download";
-    int last_step_pct = 0;
-    while ((err = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+    for (attempt = 1; attempt <= FW_OTA_MAX_ATTEMPTS; ++attempt) {
         if (esp_timer_get_time() >= deadline_us) {
             stage = "timeout";
             detail = "OTA time cap exceeded";
             goto fail;
         }
-        int read = esp_https_ota_get_image_len_read(handle);
-        int pct = (int)(((int64_t)read * 100) / (int64_t)s_image_len);
-        if (pct >= last_step_pct + 25 && pct < 100) {
-            last_step_pct = pct - (pct % 25);
-            emit_status("{\"fw_update\":\"progress\",\"pct\":%d}", last_step_pct);
+        /* Only successfully written bytes survive abort. Header reads and
+         * failed writes never advance this checkpoint. A tiny prefix is
+         * restarted because IDF requires 1024 B to resume an app image. */
+        if (checkpoint < FW_OTA_RESUME_MIN) checkpoint = 0;
+        const uint32_t offset = checkpoint;
+        diag = (ota_http_diag_t){.requested_offset = offset};
+        stage = "begin";
+        esp_http_client_config_t http_cfg = {
+            .url = s_url,
+            .timeout_ms = FW_OTA_HTTP_TIMEOUT_MS,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+            .buffer_size = 2048,
+            .keep_alive_enable = true,
+            .keep_alive_idle = 60,
+            .keep_alive_interval = 10,
+            .keep_alive_count = 3,
+            .event_handler = ota_http_event,
+            .user_data = &diag,
+        };
+        esp_https_ota_config_t ota_cfg = {
+            .http_config = &http_cfg,
+            .ota_resumption = offset != 0,
+            .ota_image_bytes_written = offset,
+            .partition.staging = s_update_part,
+        };
+        ESP_LOGI(TAG, "OTA attempt=%u/%u offset=%" PRIu32 "/%" PRIu32,
+                 attempt, FW_OTA_MAX_ATTEMPTS, offset, s_image_len);
+        err = esp_https_ota_begin(&ota_cfg, &handle);
+        bool retry = false;
+        if (err != ESP_OK) {
+            /* begin owns cleanup on failure. ERROR can precede CONNECTED,
+             * so cleanup need not emit DISCONNECTED before freeing client. */
+            diag.client = NULL;
+            detail = esp_err_to_name(err);
+            retry = ota_http_retryable(err, &diag);
+            goto attempt_failed;
         }
-    }
-    if (err != ESP_OK) {
-        detail = esp_err_to_name(err);
-        goto fail;
-    }
-    if (!esp_https_ota_is_complete_data_received(handle)) {
-        detail = "incomplete data";
-        goto fail;
+        if (esp_timer_get_time() >= deadline_us) {
+            stage = "timeout";
+            detail = "OTA time cap exceeded";
+            goto attempt_failed;
+        }
+        /* Validate BEFORE perform(): esp_ota_begin/write only happen there.
+         * A same-size object changed between requests still fails the final
+         * full-flash SHA, before finish can select it as the boot image. */
+        stage = "response";
+        if (diag.range_fallback) {
+            checkpoint = 0;
+            detail = "server rejected Range; restart from zero";
+            retry = !diag.tls_flags &&
+                    (diag.response.status == 200 || diag.response.status == 206);
+            goto attempt_failed;
+        }
+        if (!fw_ota_http_response_valid(&diag.response, offset, s_image_len) ||
+            !diag.client || esp_http_client_is_chunked_response(diag.client) ||
+            esp_http_client_get_transport_type(diag.client) != HTTP_TRANSPORT_OVER_SSL) {
+            detail = "invalid HTTP status, range or length";
+            goto attempt_failed;
+        }
+        stage = "download";
+        int64_t progress_us = esp_timer_get_time();
+        for (;;) {
+            if (esp_timer_get_time() >= deadline_us) {
+                stage = "timeout";
+                detail = "OTA time cap exceeded";
+                goto attempt_failed;
+            }
+            err = esp_https_ota_perform(handle);
+            if (err != ESP_OK && err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+                ota_http_capture(&diag);
+                detail = esp_err_to_name(err);
+                retry = ota_http_retryable(err, &diag);
+                goto attempt_failed;
+            }
+            if (esp_timer_get_time() >= deadline_us) {
+                stage = "timeout";
+                detail = "OTA time cap exceeded";
+                goto attempt_failed;
+            }
+            int read = esp_https_ota_get_image_len_read(handle);
+            if (read < 0 || (uint32_t)read < checkpoint ||
+                (uint32_t)read > s_image_len) {
+                detail = "invalid written byte count";
+                goto attempt_failed;
+            }
+            if ((uint32_t)read > checkpoint) {
+                checkpoint = (uint32_t)read;
+                progress_us = esp_timer_get_time();
+            }
+            int pct = (int)(((uint64_t)checkpoint * 100) / s_image_len);
+            if (pct >= last_step_pct + 25 && pct < 100) {
+                last_step_pct = pct - (pct % 25);
+                emit_status("{\"fw_update\":\"progress\",\"pct\":%d}", last_step_pct);
+            }
+            if (err == ESP_OK) break;
+            if (esp_timer_get_time() - progress_us >= INT64_C(90000000)) {
+                detail = "no download progress for 90s";
+                retry = true;
+                goto attempt_failed;
+            }
+        }
+        if (!esp_https_ota_is_complete_data_received(handle) || checkpoint != s_image_len) {
+            detail = "incomplete data";
+            retry = checkpoint < s_image_len;
+            goto attempt_failed;
+        }
+        break;
+
+attempt_failed:
+        ota_http_capture(&diag);
+        ESP_LOGW(TAG, "OTA attempt=%u stage=%s written=%" PRIu32 "/%" PRIu32
+                 " http=%d err=%s errno=%d tls=0x%x code=%d flags=0x%x detail=%s",
+                 attempt, stage, checkpoint, s_image_len, diag.response.status,
+                 esp_err_to_name(err), diag.socket_errno, (unsigned)diag.tls_error,
+                 diag.tls_code, (unsigned)diag.tls_flags, detail);
+        if (handle) {
+            esp_https_ota_abort(handle);
+            handle = NULL;
+        }
+        diag.client = NULL;
+        unsigned delay_s = fw_ota_retry_delay_s(attempt);
+        if (!retry || !delay_s || checkpoint >= s_image_len) goto fail;
+        if (esp_timer_get_time() + (int64_t)delay_s * 1000000 >= deadline_us) {
+            stage = "timeout";
+            detail = "OTA time cap exceeded";
+            goto fail;
+        }
+        emit_status("{\"fw_update\":\"retry\",\"attempt\":%u,\"offset\":%" PRIu32
+                    ",\"delay_s\":%u}", attempt + 1, checkpoint, delay_s);
+        /* Keep the OTA claim throughout the backoff: no competing updater,
+         * mark-valid decision or modem watchdog reset can race these writes. */
+        vTaskDelay(pdMS_TO_TICKS(delay_s * 1000));
     }
 
-    stage = "verify";
-    int len_read = esp_https_ota_get_image_len_read(handle);
-    if (len_read < 0 || (uint32_t)len_read != s_image_len) {
-        ESP_LOGE(TAG, "length mismatch: got %d, commanded %" PRIu32,
-                 len_read, s_image_len);
-        detail = "length mismatch";
+    if (esp_timer_get_time() >= deadline_us) {
+        stage = "timeout";
+        detail = "OTA time cap exceeded";
         goto fail;
     }
+    stage = "verify";
     emit_status("{\"fw_update\":\"verifying\"}");
     if (!verify_written_image(s_update_part, s_image_len, s_sha_expected)) {
         detail = "sha256 mismatch";
         goto fail;
     }
-
-    /* Digest good — let esp_https_ota validate the image and flip the boot
-     * partition. From here a failure means we did NOT change the boot slot. */
+    if (esp_timer_get_time() >= deadline_us) {
+        stage = "timeout";
+        detail = "OTA time cap exceeded";
+        goto fail;
+    }
     stage = "finish";
     err = esp_https_ota_finish(handle);
     handle = NULL;
+    diag.client = NULL;
     if (err != ESP_OK) {
         detail = esp_err_to_name(err);
         goto fail;
     }
-
     ESP_LOGW(TAG, "OTA complete — rebooting into %s (rollback armed)",
              s_update_part->label);
     emit_status("{\"fw_update\":\"rebooting\"}");
-    /* Give esp-mqtt time to flush the QoS-1 status over PPP+TLS (same
-     * rationale as backend_mode's pre-reboot flush). The OLED banner is
-     * left up — the reboot + RP2040 banner TTL clear it. */
     vTaskDelay(pdMS_TO_TICKS(2000));
     esp_restart();
-    /* unreached */
 
 fail:
-    ESP_LOGE(TAG, "OTA failed at %s: %s", stage, detail);
-    if (handle) {
-        esp_https_ota_abort(handle);
-    }
+    ESP_LOGE(TAG, "OTA failed at %s after attempt=%u written=%" PRIu32 ": %s",
+             stage, attempt, checkpoint, detail);
+    if (handle) esp_https_ota_abort(handle);
+    diag.client = NULL;
     emit_status("{\"fw_update\":\"error\",\"stage\":\"%s\",\"detail\":\"%s\"}",
                 stage, detail);
     ota_ui_banner(NULL);
-    s_in_progress = false;   /* clear LAST — modem watchdog resumes now */
+    release_in_progress();
     vTaskDelete(NULL);
 }
 
@@ -599,7 +809,7 @@ static void relay_task(void *arg)
     free(buf);
     mbedtls_sha256_free(&sha);
     ota_ui_banner(NULL);
-    s_in_progress = false;   /* clear LAST — modem watchdog resumes now */
+    release_in_progress();   /* clear LAST — modem watchdog resumes now */
     vTaskDelete(NULL);
     return;                  /* unreached */
 
@@ -612,7 +822,7 @@ fail:
     emit_status("{\"fw_update\":\"error\",\"stage\":\"%s\",\"detail\":\"%s\","
                 "\"target\":\"rp2040\"}", stage, detail);
     ota_ui_banner(NULL);
-    s_in_progress = false;   /* clear LAST — modem watchdog resumes now */
+    release_in_progress();   /* clear LAST — modem watchdog resumes now */
     vTaskDelete(NULL);
 }
 
@@ -654,18 +864,14 @@ esp_err_t fw_ota_request(const char *url, const char *sha256_hex,
             return ESP_ERR_INVALID_ARG;
         }
 
-        /* Brick-guard: if the running image is STILL pending-verify (fresh
-         * OTA, no supervision tick yet — e.g. this command arrived within
-         * seconds of MQTT CONNECT), confirm it NOW: an authenticated
-         * fw.update received over MQTT is itself proof of a healthy uplink.
-         * Without this the download would overwrite the only other bootable
-         * slot while rollback is still armed — a rollback then boots a
-         * half-written image and leaves BOTH slots unbootable. */
-        fw_ota_mark_uplink_healthy();
-        if (s_pending_verify) {
+        /* Brick-guard: an accepted, authorized next update explicitly
+         * confirms the current image before overwriting its rollback slot.
+         * This is a separate recovery reason, not broker publication proof.
+         * A failed confirmation must never leave both slots unbootable. */
+        if (!confirm_running_image(OTA_CONFIRM_AUTHORIZED_NEXT_UPDATE)) {
             /* mark-valid failed (otadata write error) — refuse rather than
              * clobber the rollback slot with rollback still armed. The next
-             * healthy supervision tick retries the mark. */
+             * eligible supervision tick or another explicit update retries. */
             ESP_LOGE(TAG, "running image still PENDING_VERIFY — refusing update");
             return ESP_ERR_INVALID_STATE;
         }
@@ -694,7 +900,7 @@ esp_err_t fw_ota_request(const char *url, const char *sha256_hex,
     TaskFunction_t entry = (target == WUPS_FW_TARGET_RP2040) ? relay_task
                                                              : ota_task;
     if (xTaskCreate(entry, "fw_ota", 8192, NULL, 3, NULL) != pdPASS) {
-        s_in_progress = false;
+        release_in_progress();
         ESP_LOGE(TAG, "fw_ota task create failed");
         return ESP_ERR_NO_MEM;
     }
@@ -810,7 +1016,7 @@ reply:
             uint16_t n = encode_resp_frame(resp, sizeof(resp), src, seq, result);
             const char *topic = mqtt_topic_cmd_response();
             if (n && topic[0]) {
-                (void)mqtt_publish_raw(topic, resp, n, /*qos=*/1, /*retain=*/0);
+                (void)mqtt_publish_critical(topic, resp, n, /*qos=*/1, /*retain=*/0);
             }
         }
         ESP_LOGI(TAG, "fw.update ACKed (seq=%u result=%u)", seq, result);
@@ -830,7 +1036,7 @@ static void xfer_abort_locked(const char *why)
     esp_ota_abort(s_xfer_handle);
     s_xfer_open = false;
     ota_ui_banner(NULL);
-    s_in_progress = false;   /* modem watchdog resumes */
+    release_in_progress();   /* modem watchdog resumes */
 }
 
 static uint8_t xfer_begin(const uint8_t *payload, uint16_t len)
@@ -866,8 +1072,7 @@ static uint8_t xfer_begin(const uint8_t *payload, uint16_t len)
      * (physical access is this path's auth model), so confirming the
      * running image first is the right call — it then becomes the rollback
      * target for the image we're about to stage. */
-    fw_ota_mark_uplink_healthy();
-    if (s_pending_verify) {
+    if (!confirm_running_image(OTA_CONFIRM_PHYSICAL_TRANSFER)) {
         ESP_LOGE(TAG, "running image still PENDING_VERIFY — refusing fw_xfer");
         return WUPS_FW_XFER_BUSY;
     }
@@ -881,7 +1086,7 @@ static uint8_t xfer_begin(const uint8_t *payload, uint16_t len)
                                   &s_xfer_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
-        s_in_progress = false;
+        release_in_progress();
         return WUPS_FW_XFER_FLASH_ERR;
     }
     s_xfer_part      = part;
@@ -956,7 +1161,7 @@ static uint8_t xfer_end(const uint8_t *payload, uint16_t len, bool *reboot)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
         ota_ui_banner(NULL);
-        s_in_progress = false;
+        release_in_progress();
         return (err == ESP_ERR_OTA_VALIDATE_FAILED) ? WUPS_FW_XFER_VERIFY_FAIL
                                                     : WUPS_FW_XFER_FLASH_ERR;
     }
@@ -965,7 +1170,7 @@ static uint8_t xfer_end(const uint8_t *payload, uint16_t len, bool *reboot)
     emit_status("{\"fw_update\":\"verifying\",\"via\":\"usb\"}");
     if (!verify_written_image(s_xfer_part, s_xfer_image_len, s_xfer_sha)) {
         ota_ui_banner(NULL);
-        s_in_progress = false;
+        release_in_progress();
         return WUPS_FW_XFER_VERIFY_FAIL;
     }
 
@@ -974,7 +1179,7 @@ static uint8_t xfer_end(const uint8_t *payload, uint16_t len, bool *reboot)
         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s",
                  esp_err_to_name(err));
         ota_ui_banner(NULL);
-        s_in_progress = false;
+        release_in_progress();
         return WUPS_FW_XFER_FLASH_ERR;
     }
 
@@ -1098,38 +1303,96 @@ void fw_ota_boot_log(void)
     }
 }
 
+static const char *confirm_reason_name(ota_confirm_reason_t reason)
+{
+    switch (reason) {
+    case OTA_CONFIRM_AUTOMATIC_UPLINK:       return "automatic uplink proof";
+    case OTA_CONFIRM_AUTHORIZED_NEXT_UPDATE:return "authorized next update";
+    case OTA_CONFIRM_PHYSICAL_TRANSFER:     return "physical transfer";
+    default:                                return "unknown";
+    }
+}
+
+static bool confirm_running_image(ota_confirm_reason_t reason)
+{
+    bool automatic = reason == OTA_CONFIRM_AUTOMATIC_UPLINK;
+    portENTER_CRITICAL(&s_claim_mux);
+    if (s_validation_busy) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return false;
+    }
+    if (!s_pending_verify) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return true;
+    }
+    if (s_marked_valid || s_in_progress ||
+        (automatic && esp_timer_get_time() >=
+                      (int64_t)FW_OTA_VERIFY_WINDOW_S * 1000000)) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return false;
+    }
+    /* Linearize proof with the validation claim. A short OTA transfer must
+     * not start/end between reading fresh proof and acquiring this claim.
+     * Lock order remains claim -> MQTT; this snapshot performs no SDK I/O. */
+    if (automatic && backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
+        !mqtt_publication_proof_fresh()) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return false;
+    }
+    s_validation_busy = true;
+    portEXIT_CRITICAL(&s_claim_mux);
+
+    /* A late supervisor cannot cancel rollback just because its task ran
+     * before the main heartbeat. Explicit recovery reasons remain separate.
+     * The busy claim serializes otadata without a lock across flash I/O. */
+    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+    portENTER_CRITICAL(&s_claim_mux);
+    if (err == ESP_OK) {
+        s_marked_valid = true;
+        s_pending_verify = false;
+    }
+    s_validation_busy = false;
+    portEXIT_CRITICAL(&s_claim_mux);
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "OTA image marked VALID: %s (rollback cancelled)",
+                 confirm_reason_name(reason));
+    } else {
+        /* Retry remains possible; failed writes never manufacture proof or
+         * disarm the rollback deadline. */
+        ESP_LOGE(TAG, "mark_app_valid failed (%s): %s",
+                 confirm_reason_name(reason), esp_err_to_name(err));
+    }
+    return err == ESP_OK;
+}
+
 void fw_ota_mark_uplink_healthy(void)
 {
-    if (!s_pending_verify || s_marked_valid) return;
-    esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
-    if (err == ESP_OK) {
-        s_marked_valid   = true;
-        s_pending_verify = false;
-        ESP_LOGW(TAG, "uplink healthy — OTA image marked VALID (rollback cancelled)");
-    } else {
-        /* Leave BOTH flags untouched: a transient otadata write failure is
-         * retried on the next healthy tick, and the rollback tick stays
-         * armed as the net. */
-        ESP_LOGE(TAG, "mark_app_valid failed: %s", esp_err_to_name(err));
-    }
+    (void)confirm_running_image(OTA_CONFIRM_AUTOMATIC_UPLINK);
 }
 
 void fw_ota_rollback_tick(void)
 {
-    if (!s_pending_verify || s_marked_valid) return;
-    /* Belt-and-braces: never roll back while a download is writing the
-     * previous slot — rebooting into a half-written image would leave both
-     * slots unbootable. (fw_ota_request refuses to start while pending-
-     * verify, so this should be unreachable.) */
-    if (s_in_progress) return;
-    if (esp_timer_get_time() < (int64_t)FW_OTA_VERIFY_WINDOW_S * 1000000) return;
+    portENTER_CRITICAL(&s_claim_mux);
+    /* Never start rollback while a transfer owns the update slot, or while
+     * confirmation is committing otadata. New transfers cannot claim the
+     * slot once rollback has acquired this validation claim. */
+    if (!s_pending_verify || s_marked_valid || s_validation_busy ||
+        s_in_progress || esp_timer_get_time() <
+                         (int64_t)FW_OTA_VERIFY_WINDOW_S * 1000000) {
+        portEXIT_CRITICAL(&s_claim_mux);
+        return;
+    }
+    s_validation_busy = true;
+    portEXIT_CRITICAL(&s_claim_mux);
     ESP_LOGE(TAG, "no healthy uplink %d s after boot on a PENDING_VERIFY "
                   "image — rolling back to the previous slot",
              FW_OTA_VERIFY_WINDOW_S);
     vTaskDelay(pdMS_TO_TICKS(100));   /* flush the log line over USB-CDC */
     esp_ota_mark_app_invalid_rollback_and_reboot();
-    /* unreached on success; if it failed there is no previous valid image —
-     * keep running (better degraded than boot-looping). */
+    /* On failure avoid a reboot loop, preserving the existing behavior. */
+    portENTER_CRITICAL(&s_claim_mux);
     s_marked_valid = true;
+    s_validation_busy = false;
+    portEXIT_CRITICAL(&s_claim_mux);
     ESP_LOGE(TAG, "rollback failed — no valid previous image? staying up");
 }
