@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "modem_radio_policy.c" "modem_awake_policy.c"
+idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "modem_radio_policy.c" "modem_awake_policy.c" "modem_signal.c"
                             "modem_support_diag.c" "modem_diag_clock.c" "mqtt.c"
                             "mqtt_health.c" "mqtt_packet_guard.c" "mqtt_dispatch_queue.c"
                             "mqtt_sdk_adapter.c"
@@ -26,6 +26,26 @@ idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "modem_radio_policy.c" "m
                                      espressif__cjson
                                      esp_https_ota app_update esp_partition
                        INCLUDE_DIRS "")
+
+# Optional fixed-APN artifacts. An empty value preserves the normal ICCID
+# policy; invalid APNs fail configuration instead of silently changing it.
+if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    set(WUPS_FIXED_APN "" CACHE STRING "Fixed modem APN; empty uses ICCID selection")
+    set_property(CACHE WUPS_FIXED_APN PROPERTY STRINGS "" "iot.1nce.net" "sensor.net")
+    if(NOT "${WUPS_FIXED_APN}" STREQUAL "" AND
+       NOT "${WUPS_FIXED_APN}" STREQUAL "iot.1nce.net" AND
+       NOT "${WUPS_FIXED_APN}" STREQUAL "sensor.net")
+        message(FATAL_ERROR "WUPS_FIXED_APN must be empty, iot.1nce.net, or sensor.net")
+    endif()
+    if(NOT "${WUPS_FIXED_APN}" STREQUAL "")
+        target_compile_definitions(${COMPONENT_LIB} PRIVATE WUPS_FIXED_APN="${WUPS_FIXED_APN}")
+        message(STATUS "Modem APN fixed by build profile: ${WUPS_FIXED_APN}")
+    endif()
+    # Runtime telemetry and the ESP app descriptor must identify the same
+    # artifact, including -1nce / -sensor suffixes supplied with PROJECT_VER.
+    idf_build_get_property(wups_fw_version PROJECT_VER)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE FW_VERSION_STR="esp32:${wups_fw_version}")
+endif()
 
 # The stopped-task adapter reads a deliberately small private MQTT contract.
 # A component update must be reviewed with its lifecycle tests before changing

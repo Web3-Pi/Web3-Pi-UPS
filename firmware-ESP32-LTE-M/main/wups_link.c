@@ -400,7 +400,8 @@ static uint32_t mqtt_wups_snapshot_key(const uint8_t *frame, size_t len)
         known = version == 1 && payload_len == sizeof(wups_host_status_v1_t);
     } else if (frame[4] == WUPS_CLASS_NET && frame[5] == WUPS_OP_NET_STATUS) {
         known = (version == 1 && payload_len == sizeof(wups_net_status_v1_t)) ||
-                (version == 2 && payload_len == sizeof(wups_net_status_v2_t));
+                (version == 2 && payload_len == sizeof(wups_net_status_v2_t)) ||
+                (version == 3 && payload_len == sizeof(wups_net_status_v3_t));
     }
     return known ? ((uint32_t)frame[3] << 16) | ((uint32_t)frame[4] << 8) | frame[5] : 0;
 }

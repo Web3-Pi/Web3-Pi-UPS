@@ -5,7 +5,9 @@ Provides cellular telemetry, authenticated commands and firmware updates over
 MQTT, HTTP or Arkiv, independently of the Raspberry Pi's local network.
 
 The current firmware uses **LTE Cat-M1 only**, on **B3 (1800 MHz) and B20
-(800 MHz)**. NB-IoT selection is disabled. See the
+(800 MHz)**. NB-IoT selection is disabled. The current
+[0.8.15 release adds SINR telemetry and fixed-APN build variants](docs/RELEASE-0.8.15.md).
+For the underlying radio and recovery behavior, see the
 [0.8.14 integration and validation notes](docs/RELEASE-0.8.14.md).
 
 ## Hardware

@@ -159,7 +159,7 @@ emitter flips to v2; the RP2040 hub must forward the raw payload length, not
 
 | Op   | Name           | Direction                       | Payload struct               |
 |------|----------------|----------------------------------|-------------------------------|
-| 0x01 | status         | EVENT (ESP32→RP2040), RESP       | `wups_net_status_v1_t` / `v2_t` |
+| 0x01 | status         | EVENT (ESP32→RP2040), RESP       | `wups_net_status_v1_t` / `v2_t` / `v3_t` |
 | 0x02 | publish        | REQ → ESP32                      | `wups_net_publish_v1_hdr_t`  |
 | 0x10 | downlink       | EVENT → destination              | `wups_net_downlink_v1_hdr_t` |
 | 0x20 | time_sync      | EVENT (INTERNAL broadcast)       | `wups_net_time_sync_v1_t`    |
@@ -167,6 +167,13 @@ emitter flips to v2; the RP2040 hub must forward the raw payload length, not
 ESP32 is a dumb pipe: it never inspects payloads of `net.publish` (the
 caller composes whatever bytes go to MQTT). It forwards `net.downlink` to
 whichever address the cloud directed (typically `RPI`).
+
+`net.status` v3 is 31 bytes: the 20-byte v1 prefix and 10-byte v2 sys-link
+tail keep their offsets, with `sinr_dB` (`int8_t`) appended at offset 30.
+The version byte is `3`; `-128` means unknown and **0 dB is valid**.
+SIM7080G `AT+CPSI?` reports RSSNR codes `0..25`, converted as
+`SINR = 2 * RSSNR - 20` dB (`-20..30`). Readers of older v1/v2 payloads must
+treat SINR as absent; invalid/missing CPSI fields are never converted to 0.
 
 ### Class 0x04 HOST (RPi)
 

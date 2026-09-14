@@ -28,6 +28,10 @@ def main():
                           r'static bool s_apn_seeded = .*?;', source, re.M)
     if apn_state is None:
         raise SystemExit("Cannot extract production APN state")
+    profile_default = re.search(r'^#ifndef WUPS_FIXED_APN\n#define WUPS_FIXED_APN ""\n#endif',
+                                source, re.M)
+    if profile_default is None:
+        raise SystemExit("Cannot extract production APN profile default")
     definitions = []
     for name in ("MODEM_TX_GPIO", "MODEM_RX_GPIO", "MODEM_UART", "MODEM_BAUD",
                  "MODEM_REG_WAIT_MS", "CMUX_ENTRY_FAILS_MAX", "CMUX_FALLBACK_RETRY_S"):
@@ -36,7 +40,7 @@ def main():
             raise SystemExit("Cannot extract production constant " + name)
         definitions.append("#define " + name + " " + match[1].split("/*", 1)[0].strip())
     bringup = function(source, "static esp_err_t ppp_bringup_dce(")
-    extracted = "\n".join(definitions) + "\n" + apn_state[0] + "\n" + bringup
+    extracted = "\n".join(definitions) + "\n" + profile_default[0] + "\n" + apn_state[0] + "\n" + bringup
     sanitizers = os.environ.get("MQTT_TEST_SANITIZERS", "address,undefined").strip()
     print("modem_apn sanitizers=" + (sanitizers or "none explicitly"), flush=True)
     print("modem.c SHA256=" + hashlib.sha256(source.encode()).hexdigest(), flush=True)
@@ -45,14 +49,18 @@ def main():
         temporary = Path(directory)
         include = temporary / "modem_apn_bringup.inc"
         include.write_text(extracted)
-        binary = temporary / "test_modem_apn"
-        command = shlex.split(os.environ.get("CC", "cc")) + [
-            "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-pedantic",
-            "-I", str(temporary), str(root / "tools/test_modem_apn.c"), "-o", str(binary)]
-        if sanitizers:
-            command += ["-fsanitize=" + sanitizers, "-fno-omit-frame-pointer"]
-        subprocess.run(command, check=True, timeout=30)
-        subprocess.run([str(binary)], check=True, timeout=30)
+        for profile, apn in (("auto", ""), ("1nce", "iot.1nce.net"), ("sensor", "sensor.net")):
+            binary = temporary / ("test_modem_apn_" + profile)
+            command = shlex.split(os.environ.get("CC", "cc")) + [
+                "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-pedantic",
+                "-I", str(temporary), str(root / "tools/test_modem_apn.c"), "-o", str(binary)]
+            if apn:
+                command += ['-DWUPS_FIXED_APN="' + apn + '"']
+            if sanitizers:
+                command += ["-fsanitize=" + sanitizers, "-fno-omit-frame-pointer"]
+            print("Build/test APN profile=" + profile, flush=True)
+            subprocess.run(command, check=True, timeout=30)
+            subprocess.run([str(binary)], check=True, timeout=30)
 
 
 if __name__ == "__main__":

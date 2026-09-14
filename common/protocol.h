@@ -411,6 +411,28 @@ typedef struct WUPS_PACKED {
                               * they can be inner frames of net.publish), saturates at 0xFFFF */
 } wups_net_status_v2_t;      /* 30 bytes */
 
+/* net.status v3 — append SINR in dB to the unchanged v2 layout. Unlike
+ * legacy RSSI/RSRP/RSRQ, zero is a valid SINR measurement. SIM7080G CPSI
+ * reports RSSNR as 0..25: SINR = 2 * RSSNR - 20 (-20..30 dB).
+ * Missing/invalid measurements MUST use -128, including initial frames. */
+#define WUPS_NET_SINR_UNKNOWN (-128)
+typedef struct WUPS_PACKED {
+    uint8_t  version;        /* = 3 */
+    uint8_t  state;
+    int8_t   rssi_dBm;
+    int8_t   rsrp_dBm;
+    int8_t   rsrq_dB;
+    uint8_t  reserved;
+    uint16_t errors;
+    uint32_t ip_addr;
+    uint32_t bytes_tx;
+    uint32_t bytes_rx;
+    uint32_t sys_frames_rx;
+    uint32_t sys_resync;
+    uint16_t sys_link_age_s;
+    int8_t   sinr_dB;        /* offset 30; -20..30 dB, -128 = unknown */
+} wups_net_status_v3_t;      /* 31 bytes */
+
 /* net.publish (REQ -> ESP32). Variable-length tail: topic + payload. */
 typedef struct WUPS_PACKED {
     uint8_t  version;        /* = 1 */

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "modem_radio_policy.h"
+#include "modem_signal.h"
 
 typedef int esp_err_t;
 enum { ESP_OK, ESP_FAIL = -1, ESP_ERR_NOT_FINISHED = 0x10c, ESP_ERR_TIMEOUT = 0x107 };
@@ -156,20 +157,24 @@ static void test_capacity(void)
 }
 static void test_cpsi(void)
 {
-    const char cpsi[] = "\r\n+URC: 10,20,30,40\r\n+CPSI: LTE CAT-M1,Online,260-03,123,20,6440,3,3,-110,-900,-700,12\r\n+CEREG: 2,5,\"cafe\",\"123\",7\r\n+URC: 1,2,3,4\r\nOK\r\n";
+    const char cpsi[] = "\r\n+URC: 10,20,30,40\r\n+CPSI: LTE CAT-M1,Online,001-01,0x1234,12345,123,EUTRAN-BAND20,6200,3,3,-110,-900,-700,12\r\n+CEREG: 2,5,\"cafe\",\"123\",7\r\n+URC: 1,2,3,4\r\nOK\r\n";
     plan("AT+CPSI?\r", cpsi, strlen(cpsi), ESP_OK);
-    int8_t rsrp = 0, rsrq = 0; poll_cpsi(&rsrp, &rsrq);
-    assert(rsrp == -90 && rsrq == -11);
-    assert(strstr(logs, "+CPSI: LTE CAT-M1,Online,260-03,123,20,6440,3,3,-110,-900,-700,12"));
-    const char direct[] = "\r\n+CPSI: LTE CAT-M1,Online,20,-10,-95,-70,12\r\nOK\r\n";
-    plan("AT+CPSI?\r", direct, strlen(direct), ESP_OK); poll_cpsi(&rsrp, &rsrq);
-    assert(rsrp == -95 && rsrq == -10);
+    int8_t rsrp = 0, rsrq = 0, sinr = WUPS_NET_SINR_UNKNOWN;
+    poll_cpsi(&rsrp, &rsrq, &sinr);
+    assert(rsrp == -90 && rsrq == -11 && sinr == 4);
+    assert(strstr(logs, "+CPSI: LTE CAT-M1,Online,001-01,0x1234,12345,123,EUTRAN-BAND20,6200,3,3,-110,-900,-700,12"));
+    const char direct[] = "\r\n+CPSI: LTE CAT-M1,Online,001-01,0x1234,12345,123,EUTRAN-BAND20,6200,3,3,-10,-95,-70,12\r\nOK\r\n";
+    plan("AT+CPSI?\r", direct, strlen(direct), ESP_OK); poll_cpsi(&rsrp, &rsrq, &sinr);
+    assert(rsrp == -95 && rsrq == -10 && sinr == 4);
     const char no_service[] = "\r\n+CPSI: NO SERVICE\r\n+URC: LTE,1,2,-100,-900,-700,12\r\nOK\r\n";
     plan("AT+CPSI?\r", no_service, strlen(no_service), ESP_OK);
-    rsrp = 7; rsrq = 8; poll_cpsi(&rsrp, &rsrq); assert(rsrp == 7 && rsrq == 8);
+    rsrp = 7; rsrq = 8; sinr = WUPS_NET_SINR_UNKNOWN;
+    poll_cpsi(&rsrp, &rsrq, &sinr);
+    assert(rsrp == 7 && rsrq == 8 && sinr == WUPS_NET_SINR_UNKNOWN);
     plan("AT+CPSI?\r", NULL, 0, ESP_ERR_TIMEOUT);
-    poll_cpsi(&rsrp, &rsrq); assert(rsrp == 7 && rsrq == 8);
-    puts("PASS actual CPSI parser: RSRP/RSRQ from CPSI only, comma-bearing URCs ignored, dB/tenths handled, no-service/timeout leave outputs unchanged");
+    poll_cpsi(&rsrp, &rsrq, &sinr);
+    assert(rsrp == 7 && rsrq == 8 && sinr == WUPS_NET_SINR_UNKNOWN);
+    puts("PASS actual CPSI poll: RSRP/RSRQ/SINR from CPSI only, comma-bearing URCs ignored, dB/tenths handled, no-service/timeout leave outputs unchanged");
 }
 int main(void)
 {

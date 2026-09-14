@@ -49,7 +49,8 @@ def main():
             "-DCONFIG_ESP_MODEM_USE_INFLATABLE_BUFFER_IF_NEEDED=1",
             "-I", str(temporary), "-I", str(firmware),
             str(root / "tools/test_modem_radio_adapter.c"),
-            str(firmware / "modem_radio_policy.c"), "-o", str(binary)]
+            str(firmware / "modem_radio_policy.c"),
+            str(firmware / "modem_signal.c"), "-o", str(binary)]
         if sanitizers:
             command += ["-fsanitize=" + sanitizers, "-fno-omit-frame-pointer"]
         subprocess.run(command, check=True, timeout=30)

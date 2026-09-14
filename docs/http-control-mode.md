@@ -207,6 +207,11 @@ repeat a sample — §9 uses them to measure the on-wire cost). Units are as nam
 milliamps (signed where noted), `*_dc` deci-Celsius (253 = 25.3 °C), `*_pct`
 percent, `load_x100` = 1-min load × 100, `*_s` seconds.
 
+`net.status` v3 additionally supplies optional `net.sinr_db` in dB (`-20..30`,
+including `0`). It is omitted for v1/v2 telemetry or an unavailable/invalid
+measurement; the binary `-128` sentinel is never emitted as a JSON reading.
+The v1-prefix network fields above keep their existing names and meaning.
+
 `power` v2 keys (since `esp32:0.8.9`), in emission order:
 
 | key | unit | wire field | note |

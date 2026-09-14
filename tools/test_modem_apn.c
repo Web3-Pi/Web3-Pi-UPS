@@ -45,7 +45,7 @@ static struct {
     char iccid[24], initial_cached_apn[32], requested_apn[32], modem_apn[32];
     unsigned create_calls, identity_reads, cache_updates, apn_at_calls;
     unsigned rf_resume_calls, reg_calls, dial_calls, mode_calls;
-    unsigned seed_logs, warning_logs;
+    unsigned seed_logs, fixed_logs, warning_logs;
     bool rf_off, fail_sync, fail_apn_at, fail_sim_read, reject_identity, unregistered;
     int mode;
     int64_t clock_us;
@@ -61,6 +61,7 @@ static void log_message(const char *tag, const char *format, ...)
     va_end(args);
     CHECK(length >= 0 && (size_t)length < sizeof(text));
     if (strstr(text, "APN selected from ICCID list:")) ++host.seed_logs;
+    if (strstr(text, "APN fixed by build profile:")) ++host.fixed_logs;
     if (strstr(text, "AT+CGDCONT failed")) ++host.warning_logs;
 }
 #define ESP_LOGI(...) log_message(__VA_ARGS__)
@@ -239,14 +240,23 @@ static esp_err_t esp_modem_set_mode(esp_modem_dce_t *dce, int mode)
 
 #include "modem_apn_bringup.inc"
 
+static const char *boot_apn;
+
+/* Expected SIM-based APN in normal builds; fixed artifacts must override
+ * it for both matching and opposite-profile ICCIDs in all scenarios. */
+static const char *profile_apn(const char *automatic_apn)
+{
+    return WUPS_FIXED_APN[0] ? WUPS_FIXED_APN : automatic_apn;
+}
+
 static void cold_boot(const char *reply, const char *expected)
 {
     memset(&host, 0, sizeof(host));
     host.sim_reply = reply;
-    host.expected_apn = expected;
+    host.expected_apn = profile_apn(expected);
     strcpy(host.modem_apn, "previous.stored.apn");
     s_dce = NULL;
-    s_apn = "sensor.net";
+    s_apn = boot_apn;
     s_apn_seeded = false;
     s_iccid_known = false;
     s_fail_stage = MODEM_FAIL_NONE;
@@ -261,7 +271,7 @@ static void next_attempt(void)
      * selected APN and SIM identity deliberately survive this new DCE. */
     host.create_calls = host.identity_reads = host.cache_updates = host.apn_at_calls = 0;
     host.rf_resume_calls = host.reg_calls = host.dial_calls = host.mode_calls = 0;
-    host.seed_logs = host.warning_logs = 0;
+    host.seed_logs = host.fixed_logs = host.warning_logs = 0;
     host.rf_off = false;
     s_fail_stage = MODEM_FAIL_NONE;
     s_dce = NULL;
@@ -272,11 +282,12 @@ static void check_success(const char *initial_apn, bool first_attempt, bool data
 {
     CHECK(ppp_bringup_dce() == ESP_OK);
     CHECK(s_fail_stage == MODEM_FAIL_NONE && s_apn_seeded && s_iccid_known);
-    CHECK(!strcmp(host.initial_cached_apn, initial_apn));
+    CHECK(!strcmp(host.initial_cached_apn, profile_apn(initial_apn)));
     CHECK(!strcmp(s_apn, host.expected_apn));
     CHECK(!strcmp(host.modem_apn, host.expected_apn));
     CHECK(host.identity_reads == (first_attempt ? 1u : 0u));
-    CHECK(host.seed_logs == (first_attempt ? 1u : 0u));
+    CHECK(host.seed_logs == (first_attempt && !WUPS_FIXED_APN[0] ? 1u : 0u));
+    CHECK(host.fixed_logs == (first_attempt && WUPS_FIXED_APN[0] ? 1u : 0u));
     CHECK(host.cache_updates == 1 && host.apn_at_calls == 1);
     CHECK(host.rf_resume_calls == 1 && host.mode_calls == 1);
     CHECK(host.mode == (data_mode ? ESP_MODEM_MODE_DATA : ESP_MODEM_MODE_CMUX));
@@ -324,9 +335,11 @@ static void test_registration_retry(void)
         for (unsigned attempt = 0; attempt < 3; ++attempt) {
             CHECK(ppp_bringup_dce() == ESP_FAIL);
             CHECK(s_fail_stage == MODEM_FAIL_NET && s_apn_seeded);
-            CHECK(!strcmp(s_apn, apns[profile]));
-            CHECK(!strcmp(host.dce.copied_apn, apns[profile]));
-            CHECK(!strcmp(host.requested_apn, apns[profile]));
+            CHECK(!strcmp(s_apn, profile_apn(apns[profile])));
+            CHECK(!strcmp(host.initial_cached_apn,
+                          attempt ? profile_apn(apns[profile]) : boot_apn));
+            CHECK(!strcmp(host.dce.copied_apn, profile_apn(apns[profile])));
+            CHECK(!strcmp(host.requested_apn, profile_apn(apns[profile])));
             CHECK(host.reg_calls > 1 && host.dial_calls == 0 && host.mode_calls == 0);
             CHECK(s_reg_timeout_streak == (int)attempt + 1);
             next_attempt();
@@ -344,16 +357,28 @@ static void test_failures(void)
     CHECK(ppp_bringup_dce() == ESP_FAIL);
     CHECK(s_fail_stage == MODEM_FAIL_NET && host.cache_updates == 1);
     CHECK(host.apn_at_calls == 0 && host.rf_resume_calls == 0 && host.mode_calls == 0);
-    CHECK(host.rf_off && !strcmp(host.dce.copied_apn, "sensor.net"));
-    CHECK(s_apn_seeded && !strcmp(s_apn, "iot.1nce.net"));
+    CHECK(host.rf_off && !strcmp(host.dce.copied_apn, profile_apn("sensor.net")));
+    CHECK(s_apn_seeded && !strcmp(s_apn, profile_apn("iot.1nce.net")));
     next_attempt();
     host.fail_sync = false;
     check_success("iot.1nce.net", false, false);
 
     cold_boot("+CCID: 8988228066614189920\r\nOK\r\n", "iot.1nce.net");
     host.fail_apn_at = true;
-    check_success("sensor.net", true, false);
-    CHECK(host.warning_logs == 1); /* Existing best-effort attach policy. */
+    if (WUPS_FIXED_APN[0]) {
+        CHECK(ppp_bringup_dce() == ESP_FAIL);
+        CHECK(s_fail_stage == MODEM_FAIL_NET && host.rf_off);
+        CHECK(host.cache_updates == 1 && host.apn_at_calls == 1);
+        CHECK(host.rf_resume_calls == 0 && host.dial_calls == 0 && host.mode_calls == 0);
+        CHECK(!strcmp(host.requested_apn, WUPS_FIXED_APN));
+        CHECK(!strcmp(host.modem_apn, "previous.stored.apn"));
+        next_attempt();
+        host.fail_apn_at = false;
+        check_success(WUPS_FIXED_APN, false, false);
+    } else {
+        check_success("sensor.net", true, false);
+        CHECK(host.warning_logs == 1); /* Existing best-effort attach policy. */
+    }
 
     cold_boot("malformed SIM response", "sensor.net");
     host.reject_identity = true;
@@ -363,7 +388,7 @@ static void test_failures(void)
     next_attempt();
     host.reject_identity = false;
     host.sim_reply = "+CCID: 8988228066614189920\r\nOK\r\n";
-    host.expected_apn = "iot.1nce.net";
+    host.expected_apn = profile_apn("iot.1nce.net");
     check_success("sensor.net", true, false);
 
     cold_boot("", "sensor.net");
@@ -375,9 +400,12 @@ static void test_failures(void)
 
 int main(void)
 {
+    boot_apn = s_apn;
+    CHECK(!strcmp(boot_apn, profile_apn("sensor.net")));
     test_profiles();
     test_registration_retry();
     test_failures();
-    printf("modem_apn: %u checks PASS (production bring-up; old/new SIM, cache/AT order, retry and failure gates)\n", checks);
+    printf("modem_apn: %u checks PASS (profile %s; production bring-up, cross-profile SIM, first boot/retry, cache/AT order and failure gates)\n",
+           checks, WUPS_FIXED_APN[0] ? WUPS_FIXED_APN : "auto ICCID");
     return 0;
 }

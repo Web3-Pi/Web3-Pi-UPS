@@ -164,12 +164,17 @@ static void test_routing(void) {
     n = make_frame(frame, WUPS_ADDR_ESP32, WUPS_CLASS_NET, WUPS_OP_NET_STATUS,
                    WUPS_FLAG_EVENT, 2, sizeof(wups_net_status_v2_t));
     net_publish("telemetry", frame, n, 0, 0); assert(route == 2);
+    n = make_frame(frame, WUPS_ADDR_ESP32, WUPS_CLASS_NET, WUPS_OP_NET_STATUS,
+                   WUPS_FLAG_EVENT, 3, sizeof(wups_net_status_v3_t));
+    frame[WUPS_HEADER_BYTES + 30] = (uint8_t)-6; checksum(frame, n);
+    net_publish("telemetry", frame, n, 0, 0); assert(route == 2);
+    assert(captured_len == n && memcmp(captured_payload, frame, n) == 0);
     net_publish("t/test/telemetry", frame, n, 2, 1);
     assert(route == 1 && captured_qos == 2 && captured_retain == 1);
     frame[n - 4] ^= 1; net_publish("telemetry", frame, n, 0, 0); assert(route == 1);
     checksum(frame, n); frame[6] = WUPS_FLAG_RESP; checksum(frame, n);
     net_publish("telemetry", frame, n, 0, 0); assert(route == 1);
-    frame[6] = WUPS_FLAG_EVENT; frame[10] = 3; checksum(frame, n);
+    frame[6] = WUPS_FLAG_EVENT; frame[10] = 4; checksum(frame, n);
     net_publish("telemetry", frame, n, 0, 0); assert(route == 1);
     net_publish("pubtest", NULL, 0, 1, 1); assert(route == 1 && captured_len == 0 && captured_retain == 1);
     const uint8_t binary[] = {0, 255, 0, 1};

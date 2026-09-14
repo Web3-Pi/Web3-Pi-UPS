@@ -122,6 +122,9 @@ def decode_payload(cls, op, flags, p: bytes) -> str:
         errors, ip, btx, brx = struct.unpack_from("<HIII", p, 6)
         s = "net.status v%d state=%s rssi=%d rsrp=%d rsrq=%d bytes_tx=%d bytes_rx=%d" % (
             ver, NET_STATE.get(state, state), rssi, rsrp, rsrq, btx, brx)
+        if ver == 3 and len(p) >= 31:
+            sinr = struct.unpack_from("<b", p, 30)[0]
+            s += " sinr=%s" % ("%d dB" % sinr if -20 <= sinr <= 30 else "unknown")
         if len(p) >= 30:
             frx, rsy, age = struct.unpack_from("<IIH", p, 20)
             s += "\n      >>> SYS-LINK: frames_rx=%d resync=%d link_age=%ds%s" % (

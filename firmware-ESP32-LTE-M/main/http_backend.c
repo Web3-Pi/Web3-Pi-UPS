@@ -520,6 +520,28 @@ static bool dispatch_command(const char *cmd, const cJSON *args)
 
 /* --- telemetry JSON ---------------------------------------------------- */
 
+/* net.status keeps the v1 prefix; v3 appends measured SINR. Omit unknown
+ * SINR instead of encoding the -128 wire sentinel as a measurement. */
+static void add_net_telemetry(cJSON *root, const uint8_t *raw, size_t len)
+{
+    if (!raw || len < sizeof(wups_net_status_v1_t)) return;
+    wups_net_status_v1_t n;
+    memcpy(&n, raw, sizeof(n));
+    cJSON *o = cJSON_AddObjectToObject(root, "net");
+    cJSON_AddNumberToObject(o, "state",    n.state);
+    cJSON_AddNumberToObject(o, "rssi_dbm", n.rssi_dBm);
+    cJSON_AddNumberToObject(o, "rsrp_dbm", n.rsrp_dBm);
+    cJSON_AddNumberToObject(o, "rsrq_db",  n.rsrq_dB);
+    if (n.version == 3 && len >= sizeof(wups_net_status_v3_t)) {
+        wups_net_status_v3_t v3;
+        memcpy(&v3, raw, sizeof(v3));
+        if (v3.sinr_dB >= -20 && v3.sinr_dB <= 30)
+            cJSON_AddNumberToObject(o, "sinr_db", v3.sinr_dB);
+    }
+    cJSON_AddNumberToObject(o, "bytes_tx", n.bytes_tx);
+    cJSON_AddNumberToObject(o, "bytes_rx", n.bytes_rx);
+}
+
 /* Build the telemetry JSON body. Returns length, 0 on failure. */
 static size_t build_body(char *out, size_t cap)
 {
@@ -613,18 +635,8 @@ static size_t build_body(char *out, size_t cap)
         cJSON_AddNumberToObject(o, "uptime_s",    h.uptime_s);
     }
 
-    /* net.status → wups_net_status_v1_t */
-    if (take_slot(2, raw, sizeof(raw)) >= sizeof(wups_net_status_v1_t)) {
-        wups_net_status_v1_t n;
-        memcpy(&n, raw, sizeof(n));
-        cJSON *o = cJSON_AddObjectToObject(root, "net");
-        cJSON_AddNumberToObject(o, "state",    n.state);
-        cJSON_AddNumberToObject(o, "rssi_dbm", n.rssi_dBm);
-        cJSON_AddNumberToObject(o, "rsrp_dbm", n.rsrp_dBm);
-        cJSON_AddNumberToObject(o, "rsrq_db",  n.rsrq_dB);
-        cJSON_AddNumberToObject(o, "bytes_tx", n.bytes_tx);
-        cJSON_AddNumberToObject(o, "bytes_rx", n.bytes_rx);
-    }
+    uint16_t net_len = take_slot(2, raw, sizeof(raw));
+    add_net_telemetry(root, raw, net_len);
 
     /* acks — command ids completed since the previous POST. */
     cJSON *acks = cJSON_AddArrayToObject(root, "acks");

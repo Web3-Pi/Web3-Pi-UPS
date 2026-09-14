@@ -1,5 +1,6 @@
 #include "modem.h"
 #include "modem_radio_policy.h"
+#include "modem_signal.h"
 #include "modem_awake_policy.h"
 #include "modem_support_diag.h"
 #include "modem_diag_clock.h"
@@ -70,11 +71,13 @@
  *   "AT\r\r\nOK\r\n"      -> path alive, translator working. */
 #define MODEM_UART_DIAG   0
 
-/* Select the fleet APN once after reading the SIM identity. Registration
- * failures must not rotate away from the SIM's configured APN. The first
- * DCE is created before ICCID is available, so its cached PDP context must
- * be synchronized with this selection before RF resume and PPP setup. */
-static const char *s_apn = "sensor.net";
+/* A fixed build profile applies even to the first DCE, before ICCID is
+ * available. With no override, keep the fleet's per-ICCID selection below.
+ * Every retry synchronizes the same APN into both SDK and modem contexts. */
+#ifndef WUPS_FIXED_APN
+#define WUPS_FIXED_APN ""
+#endif
+static const char *s_apn = sizeof(WUPS_FIXED_APN) > 1 ? WUPS_FIXED_APN : "sensor.net";
 static bool s_apn_seeded = false;
 
 #define EVT_GOT_IP        BIT0
@@ -572,43 +575,13 @@ static void modem_network_snapshot(const char *reason)
     (void)radio_at(NULL, "AT+CPSI?", reply, sizeof(reply), 3000);
 }
 
-/* Optional RSRP/RSRQ from AT+CPSI? (Cat-M form ends ...,<RSRQ>,<RSRP>,
- * <RSSI>,<RSSNR>). Parsed defensively: SIM7080G FW revisions differ on
- * whether RSRP/RSRQ come in dB(m) or tenths, so out-of-range raw values are
- * re-tried as tenths and anything still implausible is dropped silently.
- * Outputs are left untouched (0 = unknown) on any surprise. */
-static void poll_cpsi(int8_t *rsrp_out, int8_t *rsrq_out)
+/* Optional LTE measurements. The parser validates complete numeric fields;
+ * RSSNR is an encoded SINR, with -128 (not zero) used for unknown SINR. */
+static void poll_cpsi(int8_t *rsrp_out, int8_t *rsrq_out, int8_t *sinr_out)
 {
     char out[MODEM_RADIO_RESPONSE_CAPACITY] = {0};
     if (!radio_at(NULL, "AT+CPSI?", out, sizeof(out), 3000)) return;
-    /* Full replies can include unrelated comma-separated URCs. Restrict the
-     * signal parser to the CPSI line before looking at its numeric tail. */
-    char *cpsi = NULL;
-    for (char *line = out; *line;) {
-        size_t len = strcspn(line, "\r\n");
-        if (strncmp(line, "+CPSI:", 6) == 0) {
-            line[len] = '\0';
-            cpsi = line;
-            break;
-        }
-        line += len;
-        while (*line == '\r' || *line == '\n') ++line;
-    }
-    if (!cpsi || !strstr(cpsi, "LTE")) return; /* no service / other RAT */
-
-    /* Collect the integer value of every comma field, keep the tail. */
-    long vals[20];
-    int  n = 0;
-    for (char *p = strchr(cpsi, ','); p && n < 20; p = strchr(p + 1, ',')) {
-        vals[n++] = strtol(p + 1, NULL, 10);
-    }
-    if (n < 4) return;
-    long rsrq = vals[n - 4];   /* ...,<RSRQ>,<RSRP>,<RSSI>,<RSSNR> */
-    long rsrp = vals[n - 3];
-    if (rsrp <= -440 && rsrp >= -1560) rsrp /= 10;   /* tenths variant */
-    if (rsrq <= -35  && rsrq >= -340)  rsrq /= 10;
-    if (rsrp <= -44 && rsrp >= -128) *rsrp_out = (int8_t)rsrp;
-    if (rsrq <= -3  && rsrq >= -34)  *rsrq_out = (int8_t)rsrq;
+    modem_signal_parse_cpsi(out, rsrp_out, rsrq_out, sinr_out);
 }
 
 /* Build a FULL framed WUPS net.status EVENT (byte-identical to the frames
@@ -616,14 +589,15 @@ static void poll_cpsi(int8_t *rsrp_out, int8_t *rsrq_out)
  * Self-emitted frames never pass wups_link's handle_net_publish, so the
  * per-backend routing that lives there is mirrored here explicitly. */
 static void emit_net_status(uint8_t state, int8_t rssi_dbm,
-                            int8_t rsrp, int8_t rsrq)
+                            int8_t rsrp, int8_t rsrq, int8_t sinr)
 {
-    wups_net_status_v2_t st = {0};
-    st.version  = 2;
+    wups_net_status_v3_t st = {0};
+    st.version  = 3;
     st.state    = state;
     st.rssi_dBm = rssi_dbm;
     st.rsrp_dBm = rsrp;
     st.rsrq_dB  = rsrq;
+    st.sinr_dB  = sinr;
     /* v2 tail — ESP32<->RP2040 sys-link health (wups_link.h). Lets the
      * panel tell a dead inter-MCU link from a quiet one (2026-08-20). */
     st.sys_frames_rx = wups_link_frames_rx();
@@ -1223,32 +1197,37 @@ static esp_err_t ppp_bringup_dce(void)
         }
     }
 
-    /* The original fleet is this exact five-card set. All other cards use
-     * sensor.net. Identity is fixed for the boot, and retries retain its APN
-     * even when registration fails. Do not seed from an invalid identity. */
+    /* A fixed APN never depends on ICCID, but still requires a valid SIM
+     * identity. Auto builds use the exact original five-card set below;
+     * all other cards use sensor.net. Neither mode alternates APNs on retry. */
     if (!s_iccid_known) {
         ESP_LOGE(MODEM_TAG, "ICCID invalid — refusing to select an APN");
         s_fail_stage = MODEM_FAIL_SIM;
         return ESP_FAIL;
     }
     if (!s_apn_seeded) {
-        static const char *const old_batch_iccids[] = {
-            "8988228066614189920",
-            "8988280666000338870",
-            "8988280666000338871",
-            "8988228066618136967",
-            "8988228066618136966",
-        };
-        const char *iccid = identity_iccid();
-        for (size_t i = 0;
-             i < sizeof(old_batch_iccids) / sizeof(old_batch_iccids[0]); ++i) {
-            if (strcmp(iccid, old_batch_iccids[i]) == 0) {
-                s_apn = "iot.1nce.net";
-                break;
+        if (WUPS_FIXED_APN[0]) {
+            s_apn = WUPS_FIXED_APN;
+            ESP_LOGI(MODEM_TAG, "APN fixed by build profile: %s (ICCID selection disabled)", s_apn);
+        } else {
+            static const char *const old_batch_iccids[] = {
+                "8988228066614189920",
+                "8988280666000338870",
+                "8988280666000338871",
+                "8988228066618136967",
+                "8988228066618136966",
+            };
+            const char *iccid = identity_iccid();
+            for (size_t i = 0;
+                 i < sizeof(old_batch_iccids) / sizeof(old_batch_iccids[0]); ++i) {
+                if (strcmp(iccid, old_batch_iccids[i]) == 0) {
+                    s_apn = "iot.1nce.net";
+                    break;
+                }
             }
+            ESP_LOGI(MODEM_TAG, "APN selected from ICCID list: %s", s_apn);
         }
         s_apn_seeded = true;
-        ESP_LOGI(MODEM_TAG, "APN selected from ICCID list: %s", s_apn);
     }
 
     /* esp_modem copied the APN when the DCE was created, before the first
@@ -1267,8 +1246,8 @@ static esp_err_t ppp_bringup_dce(void)
      * the APN must be in place now — esp_modem itself only sends CGDCONT in
      * setup_data_mode(), i.e. after registration succeeds, which is too late
      * for networks that reject the attach on a wrong/stale APN (new SIM
-     * batch, bench 2026-08-18). Best-effort: on failure the modem attaches
-     * with whatever CGDCONT its NVRAM holds, as before. */
+     * batch, bench 2026-08-18). Auto mode retains the existing best-effort
+     * behavior. Fixed builds must not attach with an unconfirmed stored APN. */
     {
         char apn_cmd[64];
         snprintf(apn_cmd, sizeof apn_cmd, "AT+CGDCONT=1,\"IP\",\"%s\"",
@@ -1276,6 +1255,11 @@ static esp_err_t ppp_bringup_dce(void)
         if (esp_modem_at(s_dce, apn_cmd, NULL, 3000) == ESP_OK) {
             ESP_LOGI(MODEM_TAG, "attach APN set: %s", s_apn);
         } else {
+            if (WUPS_FIXED_APN[0]) {
+                ESP_LOGE(MODEM_TAG, "AT+CGDCONT failed — fixed APN not confirmed; attach blocked");
+                s_fail_stage = MODEM_FAIL_NET;
+                return ESP_FAIL;
+            }
             ESP_LOGW(MODEM_TAG, "AT+CGDCONT failed — attach uses modem's stored APN");
         }
     }
@@ -1611,7 +1595,7 @@ static teardown_action_t supervise_uplink(void)
     uint32_t last_radio_snapshot_s = now_s();
     uint32_t last_radio_poll_s = now_s();
     bool radio_snapshot_pending = false;
-    int8_t last_rsrp = 0, last_rsrq = 0;
+    int8_t last_rsrp = 0, last_rsrq = 0, last_sinr = WUPS_NET_SINR_UNKNOWN;
     uint32_t last_probe_ok_s = 0;        /* internet-probe OK verdict cache  */
 
     for (;;) {
@@ -1686,9 +1670,10 @@ static teardown_action_t supervise_uplink(void)
         }
 
         /* Signal-quality poll — CMUX sessions only (the DATA fallback has no
-         * AT channel while PPP runs). rsrp/rsrq stay 0 (unknown) unless
-         * AT+CPSI? parses cleanly. */
+         * AT channel while PPP runs). RSRP/RSRQ stay 0 and SINR stays -128
+         * (unknown) unless AT+CPSI? supplies a valid measurement. */
         int8_t rssi = s_ns_last_rssi, rsrp = last_rsrp, rsrq = last_rsrq;
+        int8_t sinr = last_sinr;
         if (s_cmux_active && now - last_radio_poll_s >= 30) {
             last_radio_poll_s = now;
             int csq = 99, ber = 99;
@@ -1711,9 +1696,11 @@ static teardown_action_t supervise_uplink(void)
                 radio_snapshot_pending = false;
             }
             rsrp = rsrq = 0;
-            poll_cpsi(&rsrp, &rsrq);
+            sinr = WUPS_NET_SINR_UNKNOWN;
+            poll_cpsi(&rsrp, &rsrq, &sinr);
             last_rsrp = rsrp;
             last_rsrq = rsrq;
+            last_sinr = sinr;
             /* Collect the radio snapshot first. Optional APN/PSM/eDRX reads
              * have a bounded batch and yield to OTA/PPP loss per command.
              * Failures are diagnostic only, never a recovery trigger. */
@@ -1737,7 +1724,7 @@ static teardown_action_t supervise_uplink(void)
             now - s_ns_last_emit_s >= NET_STATUS_EMIT_PERIOD_S) {
             /* Also anchors the DATA fallback, which has no live AT channel. */
             modem_diag_clock_log("net.status");
-            emit_net_status(state, rssi, rsrp, rsrq);
+            emit_net_status(state, rssi, rsrp, rsrq, sinr);
         }
 
         /* Belt-and-braces alert-clear re-sends: the single clear sent at
@@ -1941,7 +1928,8 @@ static void ppp_supervisor_task(void *arg)
                  * sessions). The MQTT owner caches the frame even while
                  * asynchronous topic/client initialization is pending. */
                 modem_diag_clock_log("PPP ready");
-                emit_net_status(NET_STATE_PPP_UP, s_bringup_rssi_dbm, 0, 0);
+                emit_net_status(NET_STATE_PPP_UP, s_bringup_rssi_dbm, 0, 0,
+                                WUPS_NET_SINR_UNKNOWN);
 
                 /* Supervise until the link drops or the uplink watchdog
                  * trips (see supervise_uplink). Either way, we tear down

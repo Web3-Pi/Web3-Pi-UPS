@@ -11,7 +11,7 @@
 #define TAG "identity"
 
 #ifndef FW_VERSION_STR
-#define FW_VERSION_STR "esp32:0.8.14"
+#define FW_VERSION_STR "esp32:0.8.15"
 #endif
 
 #ifndef HW_VERSION_STR
