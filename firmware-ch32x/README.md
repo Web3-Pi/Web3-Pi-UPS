@@ -1,88 +1,55 @@
-# Web3 Pi UPS — USB-PD Dual-Role Controller (CH32X035)
+# Web3 Pi UPS — CH32X035 Power Controller
 
-USB Power Delivery firmware for the **CH32X035 RISC-V microcontroller**, acting as the power management controller for the **Web3 Pi UPS v2** — a dedicated DC UPS for Raspberry Pi 5.
+USB-PD output and power-management firmware for **Web3 Pi UPS hardware
+rev.3**. The current source reports **`ch32x:1.1.1`**.
 
-The MCU dynamically switches between **SOURCE** and **SINK** roles: it powers the Raspberry Pi by default (SOURCE), and renegotiates power from an upstream USB-C charger when one is connected (SINK).
+## Architecture
+
+The **CH32X035** controls the USB-C output as a PD source, the TPS55289
+buck-boost converter and the MP2762A battery charger. The separate **HUSB238**
+handles USB-C input negotiation. CH32X reads the HUSB238 source capabilities
+and requests a suitable profile over I²C.
+
+```text
+USB-C charger -> HUSB238 input negotiation --+
+DC barrel input ----------------------------+-> power path / battery charger
+Sony NP-F battery --------------------------+-> TPS55289 -> USB-C output -> Pi
+                                                   ^
+                               CH32X035: output PD + power control
+                                                   |
+                                      USART2 / binary WUPS
+                                                   |
+                                             RP2040 router
+```
+
+Earlier board revisions shared SOURCE/SINK duties through a CC mux. The
+current main loop no longer runs that role-switching manager: on rev.3, input
+PD belongs to HUSB238 and CH32X's PD state machine serves the output port.
 
 ## Features
 
-- **USB-PD 3.0 dual-role** (SOURCE + SINK) on a single CC pair via an analog mux
-- **SOURCE**: 4 fixed PDOs advertised to the Raspberry Pi
-  - 5V @ 5A · 9V @ 3A · 12V @ 2.25A · 15V @ 1.8A
-- **SINK**: negotiates 12–15V / ≥26W from an upstream USB-C charger
-- **Raspberry Pi 5 PSU identification** — responds to RPi5 VDM discovery as a compatible 27W supply
-- **Battery-backed power** — Sony NP-F series (NP-F550 / F770 / F970)
-- **Programmable buck-boost output** via TPS55289 (I²C, voltage + current limit)
-- **Charger control + telemetry** via MP2762A (input/battery V/I, charge state, faults)
-- **JSON status** sent over UART at 921600 baud to the UI MCU (RP2040)
+- Four output PD profiles: **5 V / 5 A, 9 V / 3 A, 12 V / 2.25 A,
+  15 V / 1.8 A**, with Raspberry Pi 5 PSU identification.
+- HUSB238 input profile selection in the **9–20 V** range: prefer a profile
+  supplying at least 45 W in the order **15, 12, 18, 20, 9 V**. For weaker
+  sources, select near the highest available power with the same voltage
+  preference. See [User/husb238.h](User/husb238.h) for the complete policy.
+- MP2762A charging and telemetry for a protected 2S Sony NP-F battery pack.
+- Voltage/current setpoints, input contract, charger status and fault reporting.
+- Binary WUPS status/events and output enable, disable, cycle and reset commands.
 
-## Architecture (v2)
+## Hardware Interfaces
 
-In v1 the UPS used two CH32X035 MCUs (one for SINK input, one for SOURCE output). v2 collapses both roles into a single CH32X035 with a 74LVC1G3157 analog mux on the CC lines:
+| Component | Function | I²C address |
+|---|---|---|
+| HUSB238 | USB-C input PD negotiation | `0x08` |
+| LM75B | Board temperature | `0x48` |
+| MP2762A | Battery charger and ADC telemetry | `0x5C` |
+| TPS55289 | Buck-boost output converter | `0x75` |
 
-```
-                ┌────────────────────────┐
-USB-C charger ──┤ SINK port              │
-                │              ┌─────────┴────────┐
-                │              │  74LVC1G3157     │   PDC_CC_SEL (PB3)
-                │              │  CC mux          │◄──── 0 = SOURCE
-                │              └─────────┬────────┘      1 = SINK
-                │ SOURCE port            │
-Raspberry Pi 5 ─┤◄───────────────────────┤
-                └────────────────────────┘
-                       CH32X035 PD PHY
-```
-
-Role transitions are driven by `PDC_CC_DET` (PB11, active-low host detect). When a charger is plugged in, the controller switches to SINK for a 500 ms negotiation window, then returns to SOURCE.
-
-## Hardware
-
-| Component | Part | Function |
-|-----------|------|----------|
-| MCU | CH32X035F8U6 | RISC-V RV32IMACXW, 62 KB Flash, 20 KB RAM |
-| DC-DC | TPS55289 | Buck-boost converter, 3–30 V output, I²C-controlled |
-| Charger | MP2762A | 2S Li-ion / Li-Po charger with ADC telemetry |
-| Temp sensor | LM75B | Board temperature |
-| CC mux | 74LVC1G3157 | Analog mux for SOURCE/SINK CC switching |
-| I²C mux | 74LVC1G157 | Switches SYS_I²C between PD controller and RP2040 |
-
-### Power Input
-
-- USB-C Power Delivery (12–15 V negotiated via SINK role)
-- Barrel jack (12–20 V DC)
-
-### I²C Bus (SYS_I²C, PC18/PC19)
-
-```
-0x48 — LM75B    (temperature sensor)
-0x5C — MP2762A  (battery charger)
-0x75 — TPS55289 (buck-boost converter)
-```
-
-The 74LVC1G157 mux (controlled by `SYS_I²C_SEL`) lets the UI MCU (RP2040) take the bus when needed.
-
-### Pin Mapping (CH32X035F8U6)
-
-| Pin  | Function    | Description                                   |
-|------|-------------|-----------------------------------------------|
-| PA0  | ADC0        | VBUS_OUT_ADC                                  |
-| PA1  | ADC1        | DC_INP_ADC_SRC                                |
-| PA2  | USART2_TX   | PDC_SRC_TX → RP2040                           |
-| PA3  | USART2_RX   | PDC_SRC_RX ← RP2040                           |
-| PA4  | GPIO        | CHG_nINT (charger interrupt)                  |
-| PA5  | ADC5        | PD_SRC_VBAT (battery voltage)                 |
-| PA6  | GPIO        | DC_INP_EN_SRC                                 |
-| PA7  | GPIO        | VBUS_OUT_EN                                   |
-| PB0  | GPIO        | PDS_EN (TPS55289 enable)                      |
-| PB3  | GPIO        | PDC_CC_SEL (CC mux: 0 = SOURCE, 1 = SINK)     |
-| PB11 | GPIO        | PDC_CC_DET (host detect, active-low)          |
-| PB12 | GPIO        | PDC_SRC_STAT (status LED)                     |
-| PC14 | CC1         | PDC_SRC_CC1                                   |
-| PC15 | CC2         | PDC_SRC_CC2                                   |
-| PC16 | USB_N       | PDC_SRC_USB_N                                 |
-| PC17 | USB_P       | PDC_SRC_USB_P                                 |
-| PC18 | I²C_SCL     | SYS_I²C_SCL                                   |
-| PC19 | I²C_SDA     | SYS_I²C_SDA                                   |
+The I²C bus uses **PC18 SCL / PC19 SDA**. The RP2040 link is **USART2**, with
+**PA2 TX / PA3 RX at 921600 baud**. See [User/main.c](User/main.c) for the
+current GPIO map and the [main README](../README.md) for hardware files.
 
 ## Building
 
@@ -97,20 +64,27 @@ The project is set up for **[MounRiver Studio 2](http://mounriver.com) (MRS2) V2
 
 ### Option 2 — Standalone GCC
 
-With `riscv-none-embed-gcc` available in `PATH`:
+Use the **WCH** `riscv-none-embed-gcc` toolchain (GCC 8.2 in the CI
+MounRiver V1.92 bundle), which supports `rv32imacxw` and WCH interrupt
+attributes. Run from this directory:
 
 ```bash
-cd obj
-make            # build
-make clean      # wipe artifacts
+make            # build into build/
+# Or select the WCH toolchain explicitly:
+make CROSS=/path/to/toolchain/bin/riscv-none-embed-
+make clean      # remove command-line build artifacts
 ```
 
 ### Output Files
 
-- `obj/USB-PD.elf` — ELF executable
-- `obj/USB-PD.hex` — Intel HEX for flashing
-- `obj/USB-PD.map` — memory map
-- `obj/USB-PD.lst` — disassembly listing
+| Build route | Artifacts |
+|---|---|
+| Committed [Makefile](Makefile), used by CI | `build/USB-PD.elf`, `build/USB-PD.hex`, `build/USB-PD.map` |
+| MounRiver Studio 2 | `obj/USB-PD.elf`, `obj/USB-PD.hex`, `obj/USB-PD.map`, `obj/USB-PD.lst` |
+
+The commands below use the MRS2 `obj/` image. Substitute `build/USB-PD.hex`
+when flashing a command-line build directly with `wchisp`. The `flash.sh`
+helper currently reads `obj/USB-PD.hex` only.
 
 ### Toolchain Details
 
@@ -128,17 +102,17 @@ Programming uses the **CH32X035 built-in USB ISP bootloader** — no WCH-Link re
 
 This project uses a **locally-patched fork of `wchisp`** that adds a `flash --unprotect` flag (`-U`). The flag does WRITE_CONFIG → ISP_KEY → ERASE → PROGRAM → VERIFY in a **single USB session**, mirroring what WCHISPTool's GUI does. With upstream `wchisp` 0.3.0 you have to run `wchisp config unprotect` separately, which sends `IspEnd(1)` and resets the MCU out of the bootloader, forcing a second BOOT+RESET — the patch eliminates that.
 
-Install (Rust toolchain required):
+The patch is not bundled in this repository. A public checkout of upstream
+`wchisp` does not by itself provide the `--unprotect` flag. If using the
+maintainer's patched build, verify the capability first:
 
-```bash
-git clone https://github.com/ch32-rs/wchisp.git ~/data/repos/wchisp
-cd ~/data/repos/wchisp
-# apply the local patch (see /Users/cmd0s/data/repos/wchisp/ for the diff against upstream)
-cargo install --path . --force
-wchisp flash --help | grep -- --unprotect    # confirm the flag is present
+```sh
+wchisp flash --help | grep -- --unprotect
 ```
 
-Stock upstream still works for `dev` re-flashes; you only need the patch for `--first` mode.
+With stock upstream, use the documented two-step first-flash sequence below.
+The `flash.sh --first` helper requires the patched build and checks for its
+flag. Ordinary re-flashing does not require that patch.
 
 ### Entering boot mode
 
@@ -183,15 +157,18 @@ Once unprotected, the chip stays unprotected across power cycles. BOOT + RESET, 
 wchisp flash obj/USB-PD.hex
 ```
 
-### Production flashing (50-unit run)
+### Production flashing
 
-For shipped units, **keep RDPR engaged** to prevent end-user firmware readback. Skip `unprotect` entirely and bypass the readback check:
+For a chip that still has **RDPR engaged**, the existing production flow
+keeps that protection and bypasses readback verification:
 
 ```bash
 wchisp flash --no-verify obj/USB-PD.hex
 ```
 
-The write itself still completes; only the verify pass (which would fail against a protected chip) is skipped. RDPR remains `0xFF` after flashing.
+This skips the readback verification pass and leaves existing protection
+unchanged. It does **not** enable protection on an already-unprotected chip;
+check the device configuration as part of production programming.
 
 ### Helper script: `flash.sh`
 
@@ -205,7 +182,7 @@ A ready-made wrapper lives at [`firmware-ch32x/flash.sh`](flash.sh). Build the `
 ./flash.sh --help             # Usage summary
 ```
 
-The script waits for the MCU to enter boot mode before flashing, so for a 50-unit run the loop is: plug in next board → BOOT + RESET → script auto-detects and flashes → `✓ Flashed at HH:MM:SS`.
+The script waits for the MCU to enter boot mode before flashing, so the batch loop is: plug in next board → BOOT + RESET → script auto-detects and flashes → `✓ Flashed at HH:MM:SS`.
 
 ### Troubleshooting
 
@@ -213,46 +190,29 @@ The script waits for the MCU to enter boot mode before flashing, so for a 50-uni
 |------------------------------------------------------|------------------------------------------------------------------------------------------|
 | `No WCH ISP USB device found (4348:55e0 ...)`        | Not in boot mode. Re-do BOOT + RESET sequence.                                           |
 | `Verify failed, mismatch` after `flash` on a fresh chip | RDPR engaged. Use `wchisp flash --unprotect` (patched build) or `wchisp config unprotect` + re-enter boot + `wchisp flash` (upstream), or `--no-verify` for production. |
-| `flash.sh --first` aborts with "this wchisp build doesn't support 'flash --unprotect'" | `~/.cargo/bin/wchisp` is the upstream build. Reinstall the patched fork: `cd ~/data/repos/wchisp && cargo install --path . --force`. |
+| `flash.sh --first` aborts with "this wchisp build doesn't support 'flash --unprotect'" | `~/.cargo/bin/wchisp` is the upstream build. Use a build containing the local patch, or the upstream two-step sequence above. |
 | Device disappears after `wchisp config unprotect`    | Expected — upstream `unprotect` resets the chip via `IspEnd(1)`. Re-enter boot mode, or use the patched `flash --unprotect` instead. |
-| Data-only USB cable                                  | Use a known-good USB-C / USB-A data cable.                                               |
+| Charge-only USB cable                                  | Use a known-good USB-C / USB-A data cable.                                               |
 
-## JSON Status Protocol
+## Binary Status and Commands
 
-The PD controller sends periodic status messages on USART2 (PA2/PA3 @ 921600 baud) to the RP2040 UI MCU:
+The current firmware uses **WUPS wire protocol v1**. It sends
+`power.status` **v2** once per second to the RP2040 and emits power events
+for mains changes, faults and charge thresholds. Status includes input/output
+measurements, the HUSB238 input contract, battery/charger state, temperatures
+and fault flags. The old JSON interface is no longer the command/status API.
 
-```json
-{"up":1234,"pd":18,"pdo":2,"cc":1,"role":1,"snk_ok":0,"snk_v":0,"snk_i":0,"t":392,"vs":51,"is":30,"vr":51,"ir":30,"bp":1,"cs":2,"pg":1,"vi":11850,"ii":681,"vb":8200,"ci":900,"cf":0}
-```
+The authoritative payload definitions are in
+[../common/protocol.h](../common/protocol.h), included by
+[User/wups_proto.h](User/wups_proto.h). The
+[protocol guide](../common/protocol_desc.md) describes addressing, frame
+checksums and routing. Diagnostic ASCII may share the UART with framed data;
+receivers must synchronize to valid WUPS frames rather than parse lines.
 
-| Field    | Description                              | Unit         |
-|----------|------------------------------------------|--------------|
-| `up`     | Uptime since boot                        | seconds      |
-| `pd`     | PD state machine state                   | enum         |
-| `pdo`    | Active / requested PDO index             | 1–4          |
-| `cc`     | Sink connected                           | 0 / 1        |
-| `role`   | Current role (0 = SINK, 1 = SOURCE)      | enum         |
-| `snk_ok` | Last SINK negotiation succeeded          | 0 / 1        |
-| `snk_v`  | Negotiated SINK voltage                  | 0.1 V        |
-| `snk_i`  | Negotiated SINK current                  | 0.1 A        |
-| `t`      | Board temperature (LM75B)                | 0.1 °C       |
-| `vs`/`is`| VBUS voltage / current setpoint          | 0.1 V / 0.1 A|
-| `vr`/`ir`| VBUS voltage / current readback          | 0.1 V / 0.1 A|
-| `bp`     | Battery present (MP2762A UVLO)           | 0 / 1        |
-| `cs`     | Charge state                             | enum         |
-| `pg`     | Power good (input present)               | 0 / 1        |
-| `vi`/`ii`| Charger input voltage / current          | mV / mA      |
-| `vb`     | Battery voltage                          | mV           |
-| `ci`     | Charge current                           | mA           |
-| `cf`     | Charger fault flags                      | bitmask      |
-
-**`pd` (PD state)** — selected values: `0` Idle · `1` Disconnected · `11` Sink connected · `12` Sending SRC_CAP · `13` Waiting REQUEST · `14` REQUEST received · `15` Sending ACCEPT · `17` Adjusting voltage · `18` Sending PS_RDY. Full list in `User/PD_Process.h`.
-
-**`pdo` (PDO index)** — `1` 5V/5A · `2` 9V/3A · `3` 12V/2.25A · `4` 15V/1.8A.
-
-**`cs` (charge state)** — `0` not charging · `1` trickle/pre-charge · `2` fast charge · `3` charge done.
-
-**`cf` (fault flags, MP2762A REG14H)** — bit 7 watchdog · bit 6 OTG · bits 5:4 charge fault (input OVP / thermal / timer) · bit 3 battery OVP · bits 2:0 NTC fault.
+Supported requests include `system.ping`, `system.status_query` and
+`power.enable`, `power.disable`, `power.cycle`, `power.reset`. Power-control
+commands can interrupt the Raspberry Pi's supply. Coordinate an OS shutdown
+through the host service before deliberately cutting power.
 
 ## Project Structure
 
@@ -266,13 +226,16 @@ Peripheral/     CH32X035 HAL drivers
 Startup/        startup assembly
 User/           application code
   main.c             entry point, GPIO/I²C/UART init, main loop
-  PD_Process.{c,h}   USB-PD state machine (dual-role)
+  PD_Process.{c,h}   USB-PD output state machine
+  husb238.{c,h}      input PD capabilities, profile selection and telemetry
+  wups_proto.h      shared binary protocol include
   tps55289.{c,h}     buck-boost driver
   mp2762a.{c,h}      charger driver
   lm75b.{c,h}        temperature sensor driver
   i2c_lib.{c,h}      software-bitbang I²C
   ch32x035_it.{c,h}  interrupt handlers
   system_ch32x035.{c,h}  clock setup
+Makefile        headless build into build/
 USB-PD.wvproj   MounRiver Studio 2 project
 .project        Eclipse / CDT project descriptor
 .cproject       Eclipse / CDT build configuration
@@ -281,19 +244,14 @@ USB-PD.wvproj   MounRiver Studio 2 project
 
 ## USB-PD Implementation Notes
 
-- The PD PHY is integrated in the CH32X035 (BMC encoder/decoder + CC analog frontend).
-- **Timing critical**: GoodCRC must be sent within 30 µs — handled in the `USBPD_IRQHandler`. Do not add blocking work in interrupts or the main loop.
-- Detection in `PD_Detect()` is **role-aware**: SOURCE uses Rp pull-ups (CC_PU_330) and detects sink Rd; SINK uses Rd pull-downs and detects source Rp.
-- For SOURCE mode the external pull-down on CC must be removed (otherwise sink detection misfires).
-- Low-power STANDBY is **disabled** while dual-role is active so host detection on PB11 keeps running.
+- The output PD PHY is integrated in CH32X035. Timing-sensitive responses
+  share the main loop with charger and converter polling; avoid adding
+  blocking work to interrupt handlers or between PD service calls.
+- The HUSB238 input contract is read back after attach. USB-C detach re-arms
+  profile selection, independently of barrel-input power.
+- The rev.3 board's `PDS_EN` pull-down means a CH32X reset can interrupt the
+  output supply. Do not assume a controller reset or flash is transparent
+  to a connected Raspberry Pi.
 
-## SINK Negotiation Parameters (`PD_Process.h`)
-
-| Constant               | Value     |
-|------------------------|-----------|
-| `SINK_MIN_VOLTAGE_MV`  | 12000     |
-| `SINK_MAX_VOLTAGE_MV`  | 15000     |
-| `SINK_MIN_POWER_MW`    | 26000     |
-| `SINK_WINDOW_MS`       | 500       |
-
-If the upstream charger does not offer a PDO meeting these limits within 500 ms, the controller returns to SOURCE mode and continues powering the Pi from the battery / barrel input.
+See [the battery-mode telemetry fix](../docs/ch32x-battery-mode-telemetry-fix.md)
+for the distinction between charger readings and battery-only operation.

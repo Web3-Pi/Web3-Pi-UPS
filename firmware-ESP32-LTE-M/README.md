@@ -46,11 +46,17 @@ The modem's radio configuration is read back and verified before registration.
 The firmware reads these settings before changing them, avoids redundant
 persistent writes, and verifies the active PSM/eDRX state after registration.
 
-APN selection uses the existing fleet classification: the five known original
-SIM ICCIDs use `iot.1nce.net`; other SIMs use `sensor.net`. The selected APN is
-shared by the DCE configuration and `AT+CGDCONT` from the first connection;
-retries retain it. This restores both fleet profiles when integrating the
-earlier old-SIM-only test image.
+The default APN profile uses the existing fleet classification: the five
+known legacy SIM ICCIDs use `iot.1nce.net`; other SIMs use `sensor.net`. A
+fixed-APN build overrides this classification. In either case, the selected
+APN is applied to the DCE and `AT+CGDCONT` before PPP and retained on retries.
+The profiles below are separate build choices; the firmware does not switch
+between APNs automatically after a connection failure.
+
+Version 0.8.15 adds SINR to `net.status` v3, alongside RSRP, RSRQ and RSSI.
+Missing or invalid SINR uses the signed `-128` sentinel; `0 dB` is a valid
+reading. MQTT and Arkiv carry the extended frame, and HTTP includes `sinr_db`
+when available. A compatible panel is needed to display the new measurement.
 
 Full `AT+CEREG?`, `AT+COPS?` and `AT+CPSI?` replies are logged at startup and
 during CMUX supervision. Additional diagnostics include `AT+CGDCONT?`,
@@ -109,6 +115,29 @@ Production Arkiv images require the locally supplied, gitignored
 placeholder instead: WSS push cannot connect and command handling falls back
 to HTTP polling. Keep the real header out of commits and source archives.
 
+### APN Build Profiles
+
+Use separate build directories so the CMake cache keeps each profile isolated.
+From this directory with ESP-IDF activated:
+
+```sh
+# Default fleet classification (legacy ICCID list -> 1nce, other SIMs -> sensor)
+idf.py -B build-auto -DPROJECT_VER=0.8.15 -DWUPS_FIXED_APN= build
+
+# Always use iot.1nce.net, independent of ICCID
+idf.py -B build-1nce -DPROJECT_VER=0.8.15-1nce -DWUPS_FIXED_APN=iot.1nce.net build
+
+# Always use sensor.net, independent of ICCID
+idf.py -B build-sensor -DPROJECT_VER=0.8.15-sensor -DWUPS_FIXED_APN=sensor.net build
+```
+
+Each directory contains `firmware-ESP32-LTE-M.bin`, the application image for
+the existing two-slot OTA layout. The version suffix is also reported in the
+runtime `esp32:` identity. A fixed-APN image must match the intended SIM's data
+service. Neither profile includes per-device provisioning or changes APN
+when registration or data transfer fails. See the
+[0.8.15 release notes](docs/RELEASE-0.8.15.md) for validation scope.
+
 ### One-time migration to the two-OTA partition table (OTA-1)
 
 The first flash of the OTA-1 layout (`ota_0`/`ota_1` + `otadata`) on a unit
@@ -120,8 +149,9 @@ stale WS-9 anti-replay counter (`last_ctr`) or trip
 `backend_mode`). With the serial monitor stopped (or yielded):
 
 ```sh
-esptool.py --port /dev/cu.usbmodem1101 erase_region 0x9000 0x6000
-tools/idf -p /dev/cu.usbmodem1101 flash
+ESPPORT=/dev/cu.usbmodemXXXX  # replace with the connected device
+esptool.py --port "$ESPPORT" erase_region 0x9000 0x6000
+idf.py -p "$ESPPORT" flash
 ```
 
 **Never** use `erase_flash` on a provisioned unit — it wipes the per-device
@@ -130,7 +160,8 @@ tools/idf -p /dev/cu.usbmodem1101 flash
 monotonically higher), so no re-provisioning is needed. This jump cannot be
 taken over the air; fielded factory-layout devices need this USB flash once.
 
-Reset without reflashing (e.g. after a menuconfig change that affects hardware setup):
+Reset the currently installed firmware without reflashing (configuration changes
+require a rebuild and flash before they take effect):
 
 ```sh
 tools/reset
@@ -151,6 +182,7 @@ firmware-ESP32-LTE-M/
 │   ├── mqtt.c               # SDK owner, producer queues and health monitor
 │   └── fw_ota.c             # ESP32 OTA and RP2040 update relay
 ├── docs/
+│   ├── RELEASE-0.8.15.md     # SINR telemetry and fixed-APN variants
 │   ├── RELEASE-0.8.14.md     # integrated changes and validation evidence
 │   ├── MQTT-RESILIENCE.md    # behavior, tests and remaining hardware gates
 │   ├── info.md              # historical LilyGo prototype reference
@@ -169,6 +201,7 @@ firmware-ESP32-LTE-M/
 
 In this repo:
 
+- [0.8.15 release notes](docs/RELEASE-0.8.15.md) — SINR telemetry and fixed-APN variants
 - [0.8.14 integration notes](docs/RELEASE-0.8.14.md) — modem/PPP/MQTT/OTA changes and validation
 - [MQTT resilience](docs/MQTT-RESILIENCE.md) — ownership, proof, recovery and tests
 - [MQTT stopped-task adapter](../docs/mqtt-sdk-adapter.md) — pinned SDK contract
