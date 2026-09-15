@@ -108,6 +108,23 @@ the Raspberry Pi's local network. The current firmware targets **LTE Cat-M1
 on B3/B20**. See the [LTE-M firmware README](firmware-ESP32-LTE-M/README.md)
 for hardware details, APN profiles and update requirements.
 
+<p align="center">
+  <a href="docs/images/lte-m-module-perspective.png">
+    <img src="docs/images/lte-m-module-perspective.png" alt="W3P MODEM V1 M.2 LTE-M expansion card — perspective render" width="600">
+  </a>
+</p>
+<p align="center">
+  <a href="docs/images/lte-m-module-modem-side.png">
+    <img src="docs/images/lte-m-module-modem-side.png" alt="W3P MODEM V1 — SIM7080G modem and LTE antenna connector side" width="350">
+  </a>
+  <a href="docs/images/lte-m-module-reverse.png">
+    <img src="docs/images/lte-m-module-reverse.png" alt="W3P MODEM V1 — reverse-side render with SIM holder and USB-C connector" width="350">
+  </a>
+</p>
+
+*W3P MODEM V1 — 3D design renders. The RP2040 marking on the reverse-side
+render differs from the current module's documented ESP32-S3 MCU.*
+
 ## Web Panel and Remote Management
 
 The [Web3 Pi Control Panel](https://panel.web3pi.io) lets you monitor and
