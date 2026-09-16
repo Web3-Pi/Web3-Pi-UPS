@@ -45,6 +45,6 @@ direct_dependencies:
 - espressif/esp_websocket_client
 - espressif/mqtt
 - idf
-manifest_hash: a0ec22ce912519e78b514c5f7f4c2cf861d3998137fe0c35ee38d172150747b6
+manifest_hash: 36d8680af838656e135a21864f26d3eb0f26e9d39e9628393cdfb630812fd267
 target: esp32s3
 version: 3.0.0

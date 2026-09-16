@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -39,6 +40,9 @@ void modem_ensure_on(void);
  * Single-word read, safe from any task. Used by fw_ota (OTA-1) to refuse a
  * firmware download with no link. */
 bool modem_ppp_is_up(void);
+/* Nonzero generation while UP; changes for every recovered IP session,
+ * including DOWN -> GOT_IP without a DCE replacement. Zero means not UP. */
+uint32_t modem_ppp_generation(void);
 
 /* Spawn two FreeRTOS tasks that bridge USB-CDC stdio ↔ modem UART:
  *   - bytes typed on the host console go to the modem

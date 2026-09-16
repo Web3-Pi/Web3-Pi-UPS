@@ -42,6 +42,8 @@
 #include "modem.h"
 #include "mqtt.h"
 #include "pmu.h"
+#include "perf_diag.h"
+#include "perf_bench.h"
 #include "wups_link.h"
 #include "arkiv_crypto_selftest.h"
 
@@ -206,6 +208,8 @@ void app_main(void)
      * once it's running. Replaces the 5 s HTTP cmd-poll path; the legacy
      * `arkiv_poll` task stays alive at a 5-minute fallback cadence (see
      * `arkiv_rpc.c poll_task` and web3pi_scope/notes/ARKIV-data-usage.md §E). */
+    perf_diag_start();
+    perf_bench_start();
     bool ws_armed = false;
     /* Keep emitting a heartbeat so the host sees the firmware is still alive
      * even when no AT traffic is happening. */

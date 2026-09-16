@@ -6,6 +6,12 @@
 
 #include "esp_err.h"
 
+/* Commit an intentional watchdog teardown only while OTA is idle. commit
+ * must be bounded state-only code (OTA -> MQTT -> PPP lock order). A successful
+ * claim blocks new transfers until finish, without holding locks over I/O. */
+bool fw_ota_try_modem_recovery(bool (*commit)(void *), void *context);
+void fw_ota_finish_modem_recovery(void);
+
 /*
  * OTA-1 — firmware update engine. Three paths share this module (and the
  * single "one update at a time" slot — fw_ota_in_progress() is true while

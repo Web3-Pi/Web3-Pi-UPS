@@ -16,28 +16,34 @@ static unsigned checks;
 } while (0)
 
 typedef int esp_err_t;
-enum { ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_TIMEOUT = -2,
+enum { ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_TIMEOUT = -2, ESP_ERR_INVALID_STATE = -3,
        ESP_MODEM_DCE_SIM7070 = 7070, ESP_MODEM_FLOW_CONTROL_NONE = 0,
        ESP_MODEM_MODE_CMUX = 1, ESP_MODEM_MODE_DATA = 2, UART_NUM_1 = 1,
        MODEM_FAIL_NONE, MODEM_FAIL_AT, MODEM_FAIL_RADIO, MODEM_FAIL_AWAKE,
        MODEM_FAIL_SIM, MODEM_FAIL_NET };
 typedef struct {
     struct { int tx_io_num, rx_io_num, rts_io_num, cts_io_num,
-                 flow_control, port_num, baud_rate; } uart_config;
+                 flow_control, port_num, baud_rate, tx_buffer_size; } uart_config;
 } esp_modem_dte_config_t;
 typedef struct { const char *apn; } esp_modem_dce_config_t;
 typedef struct { char copied_apn[32]; } esp_modem_dce_t;
 typedef bool (*radio_at_fn)(void *, const char *, char *, size_t, unsigned);
-#define ESP_MODEM_DTE_DEFAULT_CONFIG() { .uart_config = {0} }
+#define ESP_MODEM_DTE_DEFAULT_CONFIG() { .uart_config = { .tx_buffer_size = 512 } }
 #define ESP_MODEM_DCE_DEFAULT_CONFIG(value) { .apn = (value) }
 #define MODEM_TAG "modem"
 #define pdMS_TO_TICKS(ms) (ms)
+#define tskNO_AFFINITY -1
 
 static esp_modem_dce_t *s_dce;
 static int netif, *s_ppp_netif = &netif;
 static int s_fail_stage, s_bringup_rssi_dbm, s_cmux_entry_fails, s_reg_timeout_streak;
 static bool s_iccid_known, s_cmux_active, s_cmux_dirty;
 static int64_t s_cmux_fallback_since_s;
+typedef struct { int port, tx_gpio, rx_gpio; } modem_uart_baud_config_t;
+static const modem_uart_baud_config_t s_modem_uart_config = {1, 2, 4};
+/* Boot OTA selection has its own integration test; this harness checks
+ * prepare/DTE propagation for both the fallback and configured baud. */
+static int s_modem_boot_baud = CONFIG_WUPS_MODEM_UART_BAUD;
 
 static struct {
     esp_modem_dce_t dce;
@@ -47,9 +53,26 @@ static struct {
     unsigned rf_resume_calls, reg_calls, dial_calls, mode_calls;
     unsigned seed_logs, fixed_logs, warning_logs;
     bool rf_off, fail_sync, fail_apn_at, fail_sim_read, reject_identity, unregistered;
-    int mode;
+    bool fail_baud, baud_ready;
+    int mode, creator_core, creator_affinity;
     int64_t clock_us;
 } host;
+
+static int xPortGetCoreID(void) { return host.creator_core; }
+static int xTaskGetCoreID(void *task) { CHECK(task == NULL); return host.creator_affinity; }
+static esp_err_t esp_intr_dump(FILE *output)
+{
+    CHECK(output == NULL && host.create_calls == 1 && host.mode_calls == 0);
+    return ESP_OK;
+}
+
+static bool modem_uart_baud_prepare(const modem_uart_baud_config_t *config, int baud)
+{
+    CHECK(config == &s_modem_uart_config && baud == s_modem_boot_baud);
+    CHECK(host.create_calls == 0 && host.mode_calls == 0);
+    host.baud_ready = !host.fail_baud;
+    return host.baud_ready;
+}
 
 static void log_message(const char *tag, const char *format, ...)
 {
@@ -79,6 +102,8 @@ static esp_modem_dce_t *esp_modem_new_dev(int model,
                                          const void *ppp_netif)
 {
     CHECK(model == ESP_MODEM_DCE_SIM7070 && dte != NULL && ppp_netif == &netif);
+    CHECK(host.baud_ready && dte->uart_config.baud_rate == s_modem_boot_baud);
+    CHECK(dte->uart_config.tx_buffer_size == CONFIG_WUPS_MODEM_TX_BUFFER_SIZE);
     CHECK(config != NULL && strlen(config->apn) < sizeof(host.dce.copied_apn));
     /* The real SDK copies config->apn into PdpContext at construction. */
     strcpy(host.dce.copied_apn, config->apn);
@@ -252,6 +277,8 @@ static const char *profile_apn(const char *automatic_apn)
 static void cold_boot(const char *reply, const char *expected)
 {
     memset(&host, 0, sizeof(host));
+    host.creator_core = CONFIG_WUPS_MODEM_CORE1 ? 1 : 0;
+    host.creator_affinity = CONFIG_WUPS_MODEM_CORE1 ? 1 : tskNO_AFFINITY;
     host.sim_reply = reply;
     host.expected_apn = profile_apn(expected);
     strcpy(host.modem_apn, "previous.stored.apn");
@@ -352,6 +379,15 @@ static void test_registration_retry(void)
 
 static void test_failures(void)
 {
+    cold_boot("+CCID: 8988228066618136966\r\nOK\r\n", "iot.1nce.net");
+    host.fail_baud = true;
+    CHECK(ppp_bringup_dce() == ESP_FAIL);
+    CHECK(s_fail_stage == MODEM_FAIL_AT && s_dce == NULL);
+    CHECK(host.create_calls == 0 && host.dial_calls == 0 && host.rf_resume_calls == 0);
+    next_attempt();
+    host.fail_baud = false;
+    check_success("sensor.net", true, false);
+
     cold_boot("+CCID: 8988228066614189920\r\nOK\r\n", "iot.1nce.net");
     host.fail_sync = true;
     CHECK(ppp_bringup_dce() == ESP_FAIL);
@@ -398,13 +434,41 @@ static void test_failures(void)
     CHECK(host.cache_updates == 0 && host.apn_at_calls == 0 && host.rf_resume_calls == 0);
 }
 
+static void test_creator_guard(void)
+{
+    for (int affinity = -1; affinity <= 1; ++affinity) {
+        for (int core = 0; core <= 1; ++core) {
+            cold_boot("+CCID: 8988228066618136966\r\nOK\r\n", "iot.1nce.net");
+            host.creator_affinity = affinity;
+            host.creator_core = core;
+            if (CONFIG_WUPS_MODEM_CORE1 && (affinity != 1 || core != 1)) {
+                CHECK(ppp_bringup_dce() == ESP_ERR_INVALID_STATE);
+                CHECK(!host.baud_ready && host.create_calls == 0 && host.mode_calls == 0);
+                host.creator_affinity = host.creator_core = 1;
+            }
+            check_success("sensor.net", true, false);
+            next_attempt();
+            check_success("iot.1nce.net", false, false);
+        }
+    }
+}
+
 int main(void)
 {
     boot_apn = s_apn;
     CHECK(!strcmp(boot_apn, profile_apn("sensor.net")));
+    /* A pending boot must pass the selected fallback to BOTH the saved
+     * AT+IPR preparation and DTE, also on retries after image validation. */
+    s_modem_boot_baud = 115200;
+    cold_boot("+CCID: 8988228066614189920\r\nOK\r\n", "iot.1nce.net");
+    check_success("sensor.net", true, false);
+    next_attempt();
+    check_success("iot.1nce.net", false, false);
+    s_modem_boot_baud = CONFIG_WUPS_MODEM_UART_BAUD;
     test_profiles();
     test_registration_retry();
     test_failures();
+    test_creator_guard();
     printf("modem_apn: %u checks PASS (profile %s; production bring-up, cross-profile SIM, first boot/retry, cache/AT order and failure gates)\n",
            checks, WUPS_FIXED_APN[0] ? WUPS_FIXED_APN : "auto ICCID");
     return 0;

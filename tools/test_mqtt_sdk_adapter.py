@@ -2,7 +2,7 @@
 """Exercise the actual stopped-task adapter with pinned SDK lifecycle excerpts.
 
 The lifecycle fixture must match the vendored, pinned SDK build inputs, including
-the narrowly scoped resend/abort patch (which does not change lifecycle code).
+the reviewed resend/abort and opt-in bounded-service patch series.
 MQTT_TEST_SANITIZERS=undefined selects UBSan; an empty value selects plain C.
 """
 from pathlib import Path
@@ -12,14 +12,12 @@ import shlex
 import subprocess
 import tempfile
 
+from mqtt_sdk_sources import verify_current
+
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "firmware-ESP32-LTE-M/main"
 HOST = ROOT / "tools/mqtt_sdk_adapter_host"
 SDK = ROOT / "firmware-ESP32-LTE-M/components/espressif__mqtt"
-SDK_PINS = {
-    "mqtt_client.c": "1a120957d6f8078a0cd27f4febac54389c5dce7f025069cad493e945d005f361",
-    "lib/include/mqtt_client_priv.h": "ee8f464f6cbf77a83468126bf22d91833b9c2b8985ba5860381acb99a655c565",
-}
 START_SHA = "a061f3b31aff4ee0ac8cfc8281057547cfca01eebbfe4705b6e69842b4894a91"
 CLEANUP_SHA = "32d9c4d7037a11ed4cfa086e15275ea0e51ee3deb44a174e640760e9a5778026"
 
@@ -40,12 +38,19 @@ def verify_source():
     start_fn, cleanup = excerpts(fixture)
     assert hashlib.sha256(start_fn.encode()).hexdigest() == START_SHA
     assert hashlib.sha256(cleanup.encode()).hexdigest() == CLEANUP_SHA
+    upstream, patched = verify_current(SDK)
+    pins = {**upstream, **patched}
     cmake = (MAIN / "CMakeLists.txt").read_text()
-    for path, expected in SDK_PINS.items():
+    for path in ("mqtt_client.c", "lib/include/mqtt_client_priv.h"):
+        expected = pins[path]
         assert f"{path}|{expected}" in cmake, "Build must enforce the reviewed SDK pins"
-        actual = hashlib.sha256((SDK / path).read_bytes()).hexdigest()
-        assert actual == expected, f"SDK lifecycle source changed: {path}"
-    assert excerpts((SDK / "mqtt_client.c").read_text()) == (start_fn, cleanup)
+    source = (SDK / "mqtt_client.c").read_text()
+    assert excerpts(source) == (start_fn, cleanup)
+    task = source[source.index("static void esp_mqtt_task(void *pv)\n{"):]
+    entry = task[task.index("    client->run = true;"):task.index("    while (client->run)")]
+    assert entry == ("    client->run = true;\n\n"
+                     "    client->state = MQTT_STATE_INIT;\n"
+                     "    xEventGroupClearBits(client->status_bits, STOPPED_BIT);\n")
 
 
 def main():

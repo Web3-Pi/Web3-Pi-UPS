@@ -35,6 +35,7 @@ static _Thread_local TaskHandle_t host_current_task;
 static _Thread_local unsigned host_critical_depth;
 static _Thread_local bool host_in_callback;
 static atomic_bool host_stopping, host_ppp = true;
+static atomic_uint host_ppp_generation = 1;
 static atomic_uint_fast64_t host_clock_ms = 1000;
 static atomic_int host_sdk_calls, host_init_calls, host_register_calls, host_destroy_calls;
 static atomic_int host_start_calls, host_reconnect_calls, host_subscribe_calls;
@@ -107,6 +108,7 @@ const char *identity_fw_version(void) { return "host-test"; }
 const char *identity_hw_version(void) { return "fixture"; }
 wups_backend_mode_t backend_mode_get(void) { return WUPS_BACKEND_MODE_MQTT; }
 bool modem_ppp_is_up(void) { return atomic_load(&host_ppp); }
+uint32_t modem_ppp_generation(void) { return atomic_load(&host_ppp) ? atomic_load(&host_ppp_generation) : 0; }
 void modem_notify_mqtt_down(void) {}
 bool fw_ota_in_progress(void) { return false; }
 uint32_t wups_link_frame_age_s(void) { return 0; }
@@ -235,6 +237,7 @@ static void host_event(int id, esp_mqtt_event_t *event)
 esp_mqtt_client_handle_t esp_mqtt_client_init(const esp_mqtt_client_config_t *config)
 {
     host_sdk_boundary(); assert(config->network.timeout_ms == 15000);
+    assert(config->network.bounded_service);
     struct host_client *client = malloc(sizeof(*client)); assert(client);
     client->marker = 0xface; atomic_init(&client->stopped, false);
     atomic_fetch_add(&host_init_calls, 1); return client;
@@ -295,6 +298,15 @@ int esp_mqtt_client_get_outbox_size(esp_mqtt_client_handle_t client)
     host_sdk_boundary(); assert(client->marker == 0xface);
     if (atomic_load(&host_outbox_block)) host_sdk_wait();
     return atomic_load(&host_outbox_bytes);
+}
+esp_err_t esp_mqtt_client_get_service_status(esp_mqtt_client_handle_t client,
+                                             esp_mqtt_service_status_t *status)
+{
+    /* Deliberately no SDK-boundary wait: this API is used by the independent
+     * monitor even while a separate SDK call is suspended. */
+    assert(client->marker == 0xface);
+    memset(status, 0, sizeof(*status));
+    return ESP_OK;
 }
 int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t client, const char *topic, int qos)
 {
@@ -550,6 +562,85 @@ static void test_backoff(void)
     host_shutdown();
     puts("PASS actual owner reconnect schedule: rejected SDK request stays at 10s; accepted requests select 30/60s auth backoff; application start requests do not advance it");
 }
+static void test_ppp_retry(bool authentication)
+{
+    atomic_store(&host_auto_connect, false);
+    assert(mqtt_runtime_init() == ESP_OK && mqtt_client_start() == ESP_OK);
+    WAIT_FOR(mqtt_sdk_is_started()); host_synchronize_owner();
+    esp_mqtt_error_codes_t error = {
+        .error_type = authentication ? MQTT_ERROR_TYPE_CONNECTION_REFUSED : MQTT_ERROR_TYPE_TCP_TRANSPORT,
+        .connect_return_code = MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED};
+    esp_mqtt_event_t event = {.error_handle = &error};
+    for (int i = 0; i < 6; ++i) host_event(MQTT_EVENT_ERROR, &event);
+    const uint64_t attempts[] = {11000, 41000, 101000};
+    for (unsigned i = 0; i < 3; ++i) {
+        atomic_store(&host_clock_ms, attempts[i]); wake_owner();
+        WAIT_FOR(atomic_load(&host_reconnect_calls) == (int)i + 1);
+        host_synchronize_owner();
+    }
+    /* The old transport has a 120s retry pending. Same-session start requests
+     * do not shorten it, but a genuinely new PPP generation may do so. */
+    atomic_store(&host_clock_ms, 102000);
+    assert(mqtt_client_start() == ESP_OK); host_synchronize_owner();
+    assert(atomic_load(&host_reconnect_calls) == 3);
+    atomic_store(&host_ppp, false); host_synchronize_owner();
+    atomic_fetch_add(&host_ppp_generation, 1); atomic_store(&host_ppp, true);
+    assert(mqtt_client_start() == ESP_OK); host_synchronize_owner();
+    if (authentication) {
+        assert(atomic_load(&host_reconnect_calls) == 3);
+        atomic_store(&host_clock_ms, 220999); host_synchronize_owner();
+        assert(atomic_load(&host_reconnect_calls) == 3);
+        atomic_store(&host_clock_ms, 221000); wake_owner();
+    }
+    WAIT_FOR(atomic_load(&host_reconnect_calls) == 4); host_synchronize_owner();
+    for (int i = 0; i < 4; ++i) {
+        assert(mqtt_client_start() == ESP_OK); host_synchronize_owner();
+    }
+    assert(atomic_load(&host_reconnect_calls) == 4);
+    host_shutdown();
+    puts(authentication ? "PASS PPP generation preserves authentication backoff" :
+         "PASS PPP generation expedites obsolete 120s transport backoff exactly once");
+}
+static bool host_reset_commit(void *context)
+{
+    assert(host_critical_depth == 1);
+    ++*(unsigned *)context;
+    return true;
+}
+static void test_recovery_commit(void)
+{
+    atomic_store(&host_auto_connect, false);
+    assert(mqtt_runtime_init() == ESP_OK && mqtt_client_start() == ESP_OK);
+    WAIT_FOR(mqtt_sdk_is_started()); host_synchronize_owner();
+    atomic_store(&host_ppp, false); host_synchronize_owner();
+    mqtt_health_snapshot_t old, current;
+    mqtt_get_health(&old);
+    unsigned commits = 0;
+    assert(mqtt_recovery_try_commit(&old, host_reset_commit, &commits) && commits == 1);
+    esp_mqtt_event_t event = {0};
+    host_event(MQTT_EVENT_CONNECTED, &event);
+    assert(!mqtt_recovery_try_commit(&old, host_reset_commit, &commits));
+    host_event(MQTT_EVENT_DISCONNECTED, &event);
+    /* Even a complete reconnect+disconnect during diagnostics invalidates
+     * a decision from the preceding session. */
+    assert(!mqtt_recovery_try_commit(&old, host_reset_commit, &commits));
+    mqtt_get_health(&current);
+    assert(mqtt_recovery_try_commit(&current, host_reset_commit, &commits) && commits == 2);
+    mqtt_ota_state_changed(true);
+    assert(!mqtt_recovery_try_commit(&current, host_reset_commit, &commits));
+    mqtt_ota_state_changed(false);
+    sdk_begin(); atomic_store(&host_clock_ms, 40000);
+    assert(!mqtt_recovery_try_commit(&current, host_reset_commit, &commits));
+    sdk_end();
+    esp_mqtt_error_codes_t error = {.error_type = MQTT_ERROR_TYPE_CONNECTION_REFUSED,
+        .connect_return_code = MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED};
+    event.error_handle = &error;
+    for (int i = 0; i < 3; ++i) host_event(MQTT_EVENT_ERROR, &event);
+    assert(!mqtt_recovery_try_commit(&current, host_reset_commit, &commits));
+    assert(commits == 2);
+    host_shutdown();
+    puts("PASS reset commit rejects current CONNECTED, changed generation, OTA, stalled worker and auth refusal");
+}
 static void test_revive(void)
 {
     atomic_store(&host_auto_connect, false); atomic_store(&host_reconnect_result, ESP_FAIL);
@@ -771,6 +862,9 @@ int main(int argc, char **argv)
     else if (strcmp(argv[1], "registration") == 0) test_registration(true);
     else if (strcmp(argv[1], "start") == 0) test_registration(false);
     else if (strcmp(argv[1], "backoff") == 0) test_backoff();
+    else if (strcmp(argv[1], "ppp_transport") == 0) test_ppp_retry(false);
+    else if (strcmp(argv[1], "ppp_auth") == 0) test_ppp_retry(true);
+    else if (strcmp(argv[1], "recovery_commit") == 0) test_recovery_commit();
     else if (strcmp(argv[1], "revive") == 0) test_revive();
     else if (strcmp(argv[1], "pressure") == 0) test_pressure();
     else if (strcmp(argv[1], "probe") == 0) test_probe();

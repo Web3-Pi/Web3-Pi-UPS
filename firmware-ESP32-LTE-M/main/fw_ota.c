@@ -134,8 +134,27 @@ static volatile uint32_t s_rp2040_hello_count;
  * different tasks. MQTT state hooks are fast and never acquire this mux;
  * the lock order is this claim mux -> MQTT application mux, never reverse. */
 static portMUX_TYPE s_claim_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool s_modem_recovery_busy;
 
 bool fw_ota_in_progress(void) { return s_in_progress; }
+
+bool fw_ota_try_modem_recovery(bool (*commit)(void *), void *context)
+{
+    if (!commit) return false;
+    portENTER_CRITICAL(&s_claim_mux);
+    bool ok = !s_in_progress && !s_validation_busy && !s_modem_recovery_busy &&
+              commit(context);
+    if (ok) s_modem_recovery_busy = true;
+    portEXIT_CRITICAL(&s_claim_mux);
+    return ok;
+}
+
+void fw_ota_finish_modem_recovery(void)
+{
+    portENTER_CRITICAL(&s_claim_mux);
+    s_modem_recovery_busy = false;
+    portEXIT_CRITICAL(&s_claim_mux);
+}
 
 /* Atomically claim the shared update slot and invalidate MQTT proof even for
  * a transfer that fails before the independent monitor's next sample. */
@@ -143,7 +162,7 @@ static bool claim_in_progress(void)
 {
     bool ok = false;
     portENTER_CRITICAL(&s_claim_mux);
-    if (!s_in_progress && !s_validation_busy) {
+    if (!s_in_progress && !s_validation_busy && !s_modem_recovery_busy) {
         s_in_progress = true;
         mqtt_ota_state_changed(true);
         ok = true;

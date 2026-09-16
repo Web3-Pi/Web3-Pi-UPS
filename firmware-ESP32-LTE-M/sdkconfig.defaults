@@ -4,6 +4,12 @@
 #  production card has a different flash size AND a different GPIO/PMU pinout.)
 # Delete sdkconfig if you want a clean rebuild from these defaults.
 
+# --- ESP32-S3 CPU profile promoted from research ---
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# --- Configured modem UART rate; see README for OTA migration safeguards ---
+CONFIG_WUPS_MODEM_UART_230400=y
+
 # --- Console (USB-Serial-JTAG over USB-C) ---
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 

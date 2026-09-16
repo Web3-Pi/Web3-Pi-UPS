@@ -47,6 +47,7 @@ typedef enum {
     OTA_CONFIRM_PHYSICAL_TRANSFER,
 } ota_confirm_reason_t;
 static bool s_pending_verify, s_marked_valid, s_validation_busy, s_in_progress;
+static bool s_modem_recovery_busy;
 static int s_claim_mux, lock_depth;
 static int mode, valid_calls, rollback_calls, ota_hooks;
 static int64_t clock_us;
@@ -93,14 +94,35 @@ static unsigned checks;
 static void reset(int64_t seconds) {
     assert(!lock_depth);
     s_pending_verify = true; s_marked_valid = false;
-    s_validation_busy = s_in_progress = false;
+    s_validation_busy = s_in_progress = s_modem_recovery_busy = false;
     mode = WUPS_BACKEND_MODE_MQTT; clock_us = seconds * INT64_C(1000000);
     proof = true; valid_result = ESP_OK;
     valid_calls = rollback_calls = ota_hooks = 0;
     reenter_rollback = reenter_claim = false; last_hook = false;
     invalidate_proof_on_claim = false;
 }
+static bool recovery_commit(void *context) {
+    assert(lock_depth == 1);
+    unsigned *calls = context;
+    ++*calls;
+    return true;
+}
+static bool recovery_rejected(void *context) { (void)context; return false; }
 int main(void) {
+    unsigned commits = 0;
+    reset(10);
+    CHECK(!fw_ota_try_modem_recovery(recovery_rejected, NULL));
+    CHECK(!s_modem_recovery_busy);
+    CHECK(claim_in_progress());
+    CHECK(!fw_ota_try_modem_recovery(recovery_commit, &commits) && commits == 0);
+    release_in_progress();
+    CHECK(fw_ota_try_modem_recovery(recovery_commit, &commits) && commits == 1);
+    CHECK(!claim_in_progress() && !s_in_progress);
+    CHECK(!fw_ota_try_modem_recovery(recovery_commit, &commits) && commits == 1);
+    fw_ota_finish_modem_recovery();
+    CHECK(claim_in_progress()); release_in_progress();
+    s_validation_busy = true;
+    CHECK(!fw_ota_try_modem_recovery(recovery_commit, &commits) && commits == 1);
     reset(599); fw_ota_mark_uplink_healthy();
     CHECK(valid_calls == 1 && !s_pending_verify && s_marked_valid);
     fw_ota_mark_uplink_healthy(); CHECK(valid_calls == 1);
@@ -177,6 +199,7 @@ def main() -> None:
     if not deadline:
         raise RuntimeError("production rollback deadline missing")
     functions = "\n\n".join(production_function(source, name) for name in (
+        "fw_ota_try_modem_recovery", "fw_ota_finish_modem_recovery",
         "claim_in_progress", "release_in_progress", "confirm_reason_name",
         "confirm_running_image", "fw_ota_mark_uplink_healthy", "fw_ota_rollback_tick",
     ))

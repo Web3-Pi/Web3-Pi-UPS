@@ -5,8 +5,9 @@ Provides cellular telemetry, authenticated commands and firmware updates over
 MQTT, HTTP or Arkiv, independently of the Raspberry Pi's local network.
 
 The current firmware uses **LTE Cat-M1 only**, on **B3 (1800 MHz) and B20
-(800 MHz)**. NB-IoT selection is disabled. The current
-[0.8.15 release adds SINR telemetry and fixed-APN build variants](docs/RELEASE-0.8.15.md).
+(800 MHz)**. NB-IoT selection is disabled. Version 0.8.16 adds
+[bounded MQTT/TLS service and guarded modem recovery](docs/MQTT-RECOVERY-15-17.md).
+The [0.8.15 release added SINR telemetry and fixed-APN build variants](docs/RELEASE-0.8.15.md).
 For the underlying radio and recovery behavior, see the
 [0.8.14 integration and validation notes](docs/RELEASE-0.8.14.md).
 
@@ -14,8 +15,9 @@ For the underlying radio and recovery behavior, see the
 
 The committed defaults target the W3P MODEM V1 M.2 card:
 
-- **MCU:** ESP32-S3FH4R2, 4 MB flash; PSRAM is disabled.
-- **Modem:** SIMCom SIM7080G, controlled over UART1 at 115200 baud.
+- **MCU:** ESP32-S3FH4R2 at 240 MHz, 4 MB flash; PSRAM is disabled.
+- **Modem:** SIMCom SIM7080G, controlled over UART1; the configured rate is
+  230400 baud. The migration safeguards below may temporarily use 115200.
 - **Power:** hardware supplies the modem's 3.8 V rail; this card has no AXP2101
   PMU. The LilyGo PMU path is disabled.
 - **UPS link:** UART2 carries the WUPS protocol to the RP2040.
@@ -110,6 +112,32 @@ The component lock and local MQTT/HTTPS OTA components are part of the build.
 Do not remove the local overrides or change their source hashes to bypass a
 configuration error; the patches and adapter must be reviewed together.
 
+The research work also provides optional modem CPU1 affinity, unbuffered TX
+and sparse CPU/UART diagnostics. The hardware image `0.8.16-1nce-240-c1`
+used `CONFIG_WUPS_MODEM_CORE1=y` and `CONFIG_WUPS_MODEM_TX_UNBUFFERED=y`;
+these switches remain off in the inherited clean-build defaults. The synthetic
+traffic and reconnect benchmarks are test-only options and default off.
+
+### UART speed and OTA rollback
+
+The SIM7080G persists `AT+IPR` across resets. The earlier `main` firmware
+through 0.8.15 expects 115200 baud, so changing the saved rate during an
+unconfirmed OTA boot would make automatic rollback lose modem communication.
+Version 0.8.16 selects the configured rate only when the running partition
+already has OTA state `VALID` at modem initialization. Every other state,
+including `UNDEFINED`, or a failed state query selects 115200. That selection
+is retained for the entire boot, even after publication proof confirms the
+image. A subsequent boot of a confirmed image selects the configured 230400
+rate. Serial-flashed images without a `VALID` OTA state therefore also retain
+115200.
+
+This protects the first OTA migration from a modem initially at 115200. It
+cannot undo an earlier change to 230400 before this firmware gets to run.
+
+Before manually installing a legacy 115200-only image, boot a current image
+configured with `CONFIG_WUPS_MODEM_UART_115200=y` and verify its UART/IPR log
+first. This restores the persistent modem setting before the downgrade.
+
 Production Arkiv images require the locally supplied, gitignored
 `main/arkiv_ws_token.h`. Fresh public checkouts and CI compile with the committed
 placeholder instead: WSS push cannot connect and command handling falls back
@@ -122,13 +150,13 @@ From this directory with ESP-IDF activated:
 
 ```sh
 # Default fleet classification (legacy ICCID list -> 1nce, other SIMs -> sensor)
-idf.py -B build-auto -DPROJECT_VER=0.8.15 -DWUPS_FIXED_APN= build
+idf.py -B build-auto -DPROJECT_VER=0.8.16 -DWUPS_FIXED_APN= build
 
 # Always use iot.1nce.net, independent of ICCID
-idf.py -B build-1nce -DPROJECT_VER=0.8.15-1nce -DWUPS_FIXED_APN=iot.1nce.net build
+idf.py -B build-1nce -DPROJECT_VER=0.8.16-1nce -DWUPS_FIXED_APN=iot.1nce.net build
 
 # Always use sensor.net, independent of ICCID
-idf.py -B build-sensor -DPROJECT_VER=0.8.15-sensor -DWUPS_FIXED_APN=sensor.net build
+idf.py -B build-sensor -DPROJECT_VER=0.8.16-sensor -DWUPS_FIXED_APN=sensor.net build
 ```
 
 Each directory contains `firmware-ESP32-LTE-M.bin`, the application image for

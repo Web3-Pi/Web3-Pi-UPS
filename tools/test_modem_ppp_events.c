@@ -393,6 +393,34 @@ static int test_wake_races_and_diagnostics(void)
     return 0;
 }
 
+static int test_generation(void)
+{
+    dial();
+    CHECK(modem_ppp_generation() == 0);
+    deliver(DELIVER_GOT);
+    uint32_t first = modem_ppp_generation();
+    CHECK(first != 0);
+    deliver(DELIVER_GOT);
+    CHECK(modem_ppp_generation() == first); /* duplicate is not a new interface */
+    deliver(DELIVER_LOST);
+    CHECK(modem_ppp_generation() == 0);
+    deliver(DELIVER_GOT);
+    CHECK(modem_ppp_generation() != 0 && modem_ppp_generation() != first);
+    first = modem_ppp_generation();
+    ppp_events_begin_stop();
+    CHECK(modem_ppp_generation() == 0);
+    deliver(DELIVER_GOT);
+    CHECK(modem_ppp_generation() == 0);
+    dial();
+    deliver(DELIVER_GOT);
+    CHECK(modem_ppp_generation() != 0 && modem_ppp_generation() != first);
+    s_ppp_state.generation = UINT32_MAX;
+    deliver(DELIVER_LOST);
+    deliver(DELIVER_GOT);
+    CHECK(modem_ppp_generation() == 1); /* wrap cannot masquerade as DOWN */
+    return 0;
+}
+
 static int test_timeout(void)
 {
     dial();
@@ -413,7 +441,8 @@ static int test_timeout(void)
 int main(void)
 {
     if (test_delayed_loss() || test_order_and_errors() || test_expected_stop() ||
-        test_payloads() || test_wake_races_and_diagnostics() || test_timeout()) return 2;
+        test_payloads() || test_wake_races_and_diagnostics() || test_timeout() ||
+        test_generation()) return 2;
     printf("modem_ppp_events PASS: %u checks; virtual120s, real extracted callbacks/state decisions\n", checks);
     return 0;
 }

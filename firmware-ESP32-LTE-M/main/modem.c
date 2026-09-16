@@ -4,6 +4,8 @@
 #include "modem_awake_policy.h"
 #include "modem_support_diag.h"
 #include "modem_diag_clock.h"
+#include "modem_recovery.h"
+#include "modem_uart_baud.h"
 #include "mqtt.h"
 #include "identity.h"
 #include "backend_mode.h"
@@ -14,6 +16,9 @@
 #include "arkiv_ws.h"
 #include "arkiv_rpc.h"
 #include "fw_ota.h"
+#if CONFIG_WUPS_PERF_RECOVERY_BENCH
+#include "perf_recovery.h"
+#endif
 #include "../../common/protocol.h"
 
 #include <ctype.h>
@@ -27,7 +32,11 @@
 #include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#if CONFIG_WUPS_PERF_DIAG
+#include "esp_intr_alloc.h"
+#endif
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_modem_api.h"
 #include "esp_modem_config.h"
 #include "esp_netif.h"
@@ -54,7 +63,18 @@
 #define MODEM_RI_GPIO      6   /* ESP_UART1_RI  (not driven in SW) */
 
 #define MODEM_UART        UART_NUM_1
-#define MODEM_BAUD        115200
+#define MODEM_BAUD        CONFIG_WUPS_MODEM_UART_BAUD
+
+/* AT+IPR persists across ESP resets. A trial OTA image must leave the
+ * legacy image's 115200 UART usable if the bootloader rolls back. This
+ * selection is latched before UART startup and never promoted in this
+ * boot, even after fw_ota marks the image VALID. */
+static int s_modem_boot_baud = 115200;
+static bool s_modem_boot_baud_latched;
+
+static const modem_uart_baud_config_t s_modem_uart_config = {
+    .port = MODEM_UART, .tx_gpio = MODEM_TX_GPIO, .rx_gpio = MODEM_RX_GPIO,
+};
 
 /* Post-power-on settle before AT is reliable. SIM7080G Ton(uart) = 1.8 s
  * (HW Design V1.05, Table 9); we keep a conservative 5 s so the SIM/AT stack
@@ -218,6 +238,7 @@ typedef struct {
     int32_t error;
     uint32_t attempt;
     uint32_t sequence;
+    uint32_t generation; /* new UP edge, including DOWN -> GOT in one attempt */
     bool had_ip;
 } ppp_event_state_t;
 
@@ -237,6 +258,12 @@ static ppp_event_state_t ppp_events_snapshot(void)
 bool modem_ppp_is_up(void)
 {
     return ppp_events_snapshot().phase == PPP_UP;
+}
+
+uint32_t modem_ppp_generation(void)
+{
+    ppp_event_state_t state = ppp_events_snapshot();
+    return state.phase == PPP_UP ? state.generation : 0;
 }
 
 static void ppp_events_begin_attempt(void)
@@ -299,6 +326,8 @@ static bool ppp_events_observe(ppp_observation_t observation, int32_t error)
         s_ppp_state.observation = observation;
         s_ppp_state.error = error;
         if (observation == PPP_OBS_GOT_IP) {
+            if (before != PPP_UP && ++s_ppp_state.generation == 0)
+                ++s_ppp_state.generation; /* zero means no current interface */
             s_ppp_state.phase = PPP_UP;
             s_ppp_state.had_ip = true;
         } else if (observation == PPP_OBS_ERROR || s_ppp_state.had_ip) {
@@ -566,11 +595,23 @@ static bool modem_awake_check_before_ppp(void)
     return false;
 }
 
+static modem_recovery_t s_uplink_recovery;
+
+static void modem_registration_snapshot(void)
+{
+    char reply[MODEM_RADIO_RESPONSE_CAPACITY];
+    if (radio_at(NULL, "AT+CEREG?", reply, sizeof(reply), 3000) &&
+        modem_recovery_observe_registration(&s_uplink_recovery, reply, now_s())) {
+        ESP_LOGI(MODEM_TAG, "LTE registration returned: one bounded %us recovery opportunity",
+                 (unsigned)MODEM_RECOVERY_REG_GRACE_S);
+    }
+}
+
 static void modem_network_snapshot(const char *reason)
 {
     char reply[MODEM_RADIO_RESPONSE_CAPACITY];
     ESP_LOGI(MODEM_TAG, "network snapshot: %s", reason);
-    (void)radio_at(NULL, "AT+CEREG?", reply, sizeof(reply), 3000);
+    modem_registration_snapshot();
     (void)radio_at(NULL, "AT+COPS?", reply, sizeof(reply), 3000);
     (void)radio_at(NULL, "AT+CPSI?", reply, sizeof(reply), 3000);
 }
@@ -653,8 +694,27 @@ static void emit_net_status(uint8_t state, int8_t rssi_dbm,
     s_ns_last_emit_s = now_s();
 }
 
+static void modem_select_boot_baud(void)
+{
+    if (s_modem_boot_baud_latched) return;
+    s_modem_boot_baud_latched = true;
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    esp_err_t err = running ? esp_ota_get_state_partition(running, &state)
+                            : ESP_ERR_NOT_FOUND;
+    if (err == ESP_OK && state == ESP_OTA_IMG_VALID) {
+        s_modem_boot_baud = MODEM_BAUD;
+    } else {
+        ESP_LOGW(MODEM_TAG, "UART held at 115200 for this boot: OTA state=%d (%s); "
+                           "configured baud=%d requires a VALID boot",
+                 (int)state, esp_err_to_name(err), MODEM_BAUD);
+    }
+}
+
 esp_err_t modem_init(void)
 {
+    modem_select_boot_baud();
     /* Preload LOW before enabling either output: PWRKEY stays released
      * through Q501; DTR wakes a UART left in CSCLK=1 by an earlier image.
      * Keep DTR LOW across modem resets/redials. It does not wake PSM. */
@@ -698,69 +758,12 @@ esp_err_t modem_power_on(void)
     return ESP_OK;
 }
 
-/* Probe AT on a temporary raw UART. Returns true if the modem answered "OK".
- * The UART driver is removed afterwards so esp_modem can claim UART1 cleanly.
- * NB: a modem left in CMUX framing (ESP soft-reboot mid-session) is alive
- * but will NOT answer a plain AT — callers must treat "silent" as "off OR
- * unreachable", never as proof of power-off. */
-static void probe_escape_data_mode(void)
-{
-    /* If the modem is stuck in PPP/data mode (the ESP rebooted mid-session —
-     * the modem keeps its own data session up), pull it back to command mode
-     * with the "+++" escape: ~1 s of UART idle, "+++", ~1 s idle. Harmless when
-     * the modem is off or already in command mode. (Does NOT rescue a modem
-     * left in CMUX framing — see the note above.) */
-    vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_write_bytes(MODEM_UART, "+++", 3);
-    vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_flush_input(MODEM_UART);
-}
-
-/* Probe for up to `window_ms` after the initial "+++" escape. A modem that is
- * still booting needs the long window (see MODEM_BOOT_PROBE_MS); long windows
- * re-run the escape once at half-time in case the modem finished booting into
- * a resumed data session after the first escape already went by. */
+/* A modem may retain either IPR speed across ESP resets and PWRKEY cycles.
+ * Plain AT still cannot recover an existing CMUX session; the power-cycle
+ * ladder below handles that independently of baud discovery. */
 static bool modem_probe_at_alive_ms(uint32_t window_ms)
 {
-    uart_config_t cfg = {
-        .baud_rate  = MODEM_BAUD,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    if (uart_driver_install(MODEM_UART, 512, 0, 0, NULL, 0) != ESP_OK) {
-        return false;
-    }
-    uart_param_config(MODEM_UART, &cfg);
-    uart_set_pin(MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO,
-                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    probe_escape_data_mode();
-
-    uint8_t buf[64];
-    const int64_t deadline_us = esp_timer_get_time() + (int64_t)window_ms * 1000;
-    const int64_t half_us     = esp_timer_get_time() + (int64_t)window_ms * 500;
-    bool re_escaped = (window_ms < 10000);  /* only long windows re-escape */
-    bool alive = false;
-    for (;;) {
-        uart_flush_input(MODEM_UART);
-        uart_write_bytes(MODEM_UART, "AT\r\n", 4);
-        int n = uart_read_bytes(MODEM_UART, buf, sizeof(buf) - 1, pdMS_TO_TICKS(300));
-        if (n > 0) {
-            buf[n] = '\0';
-            if (strstr((char *)buf, "OK")) alive = true;
-        }
-        if (alive || esp_timer_get_time() >= deadline_us) break;
-        if (!re_escaped && esp_timer_get_time() >= half_us) {
-            probe_escape_data_mode();
-            re_escaped = true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    uart_driver_delete(MODEM_UART);
-    return alive;
+    return modem_uart_baud_probe(&s_modem_uart_config, window_ms);
 }
 
 static bool modem_probe_at_alive(void)
@@ -1026,6 +1029,22 @@ static int s_reg_timeout_streak = 0;
  * to acquire an IP — caller waits for the ordered PPP lifecycle state. */
 static esp_err_t ppp_bringup_dce(void)
 {
+#if CONFIG_WUPS_MODEM_CORE1
+    /* The driver constructor allocates its ISR synchronously on this core.
+     * Check both affinity and current core before every creation/recovery. */
+    if (xTaskGetCoreID(NULL) != 1 || xPortGetCoreID() != 1) {
+        ESP_LOGE(MODEM_TAG, "B-UART: UART1 creator must be pinned to CPU1; PPP blocked");
+        return ESP_ERR_INVALID_STATE;
+    }
+#endif
+    /* Own the temporary raw UART only before creating esp_modem. Confirm
+     * both the physical rate and saved IPR on every retry before PPP/CMUX. */
+    if (!modem_uart_baud_prepare(&s_modem_uart_config, s_modem_boot_baud)) {
+        ESP_LOGE(MODEM_TAG, "UART baud configuration not confirmed; PPP blocked");
+        s_fail_stage = MODEM_FAIL_AT;
+        return ESP_FAIL;
+    }
+
     /* DTE = Data Terminal Equipment side (us) — UART parameters. */
     esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
     dte_cfg.uart_config.tx_io_num   = MODEM_TX_GPIO;
@@ -1034,7 +1053,8 @@ static esp_err_t ppp_bringup_dce(void)
     dte_cfg.uart_config.cts_io_num  = -1;
     dte_cfg.uart_config.flow_control = ESP_MODEM_FLOW_CONTROL_NONE;
     dte_cfg.uart_config.port_num   = MODEM_UART;
-    dte_cfg.uart_config.baud_rate  = MODEM_BAUD;
+    dte_cfg.uart_config.baud_rate  = s_modem_boot_baud;
+    dte_cfg.uart_config.tx_buffer_size = CONFIG_WUPS_MODEM_TX_BUFFER_SIZE;
 
     /* DCE = Data Circuit-terminating Equipment side (the modem). The 1nce
      * SIM auto-provisions the radio APN, but the application PPP context
@@ -1052,6 +1072,14 @@ static esp_err_t ppp_bringup_dce(void)
         return ESP_FAIL;
     }
     ESP_LOGI(MODEM_TAG, "DCE created (SIM7070 class)");
+#if CONFIG_WUPS_PERF_DIAG
+    /* The allocator's own table is evidence of actual ISR placement, unlike
+     * a core sampled when uart_driver_install returns. Dump every new DCE. */
+    ESP_LOGI(MODEM_TAG, "interrupt_dump begin uart=1 creator_core=%d creator_affinity=%d",
+             xPortGetCoreID(), xTaskGetCoreID(NULL) == tskNO_AFFINITY ? -1 : (int)xTaskGetCoreID(NULL));
+    esp_err_t dump_result = esp_intr_dump(NULL);
+    ESP_LOGI(MODEM_TAG, "interrupt_dump end uart=1 status=%s", esp_err_to_name(dump_result));
+#endif
 
     /* Probe the modem at AT level a few times so we know it's awake before
      * we tell esp_modem to switch to PPP/data mode. esp_modem starts in
@@ -1583,6 +1611,41 @@ static void uplink_health(bool *up, bool *wd_ok, bool *ota_ok)
     }
 }
 
+typedef struct {
+    ppp_event_state_t ppp;
+    mqtt_health_snapshot_t mqtt;
+    int backend;
+} modem_recovery_commit_t;
+
+/* Called under OTA -> MQTT guards. Only the short PPP state transition is
+ * committed here; DNS, AT, SDK calls and logging stay outside all locks. */
+static bool modem_recovery_commit_ppp(void *context)
+{
+    const modem_recovery_commit_t *expected = context;
+    portENTER_CRITICAL(&s_ppp_event_lock);
+    bool current = s_ppp_state.phase == PPP_UP &&
+        s_ppp_state.attempt == expected->ppp.attempt &&
+        s_ppp_state.sequence == expected->ppp.sequence;
+    if (current) {
+        s_ppp_state.phase = PPP_STOPPING;
+        s_ppp_state.sequence++;
+    }
+    portEXIT_CRITICAL(&s_ppp_event_lock);
+    return current;
+}
+
+static bool modem_recovery_commit_backend(void *context)
+{
+    const modem_recovery_commit_t *expected = context;
+    if (backend_mode_get() != expected->backend) return false;
+    if (expected->backend == WUPS_BACKEND_MODE_MQTT)
+        return mqtt_recovery_try_commit(&expected->mqtt, modem_recovery_commit_ppp, context);
+    /* HTTP/Arkiv accessors may take task mutexes. Their final health check
+     * runs immediately before the OTA guard, never under this spinlock.
+     * Preserve that backend policy without importing blocking I/O here. */
+    return modem_recovery_commit_ppp(context);
+}
+
 /* Runs while PPP is up (and ONLY then — bring-up/backoff never get here).
  * Every PPP_SUPERVISE_TICK_MS: check uplink health, poll signal quality and
  * emit net.status (CMUX sessions), and pace the alert-clear re-sends.
@@ -1590,6 +1653,7 @@ static void uplink_health(bool *up, bool *wd_ok, bool *ota_ok)
  * uplink watchdog trips (module reset / power-cycle per s_uplink_trips). */
 static teardown_action_t supervise_uplink(void)
 {
+    modem_recovery_init(&s_uplink_recovery);
     uint32_t last_healthy_s  = now_s();  /* watchdog timer starts at GOT_IP */
     uint32_t last_clear_s    = now_s();  /* GOT_IP path just sent a clear    */
     uint32_t last_radio_snapshot_s = now_s();
@@ -1633,9 +1697,16 @@ static teardown_action_t supervise_uplink(void)
             continue;
         }
 
+#if CONFIG_WUPS_PERF_RECOVERY_BENCH
+        if (perf_recovery_take_request()) {
+            ESP_LOGI("perf_recovery", "accepted owner_core=%d", xPortGetCoreID());
+            return TEARDOWN_NORMAL;
+        }
+#endif
         bool uplink_up = false, wd_healthy = false, ota_proof = false;
         uplink_health(&uplink_up, &wd_healthy, &ota_proof);
         if (wd_healthy) {
+            modem_recovery_backend_healthy(&s_uplink_recovery);
             last_healthy_s = now;
             /* OTA-1 rollback — first demonstrably healthy uplink marks a
              * pending-verify OTA image valid (one-shot, no-op otherwise).
@@ -1689,7 +1760,7 @@ static teardown_action_t supervise_uplink(void)
                 char reply[MODEM_RADIO_RESPONSE_CAPACITY];
                 ESP_LOGI(MODEM_TAG, "network snapshot: %s",
                          radio_snapshot_pending ? "MQTT disconnected" : "periodic");
-                (void)radio_at(NULL, "AT+CEREG?", reply, sizeof(reply), 3000);
+                modem_registration_snapshot();
                 (void)radio_at(NULL, "AT+COPS?", reply, sizeof(reply), 3000);
                 last_radio_snapshot_s = now;
                 support_due = true;
@@ -1743,6 +1814,10 @@ static teardown_action_t supervise_uplink(void)
          * reset ladder. Neither result identifies the operator/backend root
          * cause. Connected/degraded MQTT and a stalled worker are held below. */
         if (now - last_healthy_s >= UPLINK_DEAD_SECS) {
+            modem_recovery_commit_t recovery = {
+                .ppp = ppp_events_snapshot(),
+                .backend = backend_mode_get(),
+            };
             /* A live MQTT session with stale publication proof, or an SDK
              * worker stuck in its own call, is handled by the independent
              * MQTT monitor. A modem reset cannot safely unstick that task.
@@ -1751,6 +1826,7 @@ static teardown_action_t supervise_uplink(void)
             bool mqtt_owned_fault = false;
             if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT) {
                 mqtt_get_health(&mqtt_health);
+                recovery.mqtt = mqtt_health;
                 mqtt_owned_fault = mqtt_health.connected || mqtt_health.worker_stalled;
             }
             /* The hold must never cover a client that cannot even attempt
@@ -1794,6 +1870,10 @@ static teardown_action_t supervise_uplink(void)
                 last_healthy_s = now_s();
                 continue;
             }
+            /* A public DNS timeout cannot overrule new backend evidence. */
+            uplink_health(&uplink_up, &wd_healthy, &ota_proof);
+            if (wd_healthy) continue;
+            if (modem_recovery_grace_active(&s_uplink_recovery, now_s())) continue;
             if (s_cmux_active) modem_network_snapshot("uplink recovery");
             /* The final AT snapshot can overlap a new OTA or a real loss. */
             if (ppp_events_take_loss())
@@ -1803,6 +1883,14 @@ static teardown_action_t supervise_uplink(void)
                 continue;
             }
             now = now_s();
+            uplink_health(&uplink_up, &wd_healthy, &ota_proof);
+            if (wd_healthy) continue;
+            if (modem_recovery_grace_active(&s_uplink_recovery, now)) continue;
+            /* Linearization point: current backend state and PPP observation
+             * must still permit teardown. OTA owns the outer guard and keeps
+             * new transfers out until ppp_teardown_dce has finished. */
+            if (!fw_ota_try_modem_recovery(modem_recovery_commit_backend, &recovery))
+                continue;
             s_uplink_trips++;
             s_fail_stage = MODEM_FAIL_NET;
             s_fails_since_ok++;
@@ -1833,6 +1921,12 @@ static teardown_action_t supervise_uplink(void)
 static void ppp_supervisor_task(void *arg)
 {
     (void)arg;
+#if CONFIG_WUPS_PERF_DIAG
+    BaseType_t affinity = xTaskGetCoreID(NULL);
+    ESP_LOGI(MODEM_TAG, "affinity task=ppp_sup running_core=%d affinity=%d priority=%u stack_bytes=8192",
+             xPortGetCoreID(), affinity == tskNO_AFFINITY ? -1 : (int)affinity,
+             (unsigned)uxTaskPriorityGet(NULL));
+#endif
 
     /* esp_modem requires a default event loop + esp_netif initialized. */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -1954,6 +2048,7 @@ static void ppp_supervisor_task(void *arg)
 
 stop_ppp:
         ppp_teardown_dce(teardown);
+        fw_ota_finish_modem_recovery();
 
         /* When degraded, power-cycle the modem more often: a hot-inserted SIM
          * or restored signal is only picked up on a modem re-init, so frequent
@@ -2036,7 +2131,7 @@ static void raw_uart_diag_task(void *arg)
 {
     (void)arg;
     uart_config_t cfg = {
-        .baud_rate  = MODEM_BAUD,
+        .baud_rate  = s_modem_boot_baud,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
@@ -2049,7 +2144,7 @@ static void raw_uart_diag_task(void *arg)
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     ESP_LOGW(MODEM_TAG, "MODEM_UART_DIAG: raw AT sweep on UART%d TX=GPIO%d RX=GPIO%d @ %d "
                         "(no esp_modem, no power-cycle)",
-             MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO, MODEM_BAUD);
+             MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO, s_modem_boot_baud);
     bool scanned = false;  /* one-shot AT+COPS=? — blocks the loop ~2.5 min */
     for (;;) {
         ESP_LOGI(MODEM_TAG, "================ DIAG AT sweep ================");
@@ -2094,7 +2189,15 @@ void modem_at_pass_through_start(void)
      * success, and then runs forever — re-creating the DCE whenever PPP
      * drops so production devices don't go silent on a transient cellular
      * outage. */
+#if CONFIG_WUPS_MODEM_CORE1
+    BaseType_t created = xTaskCreatePinnedToCore(ppp_supervisor_task, "ppp_sup", 8192, NULL, 5, NULL, 1);
+    if (created != pdPASS) {
+        ESP_LOGE(MODEM_TAG, "B-UART: PPP supervisor creation failed");
+        return;
+    }
+#else
     xTaskCreate(ppp_supervisor_task, "ppp_sup", 8192, NULL, 5, NULL);
+#endif
     ESP_LOGI(MODEM_TAG, "PPP supervisor task started (esp_modem)");
 #endif
 }

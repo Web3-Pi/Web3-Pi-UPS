@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "firmware-ESP32-LTE-M/main"
 HOST = ROOT / "tools/mqtt_runtime_host"
 sanitizers = os.environ.get("MQTT_TEST_SANITIZERS", "address,undefined")
-all_cases = ("isolation", "init", "registration", "start", "backoff", "revive", "pressure", "probe")
+all_cases = ("isolation", "init", "registration", "start", "backoff", "revive", "pressure", "probe",
+             "ppp_transport", "ppp_auth", "recovery_commit")
 cases = tuple(part.strip() for part in os.environ.get("MQTT_TEST_RUNTIME_CASES", ",".join(all_cases)).split(","))
 if not cases or any(case not in all_cases for case in cases):
     raise SystemExit("MQTT_TEST_RUNTIME_CASES must select from: " + ",".join(all_cases))

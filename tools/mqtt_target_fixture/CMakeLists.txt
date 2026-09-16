@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.16)
+get_filename_component(FIXTURE_REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+set(EXTRA_COMPONENT_DIRS "${FIXTURE_REPO_ROOT}/firmware-ESP32-LTE-M/components/espressif__mqtt")
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(web3pi_mqtt_loopback_test)

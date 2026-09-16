@@ -40,6 +40,13 @@ SDK implementation. Heap/stack metric stubs are fixed synthetic values used for
 compilation, not resource measurements. Production client lifetime continues
 until reboot; the harness frees it only after all worker threads have joined.
 
+The `ppp_transport` and `ppp_auth` cases replace a PPP generation during a
+120-second reconnect backoff. The former must retry promptly once; the latter
+must retain the authentication deadline. Repeated start requests cannot bypass
+the deadline. `recovery_commit` checks the production reset guard against a
+new MQTT connection/generation, OTA, a stalled worker and authentication refusal.
+The full runtime suite now contains eleven independently started cases.
+
 Default sanitizer selection is `address,undefined`. Set `MQTT_TEST_SANITIZERS`
 to `undefined` or an empty string explicitly on hosts without working ASan.
 `MQTT_TEST_SDK_STALL_MS=0` permits a faster development pass; final regression
