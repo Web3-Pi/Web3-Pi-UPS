@@ -1,0 +1,10 @@
+{
+  "CMakeLists.txt": "99d70b71cdc86b8aa8b8b9885ba7fca705b1c7b3c48ca2ffe2c7a63d99951b36",
+  "mqtt_client.c": "b9e388e9509f40c55fa6439244423401091907f108ae3b2725228ddf612a607a",
+  "include/mqtt_client.h": "4c0d623d9d873766bcbfbd824b4ec1de5611d4286b1310cbc3156e925c39dd3c",
+  "lib/include/mqtt_client_priv.h": "7ffa837dbdaa68d233a8990bde79f6726930d2b04f5afa031c19d2dd615db56e",
+  "lib/include/mqtt_service.h": "2ba5cd722c61999cbf1d01df45ee9be0233d3dd9b8d140700b6359b69d2ddd2a",
+  "lib/include/mqtt_transport_nb.h": "8d1b52320aa37aa3211601f96d1d0d1041edcbd534589f18c1c2b2f828a56b3a",
+  "lib/mqtt_service.c": "05d7b123d0da2229660e311003d6fcbba6e66d3f82d7ef679629e69717274a9a",
+  "lib/mqtt_transport_nb.c": "5ac58e6eaf3e80a5f61137fc8fc27267647100f1a552f55f123c31359aede0d2"
+}

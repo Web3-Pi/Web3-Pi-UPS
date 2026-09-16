@@ -45,6 +45,12 @@ bool mqtt_auth_refused(void);
 uint32_t mqtt_auth_refusals(void);
 uint32_t mqtt_connect_fail_streak(void);
 void mqtt_get_health(mqtt_health_snapshot_t *snapshot);
+/* Linearize a watchdog reset with MQTT recovery. expected is captured before
+ * diagnostics. commit executes under the short application lock and MUST only
+ * validate/mark PPP state: no I/O, logging, allocation or scheduler/SDK calls.
+ * Lock order: OTA claim -> MQTT state -> PPP state. */
+bool mqtt_recovery_try_commit(const mqtt_health_snapshot_t *expected,
+                              bool (*commit)(void *), void *context);
 bool mqtt_publication_proof_fresh(void);
 /* Every transfer transition invalidates proof; never alters rollback time. */
 void mqtt_ota_state_changed(bool active);

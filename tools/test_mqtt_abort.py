@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run fault injection against actual esp-mqtt 1.0.0 code before/after our patch.
 
-The original is reconstructed by reversing the checked-in patch and verified
-against its upstream SHA256. We compile verbatim resend, abort, write, ping,
+The original is reconstructed by reversing the complete checked-in patch series
+and verified against its upstream SHA256. We compile verbatim resend, abort, write, ping,
 keepalive functions, the whole CONNECTED switch arm and its real unlock/poll
 epilogue; the complete, unchanged SDK mqtt_outbox.c is linked too. No manually
 copied implementation serves as the oracle. Baseline failure is mandatory.
@@ -10,19 +10,16 @@ copied implementation serves as the oracle. Baseline failure is mandatory.
 MQTT_TEST_SANITIZERS defaults to address,undefined; empty selects plain C.
 """
 from pathlib import Path
-import hashlib
-import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import tempfile
 
+from mqtt_sdk_sources import reconstruct
+
 ROOT = Path(__file__).resolve().parents[1]
 SDK = ROOT / "firmware-ESP32-LTE-M/components/espressif__mqtt"
-ORIGINAL_SHA = "4b24720b34c2bd44b0857a5251f5392663225c618595229540b35f1529663a9a"
-PATCHED_SHA = "1a120957d6f8078a0cd27f4febac54389c5dce7f025069cad493e945d005f361"
 
 
 def extract_function(source, name):
@@ -49,13 +46,13 @@ def excerpts(source):
     start = task.index("        case MQTT_STATE_CONNECTED:")
     end = task.index("        case MQTT_STATE_WAIT_RECONNECT:", start)
     connected = task[start:end]
-    start = task.index("        MQTT_API_UNLOCK(client);\n        if (MQTT_STATE_CONNECTED")
+    start = task.index("        MQTT_API_UNLOCK(client);\n        if (", end)
     end = task.index("\n\n    }", start)
     epilogue = task[start:end]
     pieces.append("static void run_connected_iteration(esp_mqtt_client_handle_t client)\n"
                   "{\n    outbox_tick_t msg_tick = 0;\n    MQTT_API_LOCK(client);\n"
-                  "    switch (client->state) {\n" + connected +
-                  "    }\n" + epilogue + "\n}\n")
+                  "    do { switch (client->state) {\n" + connected +
+                  "    }\n" + epilogue + "\n    } while (0);\n}\n")
     return "\n".join(pieces)
 
 
@@ -78,25 +75,8 @@ def write_headers(build):
 
 
 def verify_sources(build):
-    manifest = json.loads((SDK / "UPSTREAM_SHA256.json").read_text())
-    assert manifest["mqtt_client.c"] == ORIGINAL_SHA
-    for name, expected in manifest.items():
-        if name != "mqtt_client.c":
-            assert hashlib.sha256((SDK / name).read_bytes()).hexdigest() == expected, name
-    patched = (SDK / "mqtt_client.c").read_bytes()
-    assert hashlib.sha256(patched).hexdigest() == PATCHED_SHA
-    original = build / "original"
-    original.mkdir()
-    shutil.copyfile(SDK / "mqtt_client.c", original / "mqtt_client.c")
-    subprocess.run(["patch", "--batch", "--reverse", "-p1", "-i",
-                    str(SDK / "0001-stop-after-resend-abort.patch")],
-                   cwd=original, check=True, capture_output=True, text=True, timeout=30)
-    baseline = (original / "mqtt_client.c").read_bytes()
-    assert hashlib.sha256(baseline).hexdigest() == ORIGINAL_SHA
-    # Unrelated receive/start/cleanup and SDK public/private declarations stay exact.
-    for name in ("mqtt_process_receive", "esp_mqtt_write", "esp_mqtt_abort_connection"):
-        assert extract_function(baseline.decode(), name) == extract_function(patched.decode(), name)
-    return baseline.decode(), patched.decode()
+    baseline, _, patched = reconstruct(build, SDK)
+    return baseline, patched
 
 
 def main():
@@ -115,7 +95,9 @@ def main():
                     "-g", "-O1", "-fno-omit-frame-pointer", "-include", str(build / "host_support.h"),
                     "-I", str(build), "-I", str(SDK / "lib/include"),
                     str(ROOT / "tools/test_mqtt_abort.c"), str(SDK / "lib/mqtt_outbox.c"),
-                    "-o", str(binary)] + (["-DMQTT_PROTOCOL_5"] if mqtt5 else []) + flags,
+                    str(SDK / "lib/mqtt_service.c"),
+                    "-o", str(binary)] + (["-DMQTT_PROTOCOL_5"] if mqtt5 else []) +
+                    (["-DWUPS_CURRENT_SDK"] if name == "fixed" else []) + flags,
                     check=True, timeout=30)
                 result = subprocess.run([str(binary)], text=True, capture_output=True, timeout=30)
                 if name == "baseline":

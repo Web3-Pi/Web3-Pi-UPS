@@ -79,4 +79,14 @@ menu "Web3 Pi modem UART"
             recreation, not RF fault simulation. Keep disabled outside the
             research comparison; no asynchronous power-key toggles.
 
+    config WUPS_PERF_RECOVERY_ONLY
+        bool "Run reconnect qualification without synthetic duplex traffic"
+        default n
+        depends on WUPS_PERF_RECOVERY_BENCH
+        help
+            Run the same two owner-controlled reconnect cycles after their
+            healthy-uplink baseline, without the preceding HTTPS benchmark.
+            This separates reconnect qualification from transfer throughput.
+            Test images only; leave disabled in normal device firmware.
+
 endmenu

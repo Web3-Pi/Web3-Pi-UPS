@@ -50,6 +50,7 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static _Atomic(esp_mqtt_client_handle_t) s_client;
 static atomic_bool s_ready, s_enabled, s_started, s_topics_ready, s_connected;
 static atomic_uint s_last_connected_s, s_auth_refusals, s_conn_fail_streak;
+static atomic_bool s_last_failure_auth;
 static TaskHandle_t s_owner_task, s_command_task, s_monitor_task;
 static QueueHandle_t s_commands;
 static mqtt_dispatch_queue_t s_queue;
@@ -204,6 +205,21 @@ void mqtt_get_health(mqtt_health_snapshot_t *out)
     mqtt_health_poll(&s_health, now_ms(), out);
     portEXIT_CRITICAL(&s_lock);
 }
+bool mqtt_recovery_try_commit(const mqtt_health_snapshot_t *expected,
+                              bool (*commit)(void *), void *context)
+{
+    if (!expected || !commit) return false;
+    portENTER_CRITICAL(&s_lock);
+    mqtt_health_snapshot_t current = {0};
+    if (atomic_load(&s_ready)) mqtt_health_poll(&s_health, now_ms(), &current);
+    bool eligible = !s_ota_active && !mqtt_auth_refused() && !current.ota_active && !current.connected &&
+        !current.proof_fresh && !current.worker_stalled &&
+        current.generation == expected->generation &&
+        current.last_ack_ms == expected->last_ack_ms;
+    bool accepted = eligible && commit(context);
+    portEXIT_CRITICAL(&s_lock);
+    return accepted;
+}
 bool mqtt_publication_proof_fresh(void)
 {
     if (!atomic_load(&s_ready) || fw_ota_in_progress()) return false;
@@ -236,6 +252,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         atomic_store(&s_connected, true);
         atomic_store(&s_auth_refusals, 0);
         atomic_store(&s_conn_fail_streak, 0);
+        atomic_store(&s_last_failure_auth, false);
         atomic_store(&s_last_connected_s, (unsigned)(now / 1000));
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "CONNECTED; bootstrap requested");
@@ -286,12 +303,17 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     }
     case MQTT_EVENT_ERROR:
         if (evt->error_handle) {
+            portENTER_CRITICAL(&s_lock);
             int type = evt->error_handle->error_type;
             int rc = evt->error_handle->connect_return_code;
+            atomic_store(&s_last_failure_auth,
+                type == MQTT_ERROR_TYPE_CONNECTION_REFUSED &&
+                (rc == MQTT_CONNECTION_REFUSE_BAD_USERNAME || rc == MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED));
             if (type == MQTT_ERROR_TYPE_CONNECTION_REFUSED &&
                 (rc == MQTT_CONNECTION_REFUSE_BAD_USERNAME || rc == MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED))
                 atomic_fetch_add(&s_auth_refusals, 1);
             else if (type == MQTT_ERROR_TYPE_TCP_TRANSPORT) atomic_store(&s_auth_refusals, 0);
+            portEXIT_CRITICAL(&s_lock);
             if (!mqtt_is_connected() && (type == MQTT_ERROR_TYPE_TCP_TRANSPORT || type == MQTT_ERROR_TYPE_CONNECTION_REFUSED))
                 atomic_fetch_add(&s_conn_fail_streak, 1);
             ESP_LOGW(TAG, "error type=%d connack=%d tls=0x%x socket=%d", type, rc,
@@ -362,6 +384,9 @@ static esp_err_t sdk_start(void)
         },
         .session.keepalive   = 60,
         .network.timeout_ms  = 15000,
+        /* Incremental TLS/MQTT I/O, with finite partial-frame deadlines and
+         * RX service before keepalive decisions (issues #15/#16). */
+        .network.bounded_service = true,
         /* 0.8.7: the SDK owner owns the retry schedule (normal 10 s
          * cadence, 30→120 s backoff while the broker refuses credentials —
          * each attempt is a full TLS handshake, ~40 MB/day at the built-in
@@ -533,6 +558,8 @@ static void owner_task(void *arg)
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY); /* runtime init commit barrier */
     uint64_t next_attempt = 0, bootstrap_generation = 0, next_bootstrap = 0;
     uint32_t backoff = MQTT_BACKOFF_MIN_MS;
+    uint32_t ppp_generation = 0;
+    bool auth_retry = false;
     unsigned rejects = 0, bootstrap_step = 0;
     for (;;) {
         uint64_t now = now_ms(), expired[MQTT_DISPATCH_CAPACITY];
@@ -540,7 +567,21 @@ static void owner_task(void *arg)
         size_t n_expired = mqtt_dispatch_expire(&s_queue, now, expired);
         for (size_t i = 0; i < n_expired; ++i) receipt_finish(expired[i], MQTT_RECEIPT_FAILED);
         portEXIT_CRITICAL(&s_lock);
-        if (!atomic_load(&s_enabled) || !modem_ppp_is_up()) goto idle;
+        uint32_t current_ppp = modem_ppp_generation();
+        if (!atomic_load(&s_enabled) || !current_ppp) goto idle;
+        if (current_ppp != ppp_generation) {
+            ppp_generation = current_ppp;
+            /* A new interface invalidates transport backoff, not a broker's
+             * authentication refusal. Do not let repeated start wakeups or
+             * repeated GOT_IP notifications bypass either policy. */
+            if (!auth_retry && !atomic_load(&s_last_failure_auth)) {
+                next_attempt = now;
+                backoff = MQTT_BACKOFF_MIN_MS;
+                rejects = 0;
+                atomic_store(&s_conn_fail_streak, 0);
+                ESP_LOGI(TAG, "new PPP generation=%" PRIu32 "; transport retry expedited", current_ppp);
+            }
+        }
         if (!atomic_load(&s_started)) {
             if (now < next_attempt) goto idle;
             sdk_begin();
@@ -595,10 +636,12 @@ static void owner_task(void *arg)
                     rejects = 0;
                 }
                 next_attempt = now_ms() + delay;
+                auth_retry = atomic_load(&s_last_failure_auth);
             }
             goto idle;
         }
         backoff = MQTT_BACKOFF_MIN_MS;
+        auth_retry = false;
         rejects = 0;
         next_attempt = now + MQTT_RETRY_NORMAL_MS;
         if (epoch_wait) goto idle;
@@ -717,6 +760,20 @@ static void monitor_task(void *arg)
                      (unsigned)uxTaskGetStackHighWaterMark(s_owner_task),
                      (unsigned)uxTaskGetStackHighWaterMark(s_command_task),
                      (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            /* This client remains alive after publication in s_client. The
+             * observation API only loads atomics, so a blocked SDK task does
+             * not prevent this independent monitor from reporting its state. */
+            esp_mqtt_client_handle_t client = atomic_load_explicit(&s_client, memory_order_acquire);
+            esp_mqtt_service_status_t service;
+            if (client && esp_mqtt_client_get_service_status(client, &service) == ESP_OK) {
+                ESP_LOGI(TAG, "service op=%u lock_max_ms=%u slice_start=%u slice_end=%u progress=%u "
+                         "rx_left_ms=%u tx_left_ms=%u tx_frames=%u tx_bytes=%u deadlines=%u",
+                         (unsigned)service.operation, (unsigned)service.max_lock_ms,
+                         (unsigned)service.slice_started_ms, (unsigned)service.slice_completed_ms,
+                         (unsigned)service.last_progress_ms, (unsigned)service.rx_remaining_ms,
+                         (unsigned)service.tx_remaining_ms, (unsigned)service.tx_frames,
+                         (unsigned)service.tx_bytes, (unsigned)service.deadline_failures);
+            }
             last_log = now;
             previous_stalled = health.worker_stalled;
             previous_degraded = health.degraded;

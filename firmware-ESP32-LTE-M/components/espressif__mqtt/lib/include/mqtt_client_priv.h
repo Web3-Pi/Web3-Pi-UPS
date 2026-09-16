@@ -17,6 +17,8 @@
 #include "esp_event.h"
 #include "mqtt_client.h"
 #include "mqtt_msg.h"
+#include "mqtt_service.h"
+#include "mqtt_transport_nb.h"
 #ifdef MQTT_PROTOCOL_5
 #include "mqtt5_client_priv.h"
 #endif
@@ -77,6 +79,7 @@ typedef struct {
     int port;
     bool auto_reconnect;
     int network_timeout_ms;
+    bool bounded_service;
     int refresh_connection_after_ms;
     int reconnect_timeout_ms;
     char **alpn_protos;
@@ -111,6 +114,7 @@ typedef enum {
     MQTT_STATE_DISCONNECTED,
     MQTT_STATE_CONNECTED,
     MQTT_STATE_WAIT_RECONNECT,
+    MQTT_STATE_BOUNDED_CONNECT,
 } mqtt_client_state_t;
 
 struct esp_mqtt_client {
@@ -118,6 +122,13 @@ struct esp_mqtt_client {
     esp_transport_handle_t transport;
     mqtt_config_storage_t *config;
     mqtt_state_t  mqtt_state;
+    mqtt_service_t service;
+    mqtt_transport_nb_t nb;
+    struct {
+        atomic_uint slice_started_ms, slice_completed_ms, max_lock_ms;
+        atomic_uint last_progress_ms, rx_remaining_ms, tx_remaining_ms;
+        atomic_uint tx_frames, tx_bytes, deadline_failures, operation;
+    } service_observation;
     _Atomic mqtt_client_state_t state;
     uint64_t refresh_connection_tick;
     int64_t keepalive_tick;

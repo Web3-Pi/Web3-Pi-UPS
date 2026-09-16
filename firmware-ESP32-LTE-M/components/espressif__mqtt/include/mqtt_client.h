@@ -29,6 +29,19 @@ typedef void *esp_event_handler_t;
 
 typedef struct esp_mqtt_client *esp_mqtt_client_handle_t;
 
+/** Lock-free observations of bounded service; individual fields are atomic
+ * samples, not a transactionally consistent snapshot. Times are monotonic ms
+ * modulo 2^32. No credentials, topics, payloads or device IDs are included. */
+typedef struct {
+    uint32_t slice_started_ms, slice_completed_ms, max_lock_ms;
+    uint32_t last_progress_ms, rx_remaining_ms, tx_remaining_ms;
+    uint32_t tx_frames, tx_bytes, deadline_failures;
+    uint32_t operation; /* 0 idle, 1 connect, 2 RX, 3 TX, 4 PING, 5 cancellation */
+} esp_mqtt_service_status_t;
+esp_err_t esp_mqtt_client_get_service_status(esp_mqtt_client_handle_t client,
+                                             esp_mqtt_service_status_t *status);
+
+
 #define MQTT_OVER_TCP_SCHEME "mqtt"
 #define MQTT_OVER_SSL_SCHEME "mqtts"
 #define MQTT_OVER_WS_SCHEME  "ws"
@@ -347,6 +360,24 @@ typedef struct esp_mqtt_client_config_t {
                           disabled (defaults to 10s) */
         int timeout_ms; /*!< Abort network operation if it is not completed after this value, in milliseconds
                 (defaults to 10s). */
+        /** Web3-Pi opt-in: cooperative MQTT 3.1.1 over TLS 1.2 service.
+         * Use enqueue() for publishing; synchronous publish() is rejected before
+         * admission. Subscribe/unsubscribe return an admitted outbox packet ID.
+         * Supports the built-in mqtts transport only. RX packets are limited to
+         * 16 KiB; TX staging to 32 KiB / 68 frames (512 B reserved for controls). Network timeout is an aggregate
+         * operation deadline, including TX queue time, never renewed by progress.
+         * Service makes nonblocking I/O calls in 10 ms / 8-packet slices, with a
+         * 10 ms cooperative yield. CPU/crypto/callback runtime may exceed a slice;
+         * callbacks must remain nonblocking. PING response budget is keepalive/2
+         * after send completion, with at most 200 ms / 64 packets of RX grace.
+         * A suspended TLS write excludes RX until completion or its original
+         * aggregate network deadline (15s when configured); grace then permits
+         * already buffered RX. Stop/disconnect abort the transport promptly;
+         * they do not promise graceful MQTT DISCONNECT transmission or suppress LWT. This bounded local TX delay is distinct from a
+         * peer-response timeout. A blocked post-handshake TLS alert encountered
+         * by SSL_read causes explicit recovery rather than unsafe interleaving.
+         */
+        bool bounded_service;
         int refresh_connection_after_ms; /*!< Refresh connection after this value (in milliseconds) */
         bool disable_auto_reconnect;     /*!< Client will reconnect to server (when errors/disconnect). Set
                                  `disable_auto_reconnect=true` to disable */

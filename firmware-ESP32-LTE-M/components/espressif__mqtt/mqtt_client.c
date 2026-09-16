@@ -1,6 +1,6 @@
-/* Modified by Web3-Pi, 2026-09-14: terminate the CONNECTED iteration after
- * resend failure; abort once if retransmitted PUBREL construction fails.
- * See WEB3PI_PATCH.md and 0001-stop-after-resend-abort.patch for provenance.
+/* Modified by Web3-Pi: resend/abort recovery and opt-in bounded MQTT service.
+ * See WEB3PI_PATCH.md, 0001-stop-after-resend-abort.patch and
+ * 0002-bounded-mqtt-service.patch for the complete reviewed patch lineage.
  */
 #include <stdint.h>
 #include <stdlib.h>
@@ -42,6 +42,20 @@ static char *create_string(const char *ptr, int len);
 static int mqtt_message_receive(esp_mqtt_client_handle_t client, int read_poll_timeout_ms);
 static void esp_mqtt_client_dispatch_transport_error(esp_mqtt_client_handle_t client);
 static esp_err_t send_disconnect_msg(esp_mqtt_client_handle_t client);
+static esp_err_t mqtt_bounded_write(esp_mqtt_client_handle_t client);
+static esp_err_t mqtt_bounded_service(esp_mqtt_client_handle_t client);
+static esp_err_t mqtt_bounded_connect(esp_mqtt_client_handle_t client);
+
+static int mqtt_client_read(esp_mqtt_client_handle_t client, char *data, int length, int timeout_ms)
+{
+    if (!client->config->bounded_service)
+        return esp_transport_read(client->transport, data, length, timeout_ms);
+    bool started = false;
+    int result = mqtt_transport_nb_read(&client->nb, data, length, &started);
+    if (started && !client->service.rx_deadline_ms)
+        client->service.rx_deadline_ms = platform_tick_get_ms() + client->config->network_timeout_ms;
+    return result == 0 ? ERR_TCP_TRANSPORT_CONNECTION_TIMEOUT : result;
+}
 
 /**
  * @brief Processes error reported from transport layer (considering the message read status)
@@ -413,6 +427,11 @@ esp_err_t esp_mqtt_set_config(esp_mqtt_client_handle_t client, const esp_mqtt_cl
         return ESP_ERR_INVALID_ARG;
     }
     MQTT_API_LOCK(client);
+    if (client->run && ((client->config && client->config->bounded_service) || config->network.bounded_service)) {
+        /* The asynchronous TLS/DNS operation retains configuration pointers. */
+        MQTT_API_UNLOCK(client);
+        return ESP_ERR_INVALID_STATE;
+    }
     //Copy user configurations to client context
     esp_err_t err = ESP_OK;
     if (!client->config) {
@@ -557,6 +576,7 @@ esp_err_t esp_mqtt_set_config(esp_mqtt_client_handle_t client, const esp_mqtt_cl
     }
 
     client->config->transport = config->network.transport;
+    client->config->bounded_service = config->network.bounded_service;
 
     if (config->network.if_name) {
         client->config->if_name = calloc(1, sizeof(struct ifreq) + 1);
@@ -647,6 +667,15 @@ esp_err_t esp_mqtt_set_config(esp_mqtt_client_handle_t client, const esp_mqtt_cl
     }
     client->config->outbox_limit = config->outbox.limit;
     esp_err_t config_has_conflict = esp_mqtt_check_cfg_conflict(client->config, config);
+    if (client->config->bounded_service &&
+        (client->config->transport || !client->config->scheme ||
+         strcmp(client->config->scheme, MQTT_OVER_SSL_SCHEME) ||
+         client->mqtt_state.connection.information.protocol_ver != MQTT_PROTOCOL_V_3_1_1 ||
+         client->config->use_secure_element || client->config->ds_data ||
+         client->config->use_ecdsa_peripheral || client->config->psk_hint_key)) {
+        ESP_LOGE(TAG, "bounded_service requires built-in mqtts / MQTT 3.1.1 and software certificate TLS");
+        config_has_conflict = ESP_ERR_NOT_SUPPORTED;
+    }
 
     MQTT_API_UNLOCK(client);
 
@@ -730,6 +759,7 @@ static esp_err_t process_keepalive(esp_mqtt_client_handle_t client)
 
 static inline esp_err_t esp_mqtt_write(esp_mqtt_client_handle_t client)
 {
+    if (client->config->bounded_service) return mqtt_bounded_write(client);
     int wlen = 0, widx = 0, len = client->mqtt_state.connection.outbound_message.length;
     while (len > 0) {
         wlen = esp_transport_write(client->transport,
@@ -853,6 +883,10 @@ static esp_err_t esp_mqtt_connect(esp_mqtt_client_handle_t client, int timeout_m
 static void esp_mqtt_abort_connection(esp_mqtt_client_handle_t client)
 {
     MQTT_API_LOCK(client);
+    mqtt_transport_nb_close(&client->nb);
+    mqtt_service_clear(&client->service);
+    client->mqtt_state.in_buffer_read_len = 0;
+    client->mqtt_state.message_length = 0;
     esp_transport_close(client->transport);
     client->wait_timeout_ms = client->config->reconnect_timeout_ms;
     client->reconnect_tick = platform_tick_get_ms();
@@ -932,6 +966,8 @@ esp_err_t esp_mqtt_client_destroy(esp_mqtt_client_handle_t client)
     if (client->run) {
         esp_mqtt_client_stop(client);
     }
+    mqtt_transport_nb_close(&client->nb);
+    mqtt_service_clear(&client->service);
     esp_mqtt_destroy_config(client);
     if (client->transport_list) {
         esp_transport_list_destroy(client->transport_list);
@@ -974,6 +1010,10 @@ esp_err_t esp_mqtt_client_set_uri(esp_mqtt_client_handle_t client, const char *u
 
     // This API could be also executed when client is active (need to protect config fields)
     MQTT_API_LOCK(client);
+    if (client->run && client->config->bounded_service) {
+        MQTT_API_UNLOCK(client);
+        return ESP_ERR_INVALID_STATE;
+    }
     // set uri overrides actual scheme, host, path if configured previously
 // False-positive leak detection. TODO: GCC-366
 #pragma GCC diagnostic push  // TODO: IDF-10105
@@ -1159,7 +1199,7 @@ static esp_err_t deliver_publish(esp_mqtt_client_handle_t client)
             msg_topic = saved_msg_topic;
             msg_topic_len = saved_msg_topic_len;
             msg_data_offset += msg_data_len;
-            int ret = esp_transport_read(client->transport, (char *)client->mqtt_state.in_buffer,
+            int ret = mqtt_client_read(client, (char *)client->mqtt_state.in_buffer,
                                          msg_total_len - msg_read_len > buf_len ? buf_len : msg_total_len - msg_read_len,
                                          client->config->network_timeout_ms);
             if (ret <= 0) {
@@ -1260,15 +1300,13 @@ static int mqtt_message_receive(esp_mqtt_client_handle_t client, int read_poll_t
 {
     int read_len, total_len, fixed_header_len;
     uint8_t *buf = client->mqtt_state.in_buffer + client->mqtt_state.in_buffer_read_len;
-    esp_transport_handle_t t = client->transport;
-
     client->mqtt_state.message_length = 0;
     if (client->mqtt_state.in_buffer_read_len == 0) {
         /*
          * Read first byte of the mqtt packet fixed header, it contains packet
          * type and flags.
          */
-        read_len = esp_transport_read(t, (char *)buf, 1, read_poll_timeout_ms);
+        read_len = mqtt_client_read(client, (char *)buf, 1, read_poll_timeout_ms);
         if (read_len <= 0) {
             return esp_mqtt_handle_transport_read_error(read_len, client, false);
         }
@@ -1294,18 +1332,32 @@ static int mqtt_message_receive(esp_mqtt_client_handle_t client, int read_poll_t
              * maximal remaining length value = 16383 (maximal total message
              * size of 16386 bytes).
              */
-            read_len = esp_transport_read(t, (char *)buf, 1, read_poll_timeout_ms);
+            read_len = mqtt_client_read(client, (char *)buf, 1, read_poll_timeout_ms);
             if (read_len <= 0) {
                 return esp_mqtt_handle_transport_read_error(read_len, client, true);
             }
             ESP_LOGD(TAG, "%s: read \"remaining length\" byte: 0x%x", __func__, *buf);
             buf++;
             client->mqtt_state.in_buffer_read_len++;
+            if (client->config->bounded_service && client->mqtt_state.in_buffer_read_len >= 5 && (*(buf - 1) & 0x80))
+                goto err; /* MQTT Remaining Length permits at most four bytes. */
         } while ((client->mqtt_state.in_buffer_read_len < 6) && (*(buf - 1) & 0x80));
     }
     total_len = mqtt_get_total_length(client->mqtt_state.in_buffer, client->mqtt_state.in_buffer_read_len, &fixed_header_len);
     ESP_LOGD(TAG, "%s: total message length: %d (already read: %"NEWLIB_NANO_COMPAT_FORMAT")", __func__, total_len, NEWLIB_NANO_COMPAT_CAST(client->mqtt_state.in_buffer_read_len));
+    if (client->config->bounded_service && (total_len <= 0 || total_len > MQTT_SERVICE_RX_BYTES)) goto err;
     client->mqtt_state.message_length = total_len;
+    if (client->config->bounded_service && client->mqtt_state.in_buffer_length < total_len) {
+        if (total_len <= 0 || total_len > MQTT_SERVICE_RX_BYTES) {
+            ESP_LOGE(TAG, "bounded MQTT packet exceeds %u bytes", MQTT_SERVICE_RX_BYTES);
+            goto err;
+        }
+        uint8_t *larger = realloc(client->mqtt_state.in_buffer, total_len);
+        if (!larger) goto err;
+        client->mqtt_state.in_buffer = larger;
+        client->mqtt_state.in_buffer_length = total_len;
+        buf = larger + client->mqtt_state.in_buffer_read_len;
+    }
     if (client->mqtt_state.in_buffer_length < total_len) {
         if (mqtt_get_type(client->mqtt_state.in_buffer) == MQTT_MSG_TYPE_PUBLISH) {
             /*
@@ -1314,7 +1366,7 @@ static int mqtt_message_receive(esp_mqtt_client_handle_t client, int read_poll_t
              */
             if (client->mqtt_state.in_buffer_read_len < fixed_header_len + 2) {
                 /* read next 2 bytes - topic length to get minimum portion of publish packet */
-                read_len = esp_transport_read(t, (char *)buf, client->mqtt_state.in_buffer_read_len - fixed_header_len + 2, read_poll_timeout_ms);
+                read_len = mqtt_client_read(client, (char *)buf, client->mqtt_state.in_buffer_read_len - fixed_header_len + 2, read_poll_timeout_ms);
                 ESP_LOGD(TAG, "%s: read_len=%d", __func__, read_len);
                 if (read_len <= 0) {
                     return esp_mqtt_handle_transport_read_error(read_len, client, true);
@@ -1345,7 +1397,7 @@ static int mqtt_message_receive(esp_mqtt_client_handle_t client, int read_poll_t
     }
     if (client->mqtt_state.in_buffer_read_len < total_len) {
         /* read the rest of the mqtt message */
-        read_len = esp_transport_read(t, (char *)buf, total_len - client->mqtt_state.in_buffer_read_len, read_poll_timeout_ms);
+        read_len = mqtt_client_read(client, (char *)buf, total_len - client->mqtt_state.in_buffer_read_len, read_poll_timeout_ms);
         ESP_LOGD(TAG, "%s: read_len=%d", __func__, read_len);
         if (read_len <= 0) {
             return esp_mqtt_handle_transport_read_error(read_len, client, true);
@@ -1373,9 +1425,12 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
 
     /* non-blocking receive in order not to block other tasks */
     int recv = mqtt_message_receive(client, 0);
+    if (client->config->bounded_service && client->service.rx_deadline_ms &&
+        platform_tick_get_ms() >= client->service.rx_deadline_ms) return ESP_FAIL;
     if (recv == 0) {    // Timeout
         return ESP_OK;
     }
+    if (recv == -1 && client->config->bounded_service) return ESP_OK;
     if (recv == -1) {    // Mid-message timeout
         if (previous_in_buffer_read_len == client->mqtt_state.in_buffer_read_len) {
             // Report error only if didn't receive anything since previous iteration
@@ -1495,7 +1550,7 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
         }
 
         outbox_set_pending(client->outbox, msg_id, ACKNOWLEDGED);
-        esp_mqtt_write(client);
+        if (esp_mqtt_write(client) != ESP_OK) return ESP_FAIL;
         break;
     case MQTT_MSG_TYPE_PUBREL:
         ESP_LOGD(TAG, "received MQTT_MSG_TYPE_PUBREL");
@@ -1512,7 +1567,7 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
             return ESP_FAIL;
         }
 
-        esp_mqtt_write(client);
+        if (esp_mqtt_write(client) != ESP_OK) return ESP_FAIL;
         break;
     case MQTT_MSG_TYPE_PUBCOMP:
         ESP_LOGD(TAG, "received MQTT_MSG_TYPE_PUBCOMP");
@@ -1532,6 +1587,11 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
         break;
     case MQTT_MSG_TYPE_PINGRESP:
         ESP_LOGD(TAG, "MQTT_MSG_TYPE_PINGRESP");
+        if (client->config->bounded_service) {
+            client->service.ping_deadline_ms = 0;
+            client->service.ping_grace_deadline_ms = 0;
+            client->service.ping_grace_packets = 0;
+        }
         client->wait_for_ping_resp = false;
         /* It is the responsibility of the Client to ensure that the interval between Control Packets
          * being sent does not exceed the Keep Alive value. In the absence of sending any other Control
@@ -1555,6 +1615,10 @@ static esp_err_t mqtt_process_receive(esp_mqtt_client_handle_t client)
     }
 
     client->mqtt_state.in_buffer_read_len = 0;
+    if (client->config->bounded_service) {
+        client->service.rx_deadline_ms = 0;
+        client->service.rx_progress = true;
+    }
     return ESP_OK;
 }
 
@@ -1608,6 +1672,14 @@ static esp_err_t mqtt_resend_pubrel(esp_mqtt_client_handle_t client, outbox_item
 
 static void mqtt_delete_expired_messages(esp_mqtt_client_handle_t client)
 {
+    if (client->config->bounded_service) {
+        /* Keep the staged outbox item's identity stable until completion.
+         * QoS0 items share packet ID zero: expiring the current item while its
+         * owned TX copy is in flight could make completion delete the next
+         * unsent QoS0 item. The original TX deadline bounds this deferral. */
+        for (mqtt_service_frame_t *frame = client->service.head; frame; frame = frame->next)
+            if (frame->outbox) return;
+    }
     // Delete message after OUTBOX_EXPIRED_TIMEOUT_MS milliseconds
 #if MQTT_REPORT_DELETED_MESSAGES
     // also report the deleted items as MQTT_EVENT_DELETED events if enabled
@@ -1652,6 +1724,331 @@ static inline void run_event_loop(esp_mqtt_client_handle_t client)
     }
 }
 
+/* Bounded mode is deliberately opt-in: only this service owner enters TLS.
+ * Public enqueue/subscribe methods touch owned memory under api_lock only. */
+static esp_err_t mqtt_bounded_write(esp_mqtt_client_handle_t client)
+{
+    mqtt_message_t *message = &client->mqtt_state.connection.outbound_message;
+    if (!message->length) return ESP_FAIL;
+    uint8_t type = mqtt_get_type(message->data);
+    if (!mqtt_service_push(&client->service, message->data, message->length, 0,
+                           type, 0, false,
+                           platform_tick_get_ms() + client->config->network_timeout_ms)) {
+        ESP_LOGE(TAG, "bounded MQTT control queue full");
+        return ESP_ERR_NO_MEM;
+    }
+    if (type == MQTT_MSG_TYPE_PINGREQ) client->service.ping_queued = true;
+    return ESP_OK;
+}
+
+static esp_err_t mqtt_bounded_tx_step(esp_mqtt_client_handle_t client)
+{
+    mqtt_service_t *s = &client->service;
+    mqtt_service_frame_t *frame = s->head;
+    if (!frame) return ESP_OK;
+    uint64_t now = platform_tick_get_ms();
+    atomic_store(&client->service_observation.operation, 3);
+    if (now >= frame->deadline_ms) {
+        ESP_LOGE(TAG, "bounded MQTT TX deadline (offset=%u/%u)",
+                 (unsigned)frame->offset, (unsigned)frame->length);
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!mqtt_transport_nb_can_write(&client->nb)) return ESP_OK;
+    if (!frame->retry_length) {
+        size_t left = frame->length - frame->offset;
+        frame->retry_length = left > MQTT_SERVICE_WRITE_CHUNK ? MQTT_SERVICE_WRITE_CHUNK : left;
+    }
+    /* A WANT retry uses the identical pointer and length. Limit requests to
+     * one small TLS record, including when the outbox contains a large packet. */
+    int sent = mqtt_transport_nb_write(&client->nb, (char *)frame->data + frame->offset,
+                                      frame->retry_length);
+    if (sent < 0 || (size_t)sent > frame->retry_length) {
+        esp_mqtt_client_dispatch_transport_error(client);
+        return ESP_FAIL;
+    }
+    if (!sent) return ESP_OK;
+    atomic_store(&client->service_observation.last_progress_ms, platform_tick_get_ms());
+    frame->offset += sent;
+    frame->retry_length = 0;
+    now = platform_tick_get_ms();
+    if (now >= frame->deadline_ms) return ESP_ERR_TIMEOUT;
+    if (frame->offset < frame->length) return ESP_OK;
+    s->last_tx_ms = now;
+    if (client->wait_for_ping_resp && now >= s->ping_deadline_ms) {
+        s->ping_grace_deadline_ms = now + MQTT_SERVICE_PING_GRACE_MS;
+        s->ping_grace_packets = MQTT_SERVICE_PING_GRACE_PACKETS;
+    }
+    if (frame->type == MQTT_MSG_TYPE_PINGREQ) {
+        s->ping_queued = false;
+        s->ping_sent_ms = now;
+        s->ping_deadline_ms = now + (uint64_t)client->mqtt_state.connection.information.keepalive * 500u;
+        s->ping_grace_deadline_ms = 0;
+        s->ping_grace_packets = 0;
+        client->wait_for_ping_resp = true;
+    }
+    if (frame->outbox) {
+        outbox_item_handle_t item = outbox_get(client->outbox, frame->id);
+        if (item) {
+            if (frame->type == MQTT_MSG_TYPE_PUBLISH && frame->qos == 0) {
+                outbox_delete_item(client->outbox, item);
+            } else {
+                outbox_set_tick(client->outbox, frame->id, now);
+                /* QoS2 PUBREL must preserve ACKNOWLEDGED until PUBCOMP. */
+                if (frame->type != MQTT_MSG_TYPE_PUBREL)
+                    outbox_set_pending(client->outbox, frame->id, TRANSMITTED);
+            }
+        }
+    }
+    mqtt_service_pop(s);
+    return ESP_OK;
+}
+
+static esp_err_t mqtt_bounded_schedule_outbox(esp_mqtt_client_handle_t client)
+{
+    mqtt_service_t *s = &client->service;
+    /* Keep bulk TX admission to one packet at a time; reserve queue room for
+     * RX acknowledgements and PING. Deadlines include any time behind them. */
+    if (s->ping_grace_deadline_ms) return ESP_OK;
+    for (mqtt_service_frame_t *f = s->head; f; f = f->next)
+        if (f->outbox) return ESP_OK;
+    if (s->count >= MQTT_SERVICE_NORMAL_TX_FRAMES) return ESP_OK;
+    outbox_tick_t tick = 0;
+    outbox_item_handle_t item = outbox_dequeue(client->outbox, QUEUED, NULL);
+    if (!item) {
+        item = outbox_dequeue(client->outbox, TRANSMITTED, &tick);
+        if (item && platform_tick_get_ms() - tick < client->config->message_retransmit_timeout) item = NULL;
+    }
+    if (!item) {
+        item = outbox_dequeue(client->outbox, ACKNOWLEDGED, &tick);
+        if (item && platform_tick_get_ms() - tick < client->config->message_retransmit_timeout) item = NULL;
+    }
+    if (!item) return ESP_OK;
+    size_t length;
+    uint16_t id;
+    int type, qos;
+    uint8_t *data = outbox_item_get_data(item, &length, &id, &type, &qos);
+    pending_state_t pending = outbox_item_get_pending(item);
+    if (pending == ACKNOWLEDGED) {
+        mqtt_msg_pubrel(&client->mqtt_state.connection, id);
+        data = client->mqtt_state.connection.outbound_message.data;
+        length = client->mqtt_state.connection.outbound_message.length;
+        type = MQTT_MSG_TYPE_PUBREL;
+        if (!length) return ESP_FAIL;
+    } else if (type == MQTT_MSG_TYPE_PUBLISH && qos && pending == TRANSMITTED) {
+        mqtt_set_dup(data);
+    }
+    if (length > MQTT_SERVICE_TX_BYTES - MQTT_SERVICE_CONTROL_RESERVE) return ESP_FAIL;
+    if (s->bytes >= MQTT_SERVICE_TX_BYTES - MQTT_SERVICE_CONTROL_RESERVE ||
+        length > MQTT_SERVICE_TX_BYTES - MQTT_SERVICE_CONTROL_RESERVE - s->bytes) return ESP_OK;
+    if (!mqtt_service_push(s, data, length, id, type, qos, true,
+                           platform_tick_get_ms() + client->config->network_timeout_ms)) {
+        /* Capacity pressure is not a network failure. The outbox owns this
+         * item and the next slice can retry admission. Oversize is rejected
+         * by enqueue before storing it. */
+        return length > MQTT_SERVICE_TX_BYTES ? ESP_FAIL : ESP_OK;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t mqtt_bounded_keepalive(esp_mqtt_client_handle_t client)
+{
+    mqtt_service_t *s = &client->service;
+    uint64_t now = platform_tick_get_ms();
+    unsigned keepalive = client->mqtt_state.connection.information.keepalive;
+    if (!keepalive) return ESP_OK;
+    if (client->wait_for_ping_resp) {
+        if (now < s->ping_deadline_ms) return ESP_OK;
+        /* An unfinished TLS write cannot be interleaved with SSL_read. Its
+         * original aggregate TX deadline still applies; this is local TX
+         * backpressure, not evidence that an unread PINGRESP never arrived. */
+        if (!mqtt_transport_nb_can_read(&client->nb)) return ESP_OK;
+        if (!s->ping_grace_deadline_ms) {
+            /* One bounded chance to service buffered packets at the deadline.
+             * Neither unrelated traffic nor partial progress renews this. */
+            s->ping_grace_deadline_ms = now + MQTT_SERVICE_PING_GRACE_MS;
+            s->ping_grace_packets = MQTT_SERVICE_PING_GRACE_PACKETS;
+        }
+        if (now >= s->ping_grace_deadline_ms || !s->ping_grace_packets) {
+            ESP_LOGE(TAG, "No PING_RESP within send-completion deadline and bounded RX grace");
+            return ESP_ERR_TIMEOUT;
+        }
+        return ESP_OK;
+    }
+    if (!s->ping_queued && now - s->last_tx_ms >= (uint64_t)keepalive * 500u)
+        return esp_mqtt_client_ping(client);
+    return ESP_OK;
+}
+
+static esp_err_t mqtt_bounded_service(esp_mqtt_client_handle_t client)
+{
+    mqtt_service_t *s = &client->service;
+    uint64_t slice_end = platform_tick_get_ms() + MQTT_SERVICE_SLICE_MS;
+    if (s->head && platform_tick_get_ms() >= s->head->deadline_ms) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (xEventGroupWaitBits(client->status_bits, DISCONNECT_BIT, true, true, 0) & DISCONNECT_BIT)
+        return ESP_FAIL; /* The owner aborts immediately; never wait for a blocked TX. */
+    if (client->wait_for_ping_resp && mqtt_transport_nb_can_read(&client->nb) &&
+        platform_tick_get_ms() >= s->ping_deadline_ms && !s->ping_grace_deadline_ms) {
+        /* Reserve is usable before the first deadline RX step. Normal service
+         * is limited to two staged frames, leaving room for all 64 grace
+         * packets even when each preceding PUBLISH needs an ACK. */
+        s->ping_grace_deadline_ms = platform_tick_get_ms() + MQTT_SERVICE_PING_GRACE_MS;
+        s->ping_grace_packets = MQTT_SERVICE_PING_GRACE_PACKETS;
+    }
+    if (mqtt_transport_nb_can_read(&client->nb) && s->ping_grace_deadline_ms && client->wait_for_ping_resp &&
+        (platform_tick_get_ms() >= s->ping_grace_deadline_ms || !s->ping_grace_packets))
+        return ESP_ERR_TIMEOUT;
+    if (s->rx_deadline_ms && platform_tick_get_ms() >= s->rx_deadline_ms) {
+        ESP_LOGE(TAG, "bounded MQTT RX deadline with partial TLS/MQTT input");
+        return ESP_ERR_TIMEOUT;
+    }
+    /* Drain a bounded batch before a timeout decision or any new TX. This
+     * finds a PINGRESP behind PUBLISH/PUBACK without an unlimited drain loop. */
+    for (unsigned count = 0; mqtt_transport_nb_can_read(&client->nb) && count < MQTT_SERVICE_RX_PACKETS &&
+         platform_tick_get_ms() < slice_end &&
+         s->count < (s->ping_grace_deadline_ms ? MQTT_SERVICE_TX_FRAMES - 2 : MQTT_SERVICE_NORMAL_TX_FRAMES); ++count) {
+        atomic_store(&client->service_observation.operation, 2);
+        s->rx_progress = false;
+        if (mqtt_process_receive(client) != ESP_OK) return ESP_FAIL;
+        if (!s->rx_progress) break;
+        atomic_store(&client->service_observation.last_progress_ms, platform_tick_get_ms());
+        if (client->wait_for_ping_resp && s->ping_grace_deadline_ms && s->ping_grace_packets)
+            --s->ping_grace_packets;
+        if (!client->run) return ESP_FAIL;
+    }
+    esp_err_t keepalive_result = mqtt_bounded_keepalive(client);
+    if (keepalive_result != ESP_OK) return keepalive_result;
+    if (client->config->refresh_connection_after_ms &&
+        platform_tick_get_ms() - client->refresh_connection_tick >= client->config->refresh_connection_after_ms)
+        return ESP_FAIL;
+    if (platform_tick_get_ms() >= slice_end) return ESP_OK;
+    if (mqtt_bounded_schedule_outbox(client) != ESP_OK) return ESP_FAIL;
+    /* During RX grace, do not start another TLS write which could suspend
+     * input again. ACKs are copied into the reserved control queue. */
+    if (s->ping_grace_deadline_ms && mqtt_transport_nb_can_read(&client->nb)) return ESP_OK;
+    return mqtt_bounded_tx_step(client);
+}
+
+static esp_err_t mqtt_bounded_connect(esp_mqtt_client_handle_t client)
+{
+    mqtt_service_t *s = &client->service;
+    mqtt_config_storage_t *cfg = client->config;
+    if (xEventGroupWaitBits(client->status_bits, DISCONNECT_BIT, true, true, 0) & DISCONNECT_BIT)
+        return ESP_FAIL;
+    if (platform_tick_get_ms() >= s->connect_deadline_ms) {
+        ESP_LOGE(TAG, "bounded MQTT connection phase %u deadline", s->connect_phase);
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s->connect_phase == 0) {
+        atomic_store(&client->service_observation.operation, 1);
+        if (!client->nb.tls) {
+            client->nb.keep_alive = (tls_keep_alive_cfg_t){
+                .keep_alive_enable = cfg->tcp_keep_alive_cfg.keep_alive_enable,
+                .keep_alive_idle = cfg->tcp_keep_alive_cfg.keep_alive_idle,
+                .keep_alive_interval = cfg->tcp_keep_alive_cfg.keep_alive_interval,
+                .keep_alive_count = cfg->tcp_keep_alive_cfg.keep_alive_count,
+            };
+            client->nb.cfg = (esp_tls_cfg_t){
+                .non_block = true, .timeout_ms = 1,
+                .alpn_protos = (const char **)cfg->alpn_protos,
+                .cacert_buf = (const unsigned char *)cfg->cacert_buf,
+                .cacert_bytes = cfg->cacert_buf ? (cfg->cacert_bytes ? cfg->cacert_bytes : strlen(cfg->cacert_buf) + 1) : 0,
+                .clientcert_buf = (const unsigned char *)cfg->clientcert_buf,
+                .clientcert_bytes = cfg->clientcert_buf ? (cfg->clientcert_bytes ? cfg->clientcert_bytes : strlen(cfg->clientcert_buf) + 1) : 0,
+                .clientkey_buf = (const unsigned char *)cfg->clientkey_buf,
+                .clientkey_bytes = cfg->clientkey_buf ? (cfg->clientkey_bytes ? cfg->clientkey_bytes : strlen(cfg->clientkey_buf) + 1) : 0,
+                .clientkey_password = (const unsigned char *)cfg->clientkey_password,
+                .clientkey_password_len = cfg->clientkey_password_len,
+                .use_global_ca_store = cfg->use_global_ca_store,
+                .crt_bundle_attach = cfg->crt_bundle_attach,
+                .common_name = cfg->common_name, .skip_common_name = cfg->skip_cert_common_name_check,
+                .ciphersuites_list = cfg->ciphersuites_list, .if_name = cfg->if_name,
+                .tls_version = ESP_TLS_VER_TLS_1_2,
+                .keep_alive_cfg = &client->nb.keep_alive,
+            };
+        }
+        int connected = mqtt_transport_nb_connect(&client->nb, cfg->host, cfg->port);
+        if (connected < 0) {
+            esp_mqtt_client_dispatch_transport_error(client);
+            return ESP_FAIL;
+        }
+        if (!connected) return ESP_OK;
+        if (platform_tick_get_ms() >= s->connect_deadline_ms) return ESP_ERR_TIMEOUT;
+        s->connect_phase = 1;
+        s->connect_deadline_ms = platform_tick_get_ms() + cfg->network_timeout_ms;
+        client->wait_for_ping_resp = false;
+        client->mqtt_state.in_buffer_read_len = 0;
+        mqtt_msg_connect(&client->mqtt_state.connection, &client->mqtt_state.connection.information);
+        return mqtt_bounded_write(client);
+    }
+    if (s->connect_phase == 1) {
+        if (mqtt_bounded_tx_step(client) != ESP_OK) return ESP_FAIL;
+        if (s->head) return ESP_OK;
+        s->connect_phase = 2;
+        s->connect_deadline_ms = platform_tick_get_ms() + cfg->network_timeout_ms;
+    }
+    atomic_store(&client->service_observation.operation, 1);
+    int received = mqtt_message_receive(client, 0);
+    if (platform_tick_get_ms() >= s->connect_deadline_ms) return ESP_ERR_TIMEOUT;
+    if (received == 0 || received == -1) return ESP_OK;
+    if (received < 0 || mqtt_get_type(client->mqtt_state.in_buffer) != MQTT_MSG_TYPE_CONNACK ||
+        client->mqtt_state.message_length != 4) return ESP_FAIL;
+    int result = mqtt_get_connect_return_code(client->mqtt_state.in_buffer);
+    if (result != MQTT_CONNECTION_ACCEPTED) {
+        client->event.event_id = MQTT_EVENT_ERROR;
+        client->event.error_handle->error_type = MQTT_ERROR_TYPE_CONNECTION_REFUSED;
+        client->event.error_handle->connect_return_code = result;
+        client->event.error_handle->esp_tls_stack_err = 0;
+        client->event.error_handle->esp_tls_last_esp_err = 0;
+        client->event.error_handle->esp_tls_cert_verify_flags = 0;
+        esp_mqtt_dispatch_event_with_msgid(client);
+        return ESP_FAIL;
+    }
+    client->mqtt_state.in_buffer_read_len = 0;
+    s->rx_deadline_ms = 0;
+    s->connect_deadline_ms = 0;
+    s->last_tx_ms = platform_tick_get_ms();
+    client->event.event_id = MQTT_EVENT_CONNECTED;
+    client->event.session_present = mqtt_get_connect_session_present(client->mqtt_state.in_buffer);
+    client->state = MQTT_STATE_CONNECTED;
+    client->refresh_connection_tick = platform_tick_get_ms();
+    client->keepalive_tick = platform_tick_get_ms();
+    esp_mqtt_dispatch_event_with_msgid(client);
+    return ESP_OK;
+}
+
+static void mqtt_service_observe_end(esp_mqtt_client_handle_t client)
+{
+    uint32_t now = platform_tick_get_ms();
+    uint32_t started = atomic_load(&client->service_observation.slice_started_ms);
+    uint32_t elapsed = now - started;
+    if (elapsed > atomic_load(&client->service_observation.max_lock_ms))
+        atomic_store(&client->service_observation.max_lock_ms, elapsed);
+    atomic_store(&client->service_observation.slice_completed_ms, now);
+    mqtt_service_t *s = &client->service;
+    uint64_t timestamp = platform_tick_get_ms();
+    atomic_store(&client->service_observation.rx_remaining_ms,
+                 s->rx_deadline_ms > timestamp ? s->rx_deadline_ms - timestamp : 0);
+    atomic_store(&client->service_observation.tx_remaining_ms,
+                 s->head && s->head->deadline_ms > timestamp ? s->head->deadline_ms - timestamp : 0);
+    atomic_store(&client->service_observation.tx_frames, s->count);
+    atomic_store(&client->service_observation.tx_bytes, s->bytes);
+    atomic_store(&client->service_observation.operation, 0);
+}
+
+esp_err_t esp_mqtt_client_get_service_status(esp_mqtt_client_handle_t client,
+                                             esp_mqtt_service_status_t *status)
+{
+    if (!client || !status) return ESP_ERR_INVALID_ARG;
+#define MQTT_OBSERVE(field) status->field = atomic_load(&client->service_observation.field)
+    MQTT_OBSERVE(slice_started_ms); MQTT_OBSERVE(slice_completed_ms); MQTT_OBSERVE(max_lock_ms);
+    MQTT_OBSERVE(last_progress_ms); MQTT_OBSERVE(rx_remaining_ms); MQTT_OBSERVE(tx_remaining_ms);
+    MQTT_OBSERVE(tx_frames); MQTT_OBSERVE(tx_bytes); MQTT_OBSERVE(deadline_failures); MQTT_OBSERVE(operation);
+#undef MQTT_OBSERVE
+    return ESP_OK;
+}
+
 static void esp_mqtt_task(void *pv)
 {
     esp_mqtt_client_handle_t client = (esp_mqtt_client_handle_t) pv;
@@ -1663,6 +2060,8 @@ static void esp_mqtt_task(void *pv)
     xEventGroupClearBits(client->status_bits, STOPPED_BIT);
     while (client->run) {
         MQTT_API_LOCK(client);
+        if (client->config->bounded_service)
+            atomic_store(&client->service_observation.slice_started_ms, platform_tick_get_ms());
         run_event_loop(client);
         // delete long pending messages
         mqtt_delete_expired_messages(client);
@@ -1706,6 +2105,13 @@ static void esp_mqtt_task(void *pv)
             client->event.event_id = MQTT_EVENT_BEFORE_CONNECT;
             esp_mqtt_dispatch_event_with_msgid(client);
 
+            if (client->config->bounded_service) {
+                mqtt_transport_nb_close(&client->nb);
+                mqtt_service_clear(&client->service);
+                client->service.connect_deadline_ms = platform_tick_get_ms() + client->config->network_timeout_ms;
+                client->state = MQTT_STATE_BOUNDED_CONNECT;
+                break;
+            }
             if (esp_transport_connect(client->transport,
                                       client->config->host,
                                       client->config->port,
@@ -1731,7 +2137,20 @@ static void esp_mqtt_task(void *pv)
             client->keepalive_tick = platform_tick_get_ms();
 
             break;
+        case MQTT_STATE_BOUNDED_CONNECT:
+            {
+                esp_err_t result = mqtt_bounded_connect(client);
+                if (result == ESP_ERR_TIMEOUT) atomic_fetch_add(&client->service_observation.deadline_failures, 1);
+                if (result != ESP_OK) esp_mqtt_abort_connection(client);
+            }
+            break;
         case MQTT_STATE_CONNECTED:
+            if (client->config->bounded_service) {
+                esp_err_t result = mqtt_bounded_service(client);
+                if (result == ESP_ERR_TIMEOUT) atomic_fetch_add(&client->service_observation.deadline_failures, 1);
+                if (result != ESP_OK) esp_mqtt_abort_connection(client);
+                break;
+            }
             // check for disconnection request
             if (xEventGroupWaitBits(client->status_bits, DISCONNECT_BIT, true, true, 0) & DISCONNECT_BIT) {
                 send_disconnect_msg(client);    // ignore error, if clean disconnect fails, just abort the connection
@@ -1830,16 +2249,30 @@ static void esp_mqtt_task(void *pv)
                 ESP_LOGD(TAG, "Reconnecting...");
                 break;
             }
+            if (client->config->bounded_service) mqtt_service_observe_end(client);
             MQTT_API_UNLOCK(client);
+            /* stop() changes run/state but does not signal RECONNECT_BIT.
+             * Bound this unlocked wait too, so cancellation cannot spend
+             * half the reconnect backoff asleep after TLS has already closed. */
             xEventGroupWaitBits(client->status_bits, RECONNECT_BIT, false, true,
-                                max_poll_timeout(client, client->wait_timeout_ms / 2 / portTICK_PERIOD_MS));
+                                client->config->bounded_service
+                                ? (pdMS_TO_TICKS(MQTT_SERVICE_IDLE_MS) ? pdMS_TO_TICKS(MQTT_SERVICE_IDLE_MS) : 1)
+                                : max_poll_timeout(client, client->wait_timeout_ms / 2 / portTICK_PERIOD_MS));
             // continue the while loop instead of break, as the mutex is unlocked
             continue;
         default:
             ESP_LOGE(TAG, "MQTT client error, client is in an unrecoverable state.");
             break;
         }
+        if (client->config->bounded_service) mqtt_service_observe_end(client);
         MQTT_API_UNLOCK(client);
+        if (client->config->bounded_service &&
+            (client->state == MQTT_STATE_CONNECTED || client->state == MQTT_STATE_BOUNDED_CONNECT)) {
+            /* Always yield, even if a socket remains readable/writable. Never
+             * sleep or poll for network readiness while holding api_lock. */
+            vTaskDelay(pdMS_TO_TICKS(MQTT_SERVICE_IDLE_MS) ? pdMS_TO_TICKS(MQTT_SERVICE_IDLE_MS) : 1);
+            continue;
+        }
         if (MQTT_STATE_CONNECTED == client->state) {
             if (esp_transport_poll_read(client->transport, max_poll_timeout(client, MQTT_POLL_READ_TIMEOUT_MS)) < 0) {
                 ESP_LOGE(TAG, "Poll read error: %d, aborting connection", errno);
@@ -1848,6 +2281,9 @@ static void esp_mqtt_task(void *pv)
         }
 
     }
+    mqtt_transport_nb_close(&client->nb);
+    mqtt_service_clear(&client->service);
+    if (client->config->bounded_service) mqtt_service_observe_end(client);
     esp_transport_close(client->transport);
     outbox_delete_all_items(client->outbox);
     client->state = MQTT_STATE_DISCONNECTED;
@@ -2042,6 +2478,11 @@ int esp_mqtt_client_subscribe_multiple(esp_mqtt_client_handle_t client,
         MQTT_API_UNLOCK(client);
         return -1;
     }
+    if (client->config->bounded_service) {
+        int id = client->mqtt_state.pending_msg_id;
+        MQTT_API_UNLOCK(client);
+        return id;
+    }
     outbox_set_pending(client->outbox, client->mqtt_state.pending_msg_id, TRANSMITTED);// handle error
 
     if (esp_mqtt_write(client) != ESP_OK) {
@@ -2099,6 +2540,11 @@ int esp_mqtt_client_unsubscribe(esp_mqtt_client_handle_t client, const char *top
     if (!mqtt_enqueue(client, NULL, 0)) {
         MQTT_API_UNLOCK(client);
         return -1;
+    }
+    if (client->config->bounded_service) {
+        int id = client->mqtt_state.pending_msg_id;
+        MQTT_API_UNLOCK(client);
+        return id;
     }
     outbox_set_pending(client->outbox, client->mqtt_state.pending_msg_id, TRANSMITTED); //handle error
 
@@ -2173,6 +2619,10 @@ static inline int mqtt_client_enqueue_publish(esp_mqtt_client_handle_t client, c
 
 int esp_mqtt_client_publish(esp_mqtt_client_handle_t client, const char *topic, const char *data, int len, int qos, int retain)
 {
+    if (client && client->config->bounded_service) {
+        errno = ENOTSUP;
+        return -1;
+    }
     if (!client) {
         ESP_LOGE(TAG, "Client was not initialized");
         return -1;
@@ -2303,6 +2753,9 @@ int esp_mqtt_client_enqueue(esp_mqtt_client_handle_t client, const char *topic, 
         len = strlen(data);
     }
 
+    if (client->config->bounded_service &&
+        (len < 0 || (size_t)len + (topic ? strlen(topic) : 0) + 16 > MQTT_SERVICE_TX_BYTES - MQTT_SERVICE_CONTROL_RESERVE)) return -2;
+
     if (client->config->outbox_limit > 0) {
         if (len + outbox_get_size(client->outbox) > client->config->outbox_limit) {
             return -2;
@@ -2366,7 +2819,10 @@ static void esp_mqtt_client_dispatch_transport_error(esp_mqtt_client_handle_t cl
     client->event.error_handle->disconnect_return_code = 0;
 #endif
 #ifdef MQTT_SUPPORTED_FEATURE_TRANSPORT_ERR_REPORTING
-    client->event.error_handle->esp_tls_last_esp_err = esp_tls_get_and_clear_last_error(esp_transport_get_error_handle(client->transport),
+    esp_tls_error_handle_t error_handle = esp_transport_get_error_handle(client->transport);
+    if (client->config->bounded_service && client->nb.tls)
+        esp_tls_get_error_handle(client->nb.tls, &error_handle);
+    client->event.error_handle->esp_tls_last_esp_err = esp_tls_get_and_clear_last_error(error_handle,
             &client->event.error_handle->esp_tls_stack_err,
             &client->event.error_handle->esp_tls_cert_verify_flags);
 #ifdef MQTT_SUPPORTED_FEATURE_TRANSPORT_SOCK_ERRNO_REPORTING

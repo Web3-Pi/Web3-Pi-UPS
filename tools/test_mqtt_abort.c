@@ -6,16 +6,20 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "mqtt_outbox.h"
+#include "mqtt_service.h"
 
 #define MQTT_MSG_TYPE_PUBLISH 3
 #define MQTT_PROTOCOL_V_5 5
 #define MQTT_STATE_CONNECTED 1
 #define MQTT_STATE_WAIT_RECONNECT 2
 #define MQTT_STATE_INIT 3
+#define MQTT_STATE_BOUNDED_CONNECT 4
+#define pdMS_TO_TICKS(ms) (ms)
 #define MQTT_EVENT_DISCONNECTED 1
 #define DISCONNECT_BIT 2
 #define MQTT_POLL_READ_TIMEOUT_MS 1000
@@ -28,6 +32,7 @@ typedef struct {
     struct { int keepalive; int protocol_ver; } information;
 } connection_t;
 typedef struct {
+    bool bounded_service;
     int network_timeout_ms, reconnect_timeout_ms, message_retransmit_timeout;
     int refresh_connection_after_ms;
 } config_t;
@@ -36,10 +41,13 @@ typedef struct {
     struct {
         connection_t connection;
         uint16_t pending_msg_id;
-        int pending_msg_type, pending_publish_qos;
+        int pending_msg_type, pending_publish_qos, message_length;
         uint8_t *in_buffer;
         size_t in_buffer_read_len;
     } mqtt_state;
+    mqtt_service_t service;
+    struct { atomic_uint deadline_failures; } service_observation;
+    void *nb;
     outbox_handle_t outbox;
     void *transport;
     int state, status_bits, wait_timeout_ms;
@@ -118,6 +126,16 @@ static void esp_mqtt5_increment_packet_counter(esp_mqtt_client_handle_t client) 
 #endif
 static void esp_mqtt_abort_connection(esp_mqtt_client_handle_t client);
 static esp_err_t esp_mqtt_client_ping(esp_mqtt_client_handle_t client);
+/* This suite exercises the unchanged default mode, including both MQTT
+ * versions. The opt-in service has its own parser/transport integration suite. */
+#ifdef WUPS_CURRENT_SDK
+static esp_err_t mqtt_bounded_write(esp_mqtt_client_handle_t client)
+{ (void)client; assert(!"Legacy test entered bounded TX"); return ESP_FAIL; }
+static esp_err_t mqtt_bounded_service(esp_mqtt_client_handle_t client)
+{ (void)client; assert(!"Legacy test entered bounded service"); return ESP_FAIL; }
+static void mqtt_transport_nb_close(void *nb) { (void)nb; }
+static void vTaskDelay(int ticks) { (void)ticks; assert(!"Legacy test entered bounded delay"); }
+#endif
 
 #include "sdk_abort_excerpts.inc"
 

@@ -1,5 +1,5 @@
 idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "modem_radio_policy.c" "modem_awake_policy.c" "modem_signal.c"
-                            "modem_support_diag.c" "modem_diag_clock.c" "modem_uart_baud.c"
+                            "modem_support_diag.c" "modem_diag_clock.c" "modem_uart_baud.c" "modem_recovery.c"
                             "perf_diag.c" "transport_diag.c" "perf_bench.c"
                             "perf_recovery.c" "mqtt.c"
                             "mqtt_health.c" "mqtt_packet_guard.c" "mqtt_dispatch_queue.c"
@@ -69,8 +69,8 @@ endif()
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     idf_component_get_property(wups_mqtt_component_dir espressif__mqtt COMPONENT_DIR)
     set(wups_mqtt_sdk_pins
-        "mqtt_client.c|1a120957d6f8078a0cd27f4febac54389c5dce7f025069cad493e945d005f361"
-        "lib/include/mqtt_client_priv.h|ee8f464f6cbf77a83468126bf22d91833b9c2b8985ba5860381acb99a655c565")
+        "mqtt_client.c|b9e388e9509f40c55fa6439244423401091907f108ae3b2725228ddf612a607a"
+        "lib/include/mqtt_client_priv.h|7ffa837dbdaa68d233a8990bde79f6726930d2b04f5afa031c19d2dd615db56e")
     foreach(wups_mqtt_pin IN LISTS wups_mqtt_sdk_pins)
         string(REPLACE "|" ";" wups_mqtt_pin_parts "${wups_mqtt_pin}")
         list(GET wups_mqtt_pin_parts 0 wups_mqtt_pin_file)

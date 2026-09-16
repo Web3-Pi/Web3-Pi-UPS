@@ -90,6 +90,7 @@ def main():
         signatures = (
             "static ppp_event_state_t ppp_events_snapshot(",
             "bool modem_ppp_is_up(",
+            "uint32_t modem_ppp_generation(",
             "static void ppp_events_begin_attempt(",
             "static void ppp_events_start_dial(",
             "static void ppp_events_begin_stop(",

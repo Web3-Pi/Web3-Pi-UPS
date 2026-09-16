@@ -4,6 +4,7 @@
 #include "modem_awake_policy.h"
 #include "modem_support_diag.h"
 #include "modem_diag_clock.h"
+#include "modem_recovery.h"
 #include "modem_uart_baud.h"
 #include "mqtt.h"
 #include "identity.h"
@@ -229,6 +230,7 @@ typedef struct {
     int32_t error;
     uint32_t attempt;
     uint32_t sequence;
+    uint32_t generation; /* new UP edge, including DOWN -> GOT in one attempt */
     bool had_ip;
 } ppp_event_state_t;
 
@@ -248,6 +250,12 @@ static ppp_event_state_t ppp_events_snapshot(void)
 bool modem_ppp_is_up(void)
 {
     return ppp_events_snapshot().phase == PPP_UP;
+}
+
+uint32_t modem_ppp_generation(void)
+{
+    ppp_event_state_t state = ppp_events_snapshot();
+    return state.phase == PPP_UP ? state.generation : 0;
 }
 
 static void ppp_events_begin_attempt(void)
@@ -310,6 +318,8 @@ static bool ppp_events_observe(ppp_observation_t observation, int32_t error)
         s_ppp_state.observation = observation;
         s_ppp_state.error = error;
         if (observation == PPP_OBS_GOT_IP) {
+            if (before != PPP_UP && ++s_ppp_state.generation == 0)
+                ++s_ppp_state.generation; /* zero means no current interface */
             s_ppp_state.phase = PPP_UP;
             s_ppp_state.had_ip = true;
         } else if (observation == PPP_OBS_ERROR || s_ppp_state.had_ip) {
@@ -577,11 +587,23 @@ static bool modem_awake_check_before_ppp(void)
     return false;
 }
 
+static modem_recovery_t s_uplink_recovery;
+
+static void modem_registration_snapshot(void)
+{
+    char reply[MODEM_RADIO_RESPONSE_CAPACITY];
+    if (radio_at(NULL, "AT+CEREG?", reply, sizeof(reply), 3000) &&
+        modem_recovery_observe_registration(&s_uplink_recovery, reply, now_s())) {
+        ESP_LOGI(MODEM_TAG, "LTE registration returned: one bounded %us recovery opportunity",
+                 (unsigned)MODEM_RECOVERY_REG_GRACE_S);
+    }
+}
+
 static void modem_network_snapshot(const char *reason)
 {
     char reply[MODEM_RADIO_RESPONSE_CAPACITY];
     ESP_LOGI(MODEM_TAG, "network snapshot: %s", reason);
-    (void)radio_at(NULL, "AT+CEREG?", reply, sizeof(reply), 3000);
+    modem_registration_snapshot();
     (void)radio_at(NULL, "AT+COPS?", reply, sizeof(reply), 3000);
     (void)radio_at(NULL, "AT+CPSI?", reply, sizeof(reply), 3000);
 }
@@ -1562,6 +1584,41 @@ static void uplink_health(bool *up, bool *wd_ok, bool *ota_ok)
     }
 }
 
+typedef struct {
+    ppp_event_state_t ppp;
+    mqtt_health_snapshot_t mqtt;
+    int backend;
+} modem_recovery_commit_t;
+
+/* Called under OTA -> MQTT guards. Only the short PPP state transition is
+ * committed here; DNS, AT, SDK calls and logging stay outside all locks. */
+static bool modem_recovery_commit_ppp(void *context)
+{
+    const modem_recovery_commit_t *expected = context;
+    portENTER_CRITICAL(&s_ppp_event_lock);
+    bool current = s_ppp_state.phase == PPP_UP &&
+        s_ppp_state.attempt == expected->ppp.attempt &&
+        s_ppp_state.sequence == expected->ppp.sequence;
+    if (current) {
+        s_ppp_state.phase = PPP_STOPPING;
+        s_ppp_state.sequence++;
+    }
+    portEXIT_CRITICAL(&s_ppp_event_lock);
+    return current;
+}
+
+static bool modem_recovery_commit_backend(void *context)
+{
+    const modem_recovery_commit_t *expected = context;
+    if (backend_mode_get() != expected->backend) return false;
+    if (expected->backend == WUPS_BACKEND_MODE_MQTT)
+        return mqtt_recovery_try_commit(&expected->mqtt, modem_recovery_commit_ppp, context);
+    /* HTTP/Arkiv accessors may take task mutexes. Their final health check
+     * runs immediately before the OTA guard, never under this spinlock.
+     * Preserve that backend policy without importing blocking I/O here. */
+    return modem_recovery_commit_ppp(context);
+}
+
 /* Runs while PPP is up (and ONLY then — bring-up/backoff never get here).
  * Every PPP_SUPERVISE_TICK_MS: check uplink health, poll signal quality and
  * emit net.status (CMUX sessions), and pace the alert-clear re-sends.
@@ -1569,6 +1626,7 @@ static void uplink_health(bool *up, bool *wd_ok, bool *ota_ok)
  * uplink watchdog trips (module reset / power-cycle per s_uplink_trips). */
 static teardown_action_t supervise_uplink(void)
 {
+    modem_recovery_init(&s_uplink_recovery);
     uint32_t last_healthy_s  = now_s();  /* watchdog timer starts at GOT_IP */
     uint32_t last_clear_s    = now_s();  /* GOT_IP path just sent a clear    */
     uint32_t last_radio_snapshot_s = now_s();
@@ -1621,6 +1679,7 @@ static teardown_action_t supervise_uplink(void)
         bool uplink_up = false, wd_healthy = false, ota_proof = false;
         uplink_health(&uplink_up, &wd_healthy, &ota_proof);
         if (wd_healthy) {
+            modem_recovery_backend_healthy(&s_uplink_recovery);
             last_healthy_s = now;
             /* OTA-1 rollback — first demonstrably healthy uplink marks a
              * pending-verify OTA image valid (one-shot, no-op otherwise).
@@ -1674,7 +1733,7 @@ static teardown_action_t supervise_uplink(void)
                 char reply[MODEM_RADIO_RESPONSE_CAPACITY];
                 ESP_LOGI(MODEM_TAG, "network snapshot: %s",
                          radio_snapshot_pending ? "MQTT disconnected" : "periodic");
-                (void)radio_at(NULL, "AT+CEREG?", reply, sizeof(reply), 3000);
+                modem_registration_snapshot();
                 (void)radio_at(NULL, "AT+COPS?", reply, sizeof(reply), 3000);
                 last_radio_snapshot_s = now;
                 support_due = true;
@@ -1728,6 +1787,10 @@ static teardown_action_t supervise_uplink(void)
          * reset ladder. Neither result identifies the operator/backend root
          * cause. Connected/degraded MQTT and a stalled worker are held below. */
         if (now - last_healthy_s >= UPLINK_DEAD_SECS) {
+            modem_recovery_commit_t recovery = {
+                .ppp = ppp_events_snapshot(),
+                .backend = backend_mode_get(),
+            };
             /* A live MQTT session with stale publication proof, or an SDK
              * worker stuck in its own call, is handled by the independent
              * MQTT monitor. A modem reset cannot safely unstick that task.
@@ -1736,6 +1799,7 @@ static teardown_action_t supervise_uplink(void)
             bool mqtt_owned_fault = false;
             if (backend_mode_get() == WUPS_BACKEND_MODE_MQTT) {
                 mqtt_get_health(&mqtt_health);
+                recovery.mqtt = mqtt_health;
                 mqtt_owned_fault = mqtt_health.connected || mqtt_health.worker_stalled;
             }
             /* The hold must never cover a client that cannot even attempt
@@ -1779,6 +1843,10 @@ static teardown_action_t supervise_uplink(void)
                 last_healthy_s = now_s();
                 continue;
             }
+            /* A public DNS timeout cannot overrule new backend evidence. */
+            uplink_health(&uplink_up, &wd_healthy, &ota_proof);
+            if (wd_healthy) continue;
+            if (modem_recovery_grace_active(&s_uplink_recovery, now_s())) continue;
             if (s_cmux_active) modem_network_snapshot("uplink recovery");
             /* The final AT snapshot can overlap a new OTA or a real loss. */
             if (ppp_events_take_loss())
@@ -1788,6 +1856,14 @@ static teardown_action_t supervise_uplink(void)
                 continue;
             }
             now = now_s();
+            uplink_health(&uplink_up, &wd_healthy, &ota_proof);
+            if (wd_healthy) continue;
+            if (modem_recovery_grace_active(&s_uplink_recovery, now)) continue;
+            /* Linearization point: current backend state and PPP observation
+             * must still permit teardown. OTA owns the outer guard and keeps
+             * new transfers out until ppp_teardown_dce has finished. */
+            if (!fw_ota_try_modem_recovery(modem_recovery_commit_backend, &recovery))
+                continue;
             s_uplink_trips++;
             s_fail_stage = MODEM_FAIL_NET;
             s_fails_since_ok++;
@@ -1945,6 +2021,7 @@ static void ppp_supervisor_task(void *arg)
 
 stop_ppp:
         ppp_teardown_dce(teardown);
+        fw_ota_finish_modem_recovery();
 
         /* When degraded, power-cycle the modem more often: a hot-inserted SIM
          * or restored signal is only picked up on a modem re-init, so frequent

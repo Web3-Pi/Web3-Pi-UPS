@@ -13,10 +13,17 @@ typedef struct {
              struct { const char *password; } authentication; } credentials;
     struct { struct { const char *topic, *msg; int msg_len, qos, retain; } last_will;
              int keepalive; } session;
-    struct { int timeout_ms; bool disable_auto_reconnect; } network;
+    struct { int timeout_ms; bool disable_auto_reconnect, bounded_service; } network;
     struct { size_t limit; } outbox;
     struct { int stack_size; } task;
 } esp_mqtt_client_config_t;
+typedef struct {
+    uint32_t slice_started_ms, slice_completed_ms, max_lock_ms;
+    uint32_t last_progress_ms, rx_remaining_ms, tx_remaining_ms;
+    uint32_t tx_frames, tx_bytes, deadline_failures, operation;
+} esp_mqtt_service_status_t;
+esp_err_t esp_mqtt_client_get_service_status(esp_mqtt_client_handle_t client,
+                                             esp_mqtt_service_status_t *status);
 typedef struct {
     int error_type, connect_return_code, esp_tls_last_esp_err, esp_transport_sock_errno;
 } esp_mqtt_error_codes_t;

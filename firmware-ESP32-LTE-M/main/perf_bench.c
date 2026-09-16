@@ -246,6 +246,11 @@ static bool baseline_ready(void)
 static void coordinator_task(void *arg)
 {
     (void)arg;
+#if CONFIG_WUPS_PERF_RECOVERY_ONLY
+    ESP_LOGI(TAG, "recovery_only: synthetic duplex skipped by test profile");
+    perf_recovery_run();
+    goto finished;
+#endif
     if (!baseline_ready()) goto finished;
     EventGroupHandle_t gate = xEventGroupCreate();
     if (!gate) {
