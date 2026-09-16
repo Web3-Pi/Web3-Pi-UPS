@@ -4,10 +4,10 @@
 #  production card has a different flash size AND a different GPIO/PMU pinout.)
 # Delete sdkconfig if you want a clean rebuild from these defaults.
 
-# --- CPU clock: A-240 experiment (communication settings unchanged) ---
+# --- ESP32-S3 CPU profile promoted from research ---
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
-# --- Research UART experiment; CPU stays at the tested 240 MHz baseline ---
+# --- Configured modem UART rate; see README for OTA migration safeguards ---
 CONFIG_WUPS_MODEM_UART_230400=y
 
 # --- Console (USB-Serial-JTAG over USB-C) ---

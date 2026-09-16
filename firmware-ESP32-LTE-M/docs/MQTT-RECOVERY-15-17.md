@@ -90,6 +90,9 @@ start requests keep their existing schedule.
   boundaries, transport/auth retry schedules and reset arbitration.
 - `tools/test_fw_ota_policy.py`: competing OTA/recovery claims and the existing
   image confirmation/rollback gates.
+- `tools/test_modem_uart_boot_policy.py`: the actual boot-time UART selector
+  and OTA confirmation/rollback functions, both configured baud rates, state
+  query failures and a selection retained through validation and retries.
 
 Host fault injection verifies control flow and timing policy; it does not
 emulate radio, TLS cryptography or ESP32 scheduling. Hardware results must name
@@ -160,3 +163,35 @@ successful hardware reconnect cycles. The final normal image is
 `0.8.16-1nce-240-c1`; the existing APN, UART and CPU/core profile is preserved.
 USB tests wrote only OTA metadata and the OTA0 application slot. The original
 OTA1 image, provisioning, NVS, bootloader and partition table were preserved.
+
+## Integration into main, 2026-09-16
+
+The integration adds a boot-time UART migration guard after the hardware
+qualification above. The modem's persistent `AT+IPR` setting stays at 115200
+during an unconfirmed OTA boot, allowing rollback to the earlier 115200-only
+`main` firmware. Only a running partition already in OTA state `VALID` at
+modem initialization may use the configured 230400 rate. Every other state
+or failed query selects 115200 for the entire boot; confirmation does not
+promote the rate until a later boot. This also leaves serial-flashed images
+without a `VALID` OTA state at 115200.
+
+The guard protects the first migration from a modem initially at 115200. It
+does not undo an earlier persistent rate change before the application runs,
+and a later manual downgrade to legacy firmware still requires restoring
+115200 first, as described in the firmware README.
+
+All 31 MQTT/modem/OTA host suites passed under Linux ASan and UBSan on the
+integration tree. The new boot-policy test exercised 178 checks for each
+configured baud, including the unchanged 600-second rollback deadline; the
+bring-up harness also checked the selected rate at both the AT preparation
+and DTE boundaries. A fresh default-APN ESP32 build passed, and both modem
+core-affinity profiles passed 268 checks each under native UBSan. These are
+host/build checks. The additional guard has not been
+flashed or subjected to physical power-failure testing; its first-migration
+rollback ordering was independently reviewed against the pinned IDF v6.0.2
+bootloader and OTA implementation.
+
+Clean-build defaults retain the research CPU 240 MHz / UART 230400 settings,
+with modem CPU1 affinity, TX0 and diagnostics optional. The earlier hardware
+qualification used CPU1 and TX0 explicitly. Synthetic traffic and reconnect
+benchmarks remain disabled by default.

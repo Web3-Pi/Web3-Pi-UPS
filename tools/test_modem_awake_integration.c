@@ -44,6 +44,8 @@ static struct {
     size_t log_length;
 } host;
 static int s_fail_stage;
+/* OTA UART selection is exercised by test_modem_uart_boot_policy.py. */
+static void modem_select_boot_baud(void) {}
 
 static void log_message(const char *tag, const char *format, ...)
 {

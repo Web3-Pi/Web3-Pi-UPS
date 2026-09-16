@@ -36,6 +36,7 @@
 #include "esp_intr_alloc.h"
 #endif
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_modem_api.h"
 #include "esp_modem_config.h"
 #include "esp_netif.h"
@@ -63,6 +64,13 @@
 
 #define MODEM_UART        UART_NUM_1
 #define MODEM_BAUD        CONFIG_WUPS_MODEM_UART_BAUD
+
+/* AT+IPR persists across ESP resets. A trial OTA image must leave the
+ * legacy image's 115200 UART usable if the bootloader rolls back. This
+ * selection is latched before UART startup and never promoted in this
+ * boot, even after fw_ota marks the image VALID. */
+static int s_modem_boot_baud = 115200;
+static bool s_modem_boot_baud_latched;
 
 static const modem_uart_baud_config_t s_modem_uart_config = {
     .port = MODEM_UART, .tx_gpio = MODEM_TX_GPIO, .rx_gpio = MODEM_RX_GPIO,
@@ -686,8 +694,27 @@ static void emit_net_status(uint8_t state, int8_t rssi_dbm,
     s_ns_last_emit_s = now_s();
 }
 
+static void modem_select_boot_baud(void)
+{
+    if (s_modem_boot_baud_latched) return;
+    s_modem_boot_baud_latched = true;
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    esp_err_t err = running ? esp_ota_get_state_partition(running, &state)
+                            : ESP_ERR_NOT_FOUND;
+    if (err == ESP_OK && state == ESP_OTA_IMG_VALID) {
+        s_modem_boot_baud = MODEM_BAUD;
+    } else {
+        ESP_LOGW(MODEM_TAG, "UART held at 115200 for this boot: OTA state=%d (%s); "
+                           "configured baud=%d requires a VALID boot",
+                 (int)state, esp_err_to_name(err), MODEM_BAUD);
+    }
+}
+
 esp_err_t modem_init(void)
 {
+    modem_select_boot_baud();
     /* Preload LOW before enabling either output: PWRKEY stays released
      * through Q501; DTR wakes a UART left in CSCLK=1 by an earlier image.
      * Keep DTR LOW across modem resets/redials. It does not wake PSM. */
@@ -1012,7 +1039,7 @@ static esp_err_t ppp_bringup_dce(void)
 #endif
     /* Own the temporary raw UART only before creating esp_modem. Confirm
      * both the physical rate and saved IPR on every retry before PPP/CMUX. */
-    if (!modem_uart_baud_prepare(&s_modem_uart_config, MODEM_BAUD)) {
+    if (!modem_uart_baud_prepare(&s_modem_uart_config, s_modem_boot_baud)) {
         ESP_LOGE(MODEM_TAG, "UART baud configuration not confirmed; PPP blocked");
         s_fail_stage = MODEM_FAIL_AT;
         return ESP_FAIL;
@@ -1026,7 +1053,7 @@ static esp_err_t ppp_bringup_dce(void)
     dte_cfg.uart_config.cts_io_num  = -1;
     dte_cfg.uart_config.flow_control = ESP_MODEM_FLOW_CONTROL_NONE;
     dte_cfg.uart_config.port_num   = MODEM_UART;
-    dte_cfg.uart_config.baud_rate  = MODEM_BAUD;
+    dte_cfg.uart_config.baud_rate  = s_modem_boot_baud;
     dte_cfg.uart_config.tx_buffer_size = CONFIG_WUPS_MODEM_TX_BUFFER_SIZE;
 
     /* DCE = Data Circuit-terminating Equipment side (the modem). The 1nce
@@ -2104,7 +2131,7 @@ static void raw_uart_diag_task(void *arg)
 {
     (void)arg;
     uart_config_t cfg = {
-        .baud_rate  = MODEM_BAUD,
+        .baud_rate  = s_modem_boot_baud,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
@@ -2117,7 +2144,7 @@ static void raw_uart_diag_task(void *arg)
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     ESP_LOGW(MODEM_TAG, "MODEM_UART_DIAG: raw AT sweep on UART%d TX=GPIO%d RX=GPIO%d @ %d "
                         "(no esp_modem, no power-cycle)",
-             MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO, MODEM_BAUD);
+             MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO, s_modem_boot_baud);
     bool scanned = false;  /* one-shot AT+COPS=? — blocks the loop ~2.5 min */
     for (;;) {
         ESP_LOGI(MODEM_TAG, "================ DIAG AT sweep ================");

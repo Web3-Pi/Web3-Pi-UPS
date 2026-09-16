@@ -237,7 +237,7 @@ identify which firmware is installed on a particular device.
 |---|---|---|---|
 | CH32X035 power controller | `ch32x:1.1.1` | WCH GCC / MounRiver Studio 2 | [README](firmware-ch32x/README.md) |
 | RP2040 UI and router | `rp2040:1.2.4` | PlatformIO, arduino-pico 5.6.1 | [README](firmware-rp2040/README.md) |
-| ESP32-S3 LTE-M card | `esp32:0.8.15` | ESP-IDF v6.0.2 | [README](firmware-ESP32-LTE-M/README.md) |
+| ESP32-S3 LTE-M card | `esp32:0.8.16` | ESP-IDF v6.0.2 | [README](firmware-ESP32-LTE-M/README.md) |
 
 Build from this repository root, with the corresponding toolchain available:
 
@@ -257,7 +257,10 @@ idf.py build
 Use each firmware README for flashing instructions and device-specific update
 requirements. RP2040 1.2.4 defaults to OLED brightness **Lvl 1/6** and migrates
 older saved brightness settings while preserving the sound preference. ESP32
-0.8.15 adds SINR telemetry and separately selectable fixed-APN builds.
+0.8.16 adds bounded MQTT service and recovery fixes, plus the CPU/UART work
+from `research`; SINR telemetry and separately selectable fixed-APN builds
+remain available. See the ESP32 README for persistent UART migration and
+legacy downgrade requirements.
 
 [GitHub Actions](.github/workflows/firmware-ci.yml) builds all three targets
 and runs host regressions for MQTT, modem recovery, OTA and protocol handling.

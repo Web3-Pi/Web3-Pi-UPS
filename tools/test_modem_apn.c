@@ -41,6 +41,9 @@ static bool s_iccid_known, s_cmux_active, s_cmux_dirty;
 static int64_t s_cmux_fallback_since_s;
 typedef struct { int port, tx_gpio, rx_gpio; } modem_uart_baud_config_t;
 static const modem_uart_baud_config_t s_modem_uart_config = {1, 2, 4};
+/* Boot OTA selection has its own integration test; this harness checks
+ * prepare/DTE propagation for both the fallback and configured baud. */
+static int s_modem_boot_baud = CONFIG_WUPS_MODEM_UART_BAUD;
 
 static struct {
     esp_modem_dce_t dce;
@@ -65,7 +68,7 @@ static esp_err_t esp_intr_dump(FILE *output)
 
 static bool modem_uart_baud_prepare(const modem_uart_baud_config_t *config, int baud)
 {
-    CHECK(config == &s_modem_uart_config && baud == CONFIG_WUPS_MODEM_UART_BAUD);
+    CHECK(config == &s_modem_uart_config && baud == s_modem_boot_baud);
     CHECK(host.create_calls == 0 && host.mode_calls == 0);
     host.baud_ready = !host.fail_baud;
     return host.baud_ready;
@@ -99,7 +102,7 @@ static esp_modem_dce_t *esp_modem_new_dev(int model,
                                          const void *ppp_netif)
 {
     CHECK(model == ESP_MODEM_DCE_SIM7070 && dte != NULL && ppp_netif == &netif);
-    CHECK(host.baud_ready && dte->uart_config.baud_rate == CONFIG_WUPS_MODEM_UART_BAUD);
+    CHECK(host.baud_ready && dte->uart_config.baud_rate == s_modem_boot_baud);
     CHECK(dte->uart_config.tx_buffer_size == CONFIG_WUPS_MODEM_TX_BUFFER_SIZE);
     CHECK(config != NULL && strlen(config->apn) < sizeof(host.dce.copied_apn));
     /* The real SDK copies config->apn into PdpContext at construction. */
@@ -454,6 +457,14 @@ int main(void)
 {
     boot_apn = s_apn;
     CHECK(!strcmp(boot_apn, profile_apn("sensor.net")));
+    /* A pending boot must pass the selected fallback to BOTH the saved
+     * AT+IPR preparation and DTE, also on retries after image validation. */
+    s_modem_boot_baud = 115200;
+    cold_boot("+CCID: 8988228066614189920\r\nOK\r\n", "iot.1nce.net");
+    check_success("sensor.net", true, false);
+    next_attempt();
+    check_success("iot.1nce.net", false, false);
+    s_modem_boot_baud = CONFIG_WUPS_MODEM_UART_BAUD;
     test_profiles();
     test_registration_retry();
     test_failures();
