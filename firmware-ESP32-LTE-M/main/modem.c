@@ -15,6 +15,9 @@
 #include "arkiv_ws.h"
 #include "arkiv_rpc.h"
 #include "fw_ota.h"
+#if CONFIG_WUPS_PERF_RECOVERY_BENCH
+#include "perf_recovery.h"
+#endif
 #include "../../common/protocol.h"
 
 #include <ctype.h>
@@ -28,6 +31,9 @@
 #include "driver/uart.h"
 #include "esp_event.h"
 #include "esp_http_client.h"
+#if CONFIG_WUPS_PERF_DIAG
+#include "esp_intr_alloc.h"
+#endif
 #include "esp_log.h"
 #include "esp_modem_api.h"
 #include "esp_modem_config.h"
@@ -974,6 +980,14 @@ static int s_reg_timeout_streak = 0;
  * to acquire an IP — caller waits for the ordered PPP lifecycle state. */
 static esp_err_t ppp_bringup_dce(void)
 {
+#if CONFIG_WUPS_MODEM_CORE1
+    /* The driver constructor allocates its ISR synchronously on this core.
+     * Check both affinity and current core before every creation/recovery. */
+    if (xTaskGetCoreID(NULL) != 1 || xPortGetCoreID() != 1) {
+        ESP_LOGE(MODEM_TAG, "B-UART: UART1 creator must be pinned to CPU1; PPP blocked");
+        return ESP_ERR_INVALID_STATE;
+    }
+#endif
     /* Own the temporary raw UART only before creating esp_modem. Confirm
      * both the physical rate and saved IPR on every retry before PPP/CMUX. */
     if (!modem_uart_baud_prepare(&s_modem_uart_config, MODEM_BAUD)) {
@@ -1009,6 +1023,14 @@ static esp_err_t ppp_bringup_dce(void)
         return ESP_FAIL;
     }
     ESP_LOGI(MODEM_TAG, "DCE created (SIM7070 class)");
+#if CONFIG_WUPS_PERF_DIAG
+    /* The allocator's own table is evidence of actual ISR placement, unlike
+     * a core sampled when uart_driver_install returns. Dump every new DCE. */
+    ESP_LOGI(MODEM_TAG, "interrupt_dump begin uart=1 creator_core=%d creator_affinity=%d",
+             xPortGetCoreID(), xTaskGetCoreID(NULL) == tskNO_AFFINITY ? -1 : (int)xTaskGetCoreID(NULL));
+    esp_err_t dump_result = esp_intr_dump(NULL);
+    ESP_LOGI(MODEM_TAG, "interrupt_dump end uart=1 status=%s", esp_err_to_name(dump_result));
+#endif
 
     /* Probe the modem at AT level a few times so we know it's awake before
      * we tell esp_modem to switch to PPP/data mode. esp_modem starts in
@@ -1590,6 +1612,12 @@ static teardown_action_t supervise_uplink(void)
             continue;
         }
 
+#if CONFIG_WUPS_PERF_RECOVERY_BENCH
+        if (perf_recovery_take_request()) {
+            ESP_LOGI("perf_recovery", "accepted owner_core=%d", xPortGetCoreID());
+            return TEARDOWN_NORMAL;
+        }
+#endif
         bool uplink_up = false, wd_healthy = false, ota_proof = false;
         uplink_health(&uplink_up, &wd_healthy, &ota_proof);
         if (wd_healthy) {
@@ -1790,6 +1818,12 @@ static teardown_action_t supervise_uplink(void)
 static void ppp_supervisor_task(void *arg)
 {
     (void)arg;
+#if CONFIG_WUPS_PERF_DIAG
+    BaseType_t affinity = xTaskGetCoreID(NULL);
+    ESP_LOGI(MODEM_TAG, "affinity task=ppp_sup running_core=%d affinity=%d priority=%u stack_bytes=8192",
+             xPortGetCoreID(), affinity == tskNO_AFFINITY ? -1 : (int)affinity,
+             (unsigned)uxTaskPriorityGet(NULL));
+#endif
 
     /* esp_modem requires a default event loop + esp_netif initialized. */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -2051,7 +2085,15 @@ void modem_at_pass_through_start(void)
      * success, and then runs forever — re-creating the DCE whenever PPP
      * drops so production devices don't go silent on a transient cellular
      * outage. */
+#if CONFIG_WUPS_MODEM_CORE1
+    BaseType_t created = xTaskCreatePinnedToCore(ppp_supervisor_task, "ppp_sup", 8192, NULL, 5, NULL, 1);
+    if (created != pdPASS) {
+        ESP_LOGE(MODEM_TAG, "B-UART: PPP supervisor creation failed");
+        return;
+    }
+#else
     xTaskCreate(ppp_supervisor_task, "ppp_sup", 8192, NULL, 5, NULL);
+#endif
     ESP_LOGI(MODEM_TAG, "PPP supervisor task started (esp_modem)");
 #endif
 }

@@ -11,3 +11,8 @@ idf_build_set_property(MINIMAL_BUILD ON)
 # to agree on it (a per-component define would be an ABI mismatch).
 idf_build_set_property(COMPILE_OPTIONS "-DMIB2_STATS=1" APPEND)
 project(firmware-ESP32-LTE-M)
+
+# Generate the same reviewed modem UART source for both affinity profiles.
+# Only build-directory copies change; managed components and SDK stay pristine.
+include(cmake/wups_modem_core1.cmake)
+wups_apply_modem_core1_overlay()

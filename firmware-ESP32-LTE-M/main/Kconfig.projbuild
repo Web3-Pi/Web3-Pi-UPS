@@ -35,6 +35,18 @@ menu "Web3 Pi modem UART"
         default 0 if WUPS_MODEM_TX_UNBUFFERED
         default 512
 
+    config WUPS_MODEM_CORE1
+        bool "Pin PPP supervisor and modem UART1 task to CPU1 (B-UART)"
+        default n
+        depends on !FREERTOS_SMP && FREERTOS_NUMBER_OF_CORES = 2
+        help
+            Pin ppp_sup and the esp_modem UART1 event task to CPU1. UART1
+            driver creation is synchronous in the pinned supervisor, so its
+            interrupt is also allocated on CPU1. Keep baud, RX/TX buffers,
+            task priorities and all other task affinities unchanged.
+            With performance diagnostics enabled, task affinity and the
+            interrupt allocation table are logged on every DCE creation.
+
     config WUPS_PERF_DIAG
         bool "Sparse CPU, memory and transport diagnostics"
         default n
@@ -56,5 +68,15 @@ menu "Web3 Pi modem UART"
             upload 512 KiB concurrently using Cloudflare speedtest endpoints.
             Uploads contain only synthetic zero bytes. Runs once per boot;
             leave disabled in images intended for normal device operation.
+
+    config WUPS_PERF_RECOVERY_BENCH
+        bool "Two orderly modem reconnect cycles after duplex benchmark"
+        default n
+        depends on WUPS_PERF_BENCH
+        help
+            Request two owner-controlled modem teardown/recreate cycles
+            after the synthetic duplex transfer. This exercises normal DCE
+            recreation, not RF fault simulation. Keep disabled outside the
+            research comparison; no asynchronous power-key toggles.
 
 endmenu

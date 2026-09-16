@@ -1,11 +1,10 @@
 # Pulled from the ESP Component Registry. Source on GitHub:
 #   https://github.com/espressif/esp-protocols/tree/master/components/esp_modem
 #
-# We use the ^ operator for esp_modem so we automatically pick up patch / minor
-# updates within the current major. esp-protocols stays compatible across minor
-# versions.
+# The reviewed UART task affinity overlay checks pristine 1.4.2 source hashes.
+# Review that overlay and its host tests before updating this exact dependency.
 dependencies:
-  espressif/esp_modem: "^1"
+  espressif/esp_modem: "1.4.2"
   # esp-mqtt was moved out of the ESP-IDF tree into the component manager
   # in v6.0+. Same code, just a different home.
   # Exact 1.0.0 build inputs with the local resend/abort fix; see component provenance.

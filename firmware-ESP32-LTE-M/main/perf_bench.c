@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "mqtt.h"
 #include "perf_diag.h"
+#include "perf_recovery.h"
 
 #define BENCH_BYTES 524288u
 #define BENCH_BUFFER 1024u
@@ -30,6 +31,7 @@
 #define BENCH_BASELINE_US INT64_C(120000000)
 #define BENCH_PROGRESS_US INT64_C(30000000)
 #define BENCH_WORKER_STACK 6144u
+#define BENCH_COORDINATOR_STACK 4096u
 #define BENCH_GO BIT0
 #define BENCH_ABORT BIT1
 #define BENCH_DOWNLOAD_DONE BIT2
@@ -41,6 +43,7 @@ static const char *UPLOAD_URL = "https://speed.cloudflare.com/__up";
 
 typedef struct {
     bool upload;
+    bool complete;
     EventGroupHandle_t gate;
     EventBits_t done_bit;
 } worker_config_t;
@@ -187,6 +190,7 @@ cleanup:
     esp_http_client_cleanup(client);
 finished:
     if (!within_deadline(deadline, &error)) complete = false;
+    worker->complete = complete;
     ESP_LOGI(TAG, "end kind=synthetic_duplex role=%s bytes=%" PRIu32
              " response_bytes=%" PRIu32 " http=%d elapsed_ms=%" PRId64
              " error=%s io_rc=%d complete=%d stage=%s worker_stack_free=%u",
@@ -278,10 +282,17 @@ static void coordinator_task(void *arg)
     perf_diag_cpu_delta(&before, &after,
                        sample_us + UINT64_C(2000000) / configTICK_RATE_HZ, &delta);
     ESP_LOGI(TAG, "round_end kind=synthetic_duplex repeats=0 wall_us=%" PRIu64
-             " busy0_bp=%" PRId32 " busy1_bp=%" PRId32 " valid_mask=%" PRIu32,
+             " busy0_bp=%" PRId32 " busy1_bp=%" PRId32 " valid_mask=%" PRIu32
+             " coordinator_stack_free=%u",
              delta.interval_us,
              delta.idle_bp[0] < 0 ? -1 : 10000 - delta.idle_bp[0],
-             delta.idle_bp[1] < 0 ? -1 : 10000 - delta.idle_bp[1], delta.valid_mask);
+             delta.idle_bp[1] < 0 ? -1 : 10000 - delta.idle_bp[1], delta.valid_mask,
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    if (s_workers[0].complete && s_workers[1].complete) {
+        perf_recovery_run();
+    } else {
+        ESP_LOGW(TAG, "recovery_skipped reason=duplex_incomplete");
+    }
 finished:
     vTaskDelete(NULL);
 }
@@ -290,7 +301,8 @@ void perf_bench_start(void)
 {
     if (s_started) return;
     s_started = true;
-    if (xTaskCreate(coordinator_task, "bench_wait", 3072, NULL, 1, NULL) != pdPASS)
+    if (xTaskCreate(coordinator_task, "bench_wait", BENCH_COORDINATOR_STACK,
+                    NULL, 1, NULL) != pdPASS)
         ESP_LOGE(TAG, "skip kind=synthetic_duplex reason=coordinator_allocation");
 }
 

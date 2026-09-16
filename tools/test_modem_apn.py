@@ -9,6 +9,7 @@ ASan/UBSan are enabled by default, with the same explicit override as other
 MQTT/modem host tests. This is not a hardware registration test.
 """
 import hashlib
+from itertools import product
 import os
 from pathlib import Path
 import re
@@ -49,19 +50,20 @@ def main():
         temporary = Path(directory)
         include = temporary / "modem_apn_bringup.inc"
         include.write_text(extracted)
-        for tx_size in (512, 0):
+        for core1, tx_size in product((0, 1), (512, 0)):
             for profile, apn in (("auto", ""), ("1nce", "iot.1nce.net"), ("sensor", "sensor.net")):
-                binary = temporary / ("test_modem_apn_" + profile + "_tx" + str(tx_size))
+                binary = temporary / (f"test_modem_apn_{profile}_tx{tx_size}_core1{core1}")
                 command = shlex.split(os.environ.get("CC", "cc")) + [
                     "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-pedantic",
                     "-DCONFIG_WUPS_MODEM_UART_BAUD=230400",
                     "-DCONFIG_WUPS_MODEM_TX_BUFFER_SIZE=" + str(tx_size),
+                    "-DCONFIG_WUPS_MODEM_CORE1=" + str(core1), "-DCONFIG_WUPS_PERF_DIAG=1",
                     "-I", str(temporary), str(root / "tools/test_modem_apn.c"), "-o", str(binary)]
                 if apn:
                     command += ['-DWUPS_FIXED_APN="' + apn + '"']
                 if sanitizers:
                     command += ["-fsanitize=" + sanitizers, "-fno-omit-frame-pointer"]
-                print("Build/test APN profile=" + profile + " TX buffer=" + str(tx_size), flush=True)
+                print(f"Build/test APN profile={profile} TX buffer={tx_size} core1={core1}", flush=True)
                 subprocess.run(command, check=True, timeout=30)
                 subprocess.run([str(binary)], check=True, timeout=30)
 

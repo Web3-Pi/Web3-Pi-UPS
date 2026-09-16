@@ -1,6 +1,7 @@
 idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "modem_radio_policy.c" "modem_awake_policy.c" "modem_signal.c"
                             "modem_support_diag.c" "modem_diag_clock.c" "modem_uart_baud.c"
-                            "perf_diag.c" "transport_diag.c" "perf_bench.c" "mqtt.c"
+                            "perf_diag.c" "transport_diag.c" "perf_bench.c"
+                            "perf_recovery.c" "mqtt.c"
                             "mqtt_health.c" "mqtt_packet_guard.c" "mqtt_dispatch_queue.c"
                             "mqtt_sdk_adapter.c"
                             "wups_link.c" "identity.c" "cmdauth.c"
