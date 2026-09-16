@@ -1,0 +1,17 @@
+# Keep the CPU1/TX0 profile used for the Bemowo t300 images.
+# Apply after sdkconfig.defaults with SDKCONFIG_DEFAULTS; separate sdkconfig
+# and build directories are required for each APN artifact.
+CONFIG_WUPS_MODEM_CORE1=y
+CONFIG_WUPS_MODEM_TX_UNBUFFERED=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+CONFIG_FREERTOS_RUN_TIME_COUNTER_TYPE_U64=y
+CONFIG_WUPS_PERF_DIAG=y
+
+# Retain the t300 build's runtime/library choices across ESP-IDF 6.0.2's
+# fresh-config defaults; avoid changing scheduling/IRAM and libc in this test.
+CONFIG_LIBC_NEWLIB=y
+CONFIG_FREERTOS_IN_IRAM=y
+CONFIG_PM_SLEEP_FUNC_IN_IRAM=y
+CONFIG_PM_SLP_IRAM_OPT=y
+CONFIG_COMPILER_ORPHAN_SECTIONS_WARNING=y

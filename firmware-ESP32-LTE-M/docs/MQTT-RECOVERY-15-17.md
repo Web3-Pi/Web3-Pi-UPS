@@ -7,7 +7,8 @@ built-in `mqtts`, MQTT 3.1.1, certificate-authenticated TLS 1.2. The service own
 the TLS context and retains partial RX and TX across short, yielding turns.
 DNS is asynchronous; socket readiness checks do not wait for network progress.
 Each partial RX packet, admitted TX packet and connection phase has its original
-15-second deadline, which positive progress cannot renew. The three connection
+300-second deadline in 0.8.17 (15 seconds in 0.8.16), which positive progress
+cannot renew. The three connection
 phases are DNS/TCP/TLS, MQTT CONNECT transmission, and CONNACK reception.
 
 Each turn services up to eight ready RX packets within a 10 ms work budget,
