@@ -23,4 +23,38 @@ menu "Web3 Pi modem UART"
         default 230400 if WUPS_MODEM_UART_230400
         default 115200
 
+    config WUPS_MODEM_TX_UNBUFFERED
+        bool "Use unbuffered modem TX (TX0 experiment)"
+        default n
+        help
+            Compare the SDK's FIFO-semaphore TX path with the default
+            512-byte TX ring. Keep baud, RX buffers and task settings fixed.
+
+    config WUPS_MODEM_TX_BUFFER_SIZE
+        int
+        default 0 if WUPS_MODEM_TX_UNBUFFERED
+        default 512
+
+    config WUPS_PERF_DIAG
+        bool "Sparse CPU, memory and transport diagnostics"
+        default n
+        depends on FREERTOS_GENERATE_RUN_TIME_STATS
+        depends on FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER
+        depends on FREERTOS_RUN_TIME_COUNTER_TYPE_U64
+        depends on !FREERTOS_SMP
+        help
+            Report 30-second per-core idle deltas and bounded UART/PPP
+            aggregates. Enable only in research images; hooks never log
+            payloads and leave transport return values unchanged.
+
+    config WUPS_PERF_BENCH
+        bool "One-shot synthetic HTTPS duplex benchmark"
+        default n
+        depends on WUPS_PERF_DIAG
+        help
+            After a healthy MQTT uplink and a quiet baseline, download and
+            upload 512 KiB concurrently using Cloudflare speedtest endpoints.
+            Uploads contain only synthetic zero bytes. Runs once per boot;
+            leave disabled in images intended for normal device operation.
+
 endmenu

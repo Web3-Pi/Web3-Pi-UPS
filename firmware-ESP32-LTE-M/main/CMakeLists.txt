@@ -1,5 +1,6 @@
 idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "modem_radio_policy.c" "modem_awake_policy.c" "modem_signal.c"
-                            "modem_support_diag.c" "modem_diag_clock.c" "modem_uart_baud.c" "mqtt.c"
+                            "modem_support_diag.c" "modem_diag_clock.c" "modem_uart_baud.c"
+                            "perf_diag.c" "transport_diag.c" "perf_bench.c" "mqtt.c"
                             "mqtt_health.c" "mqtt_packet_guard.c" "mqtt_dispatch_queue.c"
                             "mqtt_sdk_adapter.c"
                             "wups_link.c" "identity.c" "cmdauth.c"
@@ -26,6 +27,19 @@ idf_component_register(SRCS "main.c" "pmu.c" "modem.c" "modem_radio_policy.c" "m
                                      espressif__cjson
                                      esp_https_ota app_update esp_partition
                        INCLUDE_DIRS "")
+
+# Observe existing call boundaries in research images without changing the
+# managed modem component or installed SDK. No additional UART consumer.
+if(CONFIG_WUPS_PERF_DIAG)
+    target_link_options(${COMPONENT_LIB} INTERFACE
+        "-Wl,--wrap=uart_write_bytes"
+        "-Wl,--wrap=uart_read_bytes"
+        "-Wl,--wrap=uart_get_buffered_data_len"
+        "-Wl,--wrap=uart_driver_install"
+        "-Wl,--wrap=uart_driver_delete"
+        "-Wl,--wrap=xQueueReceive"
+        "-Wl,--wrap=pppos_input_tcpip_as_ram_pbuf")
+endif()
 
 # Optional fixed-APN artifacts. An empty value preserves the normal ICCID
 # policy; invalid APNs fail configuration instead of silently changing it.

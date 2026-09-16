@@ -991,6 +991,7 @@ static esp_err_t ppp_bringup_dce(void)
     dte_cfg.uart_config.flow_control = ESP_MODEM_FLOW_CONTROL_NONE;
     dte_cfg.uart_config.port_num   = MODEM_UART;
     dte_cfg.uart_config.baud_rate  = MODEM_BAUD;
+    dte_cfg.uart_config.tx_buffer_size = CONFIG_WUPS_MODEM_TX_BUFFER_SIZE;
 
     /* DCE = Data Circuit-terminating Equipment side (the modem). The 1nce
      * SIM auto-provisions the radio APN, but the application PPP context

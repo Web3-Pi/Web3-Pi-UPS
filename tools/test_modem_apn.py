@@ -49,19 +49,21 @@ def main():
         temporary = Path(directory)
         include = temporary / "modem_apn_bringup.inc"
         include.write_text(extracted)
-        for profile, apn in (("auto", ""), ("1nce", "iot.1nce.net"), ("sensor", "sensor.net")):
-            binary = temporary / ("test_modem_apn_" + profile)
-            command = shlex.split(os.environ.get("CC", "cc")) + [
-                "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-pedantic",
-                "-DCONFIG_WUPS_MODEM_UART_BAUD=230400",
-                "-I", str(temporary), str(root / "tools/test_modem_apn.c"), "-o", str(binary)]
-            if apn:
-                command += ['-DWUPS_FIXED_APN="' + apn + '"']
-            if sanitizers:
-                command += ["-fsanitize=" + sanitizers, "-fno-omit-frame-pointer"]
-            print("Build/test APN profile=" + profile, flush=True)
-            subprocess.run(command, check=True, timeout=30)
-            subprocess.run([str(binary)], check=True, timeout=30)
+        for tx_size in (512, 0):
+            for profile, apn in (("auto", ""), ("1nce", "iot.1nce.net"), ("sensor", "sensor.net")):
+                binary = temporary / ("test_modem_apn_" + profile + "_tx" + str(tx_size))
+                command = shlex.split(os.environ.get("CC", "cc")) + [
+                    "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-pedantic",
+                    "-DCONFIG_WUPS_MODEM_UART_BAUD=230400",
+                    "-DCONFIG_WUPS_MODEM_TX_BUFFER_SIZE=" + str(tx_size),
+                    "-I", str(temporary), str(root / "tools/test_modem_apn.c"), "-o", str(binary)]
+                if apn:
+                    command += ['-DWUPS_FIXED_APN="' + apn + '"']
+                if sanitizers:
+                    command += ["-fsanitize=" + sanitizers, "-fno-omit-frame-pointer"]
+                print("Build/test APN profile=" + profile + " TX buffer=" + str(tx_size), flush=True)
+                subprocess.run(command, check=True, timeout=30)
+                subprocess.run([str(binary)], check=True, timeout=30)
 
 
 if __name__ == "__main__":

@@ -23,12 +23,12 @@ enum { ESP_OK = 0, ESP_FAIL = -1, ESP_ERR_TIMEOUT = -2,
        MODEM_FAIL_SIM, MODEM_FAIL_NET };
 typedef struct {
     struct { int tx_io_num, rx_io_num, rts_io_num, cts_io_num,
-                 flow_control, port_num, baud_rate; } uart_config;
+                 flow_control, port_num, baud_rate, tx_buffer_size; } uart_config;
 } esp_modem_dte_config_t;
 typedef struct { const char *apn; } esp_modem_dce_config_t;
 typedef struct { char copied_apn[32]; } esp_modem_dce_t;
 typedef bool (*radio_at_fn)(void *, const char *, char *, size_t, unsigned);
-#define ESP_MODEM_DTE_DEFAULT_CONFIG() { .uart_config = {0} }
+#define ESP_MODEM_DTE_DEFAULT_CONFIG() { .uart_config = { .tx_buffer_size = 512 } }
 #define ESP_MODEM_DCE_DEFAULT_CONFIG(value) { .apn = (value) }
 #define MODEM_TAG "modem"
 #define pdMS_TO_TICKS(ms) (ms)
@@ -91,6 +91,7 @@ static esp_modem_dce_t *esp_modem_new_dev(int model,
 {
     CHECK(model == ESP_MODEM_DCE_SIM7070 && dte != NULL && ppp_netif == &netif);
     CHECK(host.baud_ready && dte->uart_config.baud_rate == CONFIG_WUPS_MODEM_UART_BAUD);
+    CHECK(dte->uart_config.tx_buffer_size == CONFIG_WUPS_MODEM_TX_BUFFER_SIZE);
     CHECK(config != NULL && strlen(config->apn) < sizeof(host.dce.copied_apn));
     /* The real SDK copies config->apn into PdpContext at construction. */
     strcpy(host.dce.copied_apn, config->apn);
