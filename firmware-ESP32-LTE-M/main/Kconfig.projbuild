@@ -1,0 +1,26 @@
+menu "Web3 Pi modem UART"
+
+    choice WUPS_MODEM_UART_SPEED
+        prompt "SIM7080G UART speed"
+        default WUPS_MODEM_UART_115200
+        help
+            The firmware detects 115200/230400 before PPP, plus 921600
+            for return from the previous experiment,
+            then synchronizes the ESP32 UART and the modem's saved AT+IPR.
+            Select 115200 to restore the modem before installing old firmware.
+            The selected rate stays fixed during operation.
+
+        config WUPS_MODEM_UART_115200
+            bool "115200 bit/s (baseline / restore)"
+
+        config WUPS_MODEM_UART_230400
+            bool "230400 bit/s (research)"
+
+    endchoice
+
+    config WUPS_MODEM_UART_BAUD
+        int
+        default 230400 if WUPS_MODEM_UART_230400
+        default 115200
+
+endmenu

@@ -38,6 +38,8 @@ static int netif, *s_ppp_netif = &netif;
 static int s_fail_stage, s_bringup_rssi_dbm, s_cmux_entry_fails, s_reg_timeout_streak;
 static bool s_iccid_known, s_cmux_active, s_cmux_dirty;
 static int64_t s_cmux_fallback_since_s;
+typedef struct { int port, tx_gpio, rx_gpio; } modem_uart_baud_config_t;
+static const modem_uart_baud_config_t s_modem_uart_config = {1, 2, 4};
 
 static struct {
     esp_modem_dce_t dce;
@@ -47,9 +49,18 @@ static struct {
     unsigned rf_resume_calls, reg_calls, dial_calls, mode_calls;
     unsigned seed_logs, fixed_logs, warning_logs;
     bool rf_off, fail_sync, fail_apn_at, fail_sim_read, reject_identity, unregistered;
+    bool fail_baud, baud_ready;
     int mode;
     int64_t clock_us;
 } host;
+
+static bool modem_uart_baud_prepare(const modem_uart_baud_config_t *config, int baud)
+{
+    CHECK(config == &s_modem_uart_config && baud == CONFIG_WUPS_MODEM_UART_BAUD);
+    CHECK(host.create_calls == 0 && host.mode_calls == 0);
+    host.baud_ready = !host.fail_baud;
+    return host.baud_ready;
+}
 
 static void log_message(const char *tag, const char *format, ...)
 {
@@ -79,6 +90,7 @@ static esp_modem_dce_t *esp_modem_new_dev(int model,
                                          const void *ppp_netif)
 {
     CHECK(model == ESP_MODEM_DCE_SIM7070 && dte != NULL && ppp_netif == &netif);
+    CHECK(host.baud_ready && dte->uart_config.baud_rate == CONFIG_WUPS_MODEM_UART_BAUD);
     CHECK(config != NULL && strlen(config->apn) < sizeof(host.dce.copied_apn));
     /* The real SDK copies config->apn into PdpContext at construction. */
     strcpy(host.dce.copied_apn, config->apn);
@@ -352,6 +364,15 @@ static void test_registration_retry(void)
 
 static void test_failures(void)
 {
+    cold_boot("+CCID: 8988228066618136966\r\nOK\r\n", "iot.1nce.net");
+    host.fail_baud = true;
+    CHECK(ppp_bringup_dce() == ESP_FAIL);
+    CHECK(s_fail_stage == MODEM_FAIL_AT && s_dce == NULL);
+    CHECK(host.create_calls == 0 && host.dial_calls == 0 && host.rf_resume_calls == 0);
+    next_attempt();
+    host.fail_baud = false;
+    check_success("sensor.net", true, false);
+
     cold_boot("+CCID: 8988228066614189920\r\nOK\r\n", "iot.1nce.net");
     host.fail_sync = true;
     CHECK(ppp_bringup_dce() == ESP_FAIL);

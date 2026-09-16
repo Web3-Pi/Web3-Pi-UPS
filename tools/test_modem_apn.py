@@ -53,6 +53,7 @@ def main():
             binary = temporary / ("test_modem_apn_" + profile)
             command = shlex.split(os.environ.get("CC", "cc")) + [
                 "-std=c11", "-O1", "-g", "-Wall", "-Wextra", "-Werror", "-pedantic",
+                "-DCONFIG_WUPS_MODEM_UART_BAUD=230400",
                 "-I", str(temporary), str(root / "tools/test_modem_apn.c"), "-o", str(binary)]
             if apn:
                 command += ['-DWUPS_FIXED_APN="' + apn + '"']

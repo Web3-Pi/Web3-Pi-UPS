@@ -7,6 +7,9 @@
 # --- CPU clock: A-240 experiment (communication settings unchanged) ---
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
+# --- Research UART experiment; CPU stays at the tested 240 MHz baseline ---
+CONFIG_WUPS_MODEM_UART_230400=y
+
 # --- Console (USB-Serial-JTAG over USB-C) ---
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 

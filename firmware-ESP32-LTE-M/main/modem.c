@@ -4,6 +4,7 @@
 #include "modem_awake_policy.h"
 #include "modem_support_diag.h"
 #include "modem_diag_clock.h"
+#include "modem_uart_baud.h"
 #include "mqtt.h"
 #include "identity.h"
 #include "backend_mode.h"
@@ -54,7 +55,11 @@
 #define MODEM_RI_GPIO      6   /* ESP_UART1_RI  (not driven in SW) */
 
 #define MODEM_UART        UART_NUM_1
-#define MODEM_BAUD        115200
+#define MODEM_BAUD        CONFIG_WUPS_MODEM_UART_BAUD
+
+static const modem_uart_baud_config_t s_modem_uart_config = {
+    .port = MODEM_UART, .tx_gpio = MODEM_TX_GPIO, .rx_gpio = MODEM_RX_GPIO,
+};
 
 /* Post-power-on settle before AT is reliable. SIM7080G Ton(uart) = 1.8 s
  * (HW Design V1.05, Table 9); we keep a conservative 5 s so the SIM/AT stack
@@ -698,69 +703,12 @@ esp_err_t modem_power_on(void)
     return ESP_OK;
 }
 
-/* Probe AT on a temporary raw UART. Returns true if the modem answered "OK".
- * The UART driver is removed afterwards so esp_modem can claim UART1 cleanly.
- * NB: a modem left in CMUX framing (ESP soft-reboot mid-session) is alive
- * but will NOT answer a plain AT — callers must treat "silent" as "off OR
- * unreachable", never as proof of power-off. */
-static void probe_escape_data_mode(void)
-{
-    /* If the modem is stuck in PPP/data mode (the ESP rebooted mid-session —
-     * the modem keeps its own data session up), pull it back to command mode
-     * with the "+++" escape: ~1 s of UART idle, "+++", ~1 s idle. Harmless when
-     * the modem is off or already in command mode. (Does NOT rescue a modem
-     * left in CMUX framing — see the note above.) */
-    vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_write_bytes(MODEM_UART, "+++", 3);
-    vTaskDelay(pdMS_TO_TICKS(1100));
-    uart_flush_input(MODEM_UART);
-}
-
-/* Probe for up to `window_ms` after the initial "+++" escape. A modem that is
- * still booting needs the long window (see MODEM_BOOT_PROBE_MS); long windows
- * re-run the escape once at half-time in case the modem finished booting into
- * a resumed data session after the first escape already went by. */
+/* A modem may retain either IPR speed across ESP resets and PWRKEY cycles.
+ * Plain AT still cannot recover an existing CMUX session; the power-cycle
+ * ladder below handles that independently of baud discovery. */
 static bool modem_probe_at_alive_ms(uint32_t window_ms)
 {
-    uart_config_t cfg = {
-        .baud_rate  = MODEM_BAUD,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    if (uart_driver_install(MODEM_UART, 512, 0, 0, NULL, 0) != ESP_OK) {
-        return false;
-    }
-    uart_param_config(MODEM_UART, &cfg);
-    uart_set_pin(MODEM_UART, MODEM_TX_GPIO, MODEM_RX_GPIO,
-                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    probe_escape_data_mode();
-
-    uint8_t buf[64];
-    const int64_t deadline_us = esp_timer_get_time() + (int64_t)window_ms * 1000;
-    const int64_t half_us     = esp_timer_get_time() + (int64_t)window_ms * 500;
-    bool re_escaped = (window_ms < 10000);  /* only long windows re-escape */
-    bool alive = false;
-    for (;;) {
-        uart_flush_input(MODEM_UART);
-        uart_write_bytes(MODEM_UART, "AT\r\n", 4);
-        int n = uart_read_bytes(MODEM_UART, buf, sizeof(buf) - 1, pdMS_TO_TICKS(300));
-        if (n > 0) {
-            buf[n] = '\0';
-            if (strstr((char *)buf, "OK")) alive = true;
-        }
-        if (alive || esp_timer_get_time() >= deadline_us) break;
-        if (!re_escaped && esp_timer_get_time() >= half_us) {
-            probe_escape_data_mode();
-            re_escaped = true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
-    uart_driver_delete(MODEM_UART);
-    return alive;
+    return modem_uart_baud_probe(&s_modem_uart_config, window_ms);
 }
 
 static bool modem_probe_at_alive(void)
@@ -1026,6 +974,14 @@ static int s_reg_timeout_streak = 0;
  * to acquire an IP — caller waits for the ordered PPP lifecycle state. */
 static esp_err_t ppp_bringup_dce(void)
 {
+    /* Own the temporary raw UART only before creating esp_modem. Confirm
+     * both the physical rate and saved IPR on every retry before PPP/CMUX. */
+    if (!modem_uart_baud_prepare(&s_modem_uart_config, MODEM_BAUD)) {
+        ESP_LOGE(MODEM_TAG, "UART baud configuration not confirmed; PPP blocked");
+        s_fail_stage = MODEM_FAIL_AT;
+        return ESP_FAIL;
+    }
+
     /* DTE = Data Terminal Equipment side (us) — UART parameters. */
     esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
     dte_cfg.uart_config.tx_io_num   = MODEM_TX_GPIO;
