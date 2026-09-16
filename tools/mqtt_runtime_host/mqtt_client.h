@@ -12,7 +12,7 @@ typedef struct {
     struct { const char *client_id, *username;
              struct { const char *password; } authentication; } credentials;
     struct { struct { const char *topic, *msg; int msg_len, qos, retain; } last_will;
-             int keepalive; } session;
+             int keepalive, message_retransmit_timeout; } session;
     struct { int timeout_ms; bool disable_auto_reconnect, bounded_service; } network;
     struct { size_t limit; } outbox;
     struct { int stack_size; } task;

@@ -5,7 +5,9 @@ Provides cellular telemetry, authenticated commands and firmware updates over
 MQTT, HTTP or Arkiv, independently of the Raspberry Pi's local network.
 
 The current firmware uses **LTE Cat-M1 only**, on **B3 (1800 MHz) and B20
-(800 MHz)**. NB-IoT selection is disabled. Version 0.8.16 adds
+(800 MHz)**. NB-IoT selection is disabled. Version 0.8.17 adds
+[300-second MQTT deadlines and 5-second retransmission](docs/RELEASE-0.8.17.md).
+Version 0.8.16 added
 [bounded MQTT/TLS service and guarded modem recovery](docs/MQTT-RECOVERY-15-17.md).
 The [0.8.15 release added SINR telemetry and fixed-APN build variants](docs/RELEASE-0.8.15.md).
 For the underlying radio and recovery behavior, see the
@@ -115,7 +117,9 @@ configuration error; the patches and adapter must be reviewed together.
 The research work also provides optional modem CPU1 affinity, unbuffered TX
 and sparse CPU/UART diagnostics. The hardware image `0.8.16-1nce-240-c1`
 used `CONFIG_WUPS_MODEM_CORE1=y` and `CONFIG_WUPS_MODEM_TX_UNBUFFERED=y`;
-these switches remain off in the inherited clean-build defaults. The synthetic
+these switches remain off in the inherited clean-build defaults. The two
+0.8.17 fixed-APN release images retain this profile via `sdkconfig.release-c1`;
+see [the release build commands](docs/RELEASE-0.8.17.md). The synthetic
 traffic and reconnect benchmarks are test-only options and default off.
 
 ### UART speed and OTA rollback
@@ -150,13 +154,13 @@ From this directory with ESP-IDF activated:
 
 ```sh
 # Default fleet classification (legacy ICCID list -> 1nce, other SIMs -> sensor)
-idf.py -B build-auto -DPROJECT_VER=0.8.16 -DWUPS_FIXED_APN= build
+idf.py -B build-auto -DPROJECT_VER=0.8.17 -DWUPS_FIXED_APN= build
 
 # Always use iot.1nce.net, independent of ICCID
-idf.py -B build-1nce -DPROJECT_VER=0.8.16-1nce -DWUPS_FIXED_APN=iot.1nce.net build
+idf.py -B build-1nce -DPROJECT_VER=0.8.17-1nce -DWUPS_FIXED_APN=iot.1nce.net build
 
 # Always use sensor.net, independent of ICCID
-idf.py -B build-sensor -DPROJECT_VER=0.8.16-sensor -DWUPS_FIXED_APN=sensor.net build
+idf.py -B build-sensor -DPROJECT_VER=0.8.17-sensor -DWUPS_FIXED_APN=sensor.net build
 ```
 
 Each directory contains `firmware-ESP32-LTE-M.bin`, the application image for

@@ -43,6 +43,13 @@
 #define MQTT_COMMAND_BYTES 512
 #define MQTT_RECEIPTS 8
 
+/* LTE-M timing profile. The bounded client's PINGRESP deadline is half
+ * keepalive, so 600 s advertises a 300 s response window. Retransmission
+ * of an unacknowledged QoS publication is a separate, shorter timer. */
+#define MQTT_DELIVERY_TIMEOUT_MS 300000u
+#define MQTT_KEEPALIVE_S 600
+#define MQTT_RETRANSMIT_TIMEOUT_MS 5000
+
 /* This lock protects only bounded application state. NEVER call the SDK,
  * wait, log, or execute commands while holding it. Published client and topic
  * storage live until reboot. Only the owner uses the SDK handle. */
@@ -382,8 +389,9 @@ static esp_err_t sdk_start(void)
             .qos     = 1,
             .retain  = 1,
         },
-        .session.keepalive   = 60,
-        .network.timeout_ms  = 15000,
+        .session.keepalive   = MQTT_KEEPALIVE_S,
+        .session.message_retransmit_timeout = MQTT_RETRANSMIT_TIMEOUT_MS,
+        .network.timeout_ms  = MQTT_DELIVERY_TIMEOUT_MS,
         /* Incremental TLS/MQTT I/O, with finite partial-frame deadlines and
          * RX service before keepalive decisions (issues #15/#16). */
         .network.bounded_service = true,
@@ -485,7 +493,7 @@ static int sdk_enqueue(esp_mqtt_client_handle_t client, const char *topic,
         portENTER_CRITICAL(&s_lock);
         armed = mqtt_health_begin_probe(&s_health, now_ms(), &s_probe_token) &&
             mqtt_packet_guard_probe_begin(&s_guard, s_probe_token.sequence,
-                                           probe->next_probe_due_ms, 60000);
+                                           probe->next_probe_due_ms, MQTT_DELIVERY_TIMEOUT_MS);
         if (!armed) {
             (void)mqtt_health_probe_failed(&s_health, s_probe_token, now_ms());
             (void)mqtt_packet_guard_packet_result(&s_guard, -1);
@@ -789,7 +797,18 @@ esp_err_t mqtt_runtime_init(void)
      * past its notification barrier, and can be retried by the main loop. */
     mqtt_dispatch_init(&s_queue);
     mqtt_packet_guard_init(&s_guard);
-    (void)mqtt_health_init(&s_health, now_ms(), NULL);
+    mqtt_health_config_t health_config = mqtt_health_default_config();
+    /* The health state machine requires interval >= deadline. */
+    health_config.probe_interval_ms = MQTT_DELIVERY_TIMEOUT_MS;
+    health_config.probe_deadline_ms = MQTT_DELIVERY_TIMEOUT_MS;
+    if (!mqtt_health_init(&s_health, now_ms(), &health_config)) return ESP_ERR_INVALID_ARG;
+    ESP_LOGI(TAG, "MQTT timing: network_ms=%u keepalive_s=%u ping_response_ms=%u "
+             "probe_interval_ms=%u probe_deadline_ms=%u retransmit_ms=%u",
+             (unsigned)MQTT_DELIVERY_TIMEOUT_MS, (unsigned)MQTT_KEEPALIVE_S,
+             (unsigned)(MQTT_KEEPALIVE_S * 500u),
+             (unsigned)health_config.probe_interval_ms,
+             (unsigned)health_config.probe_deadline_ms,
+             (unsigned)MQTT_RETRANSMIT_TIMEOUT_MS);
     s_commands = xQueueCreate(MQTT_COMMAND_CAPACITY, sizeof(mqtt_command_t));
     if (!s_commands) return ESP_ERR_NO_MEM;
     if (xTaskCreate(owner_task, "mqtt_owner", 6144, NULL, 5, &s_owner_task) != pdPASS ||

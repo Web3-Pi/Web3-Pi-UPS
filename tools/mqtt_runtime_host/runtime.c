@@ -236,7 +236,9 @@ static void host_event(int id, esp_mqtt_event_t *event)
 }
 esp_mqtt_client_handle_t esp_mqtt_client_init(const esp_mqtt_client_config_t *config)
 {
-    host_sdk_boundary(); assert(config->network.timeout_ms == 15000);
+    host_sdk_boundary(); assert(config->network.timeout_ms == 300000);
+    assert(config->session.keepalive == 600);
+    assert(config->session.message_retransmit_timeout == 5000);
     assert(config->network.bounded_service);
     struct host_client *client = malloc(sizeof(*client)); assert(client);
     client->marker = 0xface; atomic_init(&client->stopped, false);
@@ -835,7 +837,7 @@ static void test_probe(void)
     assert(health.probe_due && !health.probe_pending && !health.probe_admitted);
     assert(atomic_load(&host_probe_enqueue_calls) == 3);
     mqtt_get_health(&health); uint64_t deadline = health.probe_deadline_ms;
-    assert(deadline == atomic_load(&host_clock_ms) + 60000 && !health.proof_fresh);
+    assert(deadline == atomic_load(&host_clock_ms) + 300000 && !health.proof_fresh);
     /* Hold the owner before SDK admission while reported outbox is full.
      * Only the separate monitor can advance the deadline during this hold. */
     pthread_mutex_lock(&host_sdk_mutex); host_sdk_block = true; pthread_mutex_unlock(&host_sdk_mutex);
@@ -852,7 +854,7 @@ static void test_probe(void)
     assert(health.connected && health.degraded && !health.proof_fresh && !health.probe_admitted);
     assert(health.worker_busy && health.worker_stalled && atomic_load(&host_probe_enqueue_calls) == 3);
     host_shutdown();
-    puts("PASS actual runtime probes: CONNECT/unrelated/old PUBACK cannot prove health; cached QoS1 frame and early matching PUBACK establish proof only after admission; OTA requires fresh proof; independent monitor expires blocked admission at 60s");
+    puts("PASS actual runtime probes: CONNECT/unrelated/old PUBACK cannot prove health; cached QoS1 frame and early matching PUBACK establish proof only after admission; OTA requires fresh proof; independent monitor expires blocked admission at 300s");
 }
 int main(int argc, char **argv)
 {
