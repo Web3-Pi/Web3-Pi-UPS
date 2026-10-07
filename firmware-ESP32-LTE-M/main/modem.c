@@ -390,6 +390,19 @@ static uint32_t s_cmux_fallback_since_s;
  * Reset to 0 whenever the uplink is seen healthy. */
 static int s_uplink_trips;
 
+/* Backend-outage clock (issue #20): the last second the ACTIVE backend's
+ * uplink was demonstrably healthy, or the moment a fresh supervision
+ * session armed it. Unlike the per-session watchdog timer local to
+ * supervise_uplink(), it SURVIVES the modem resets the watchdog itself
+ * triggers: a continuous backend outage must still reach the NO-UPLINK hold
+ * alert (UPLINK_HOLD_ALERT_S) when every PPP session ends in a trip before
+ * that threshold — restoring PPP proves nothing about the backend. Re-armed
+ * only by a session that starts with no escalation pending (no trips, no
+ * hold alert — the same condition the GOT_IP path uses to reset the rest of
+ * the recovery bookkeeping) and while an OTA transfer deliberately starves
+ * the uplink. 0 = not armed yet this boot. */
+static uint32_t s_uplink_last_healthy_s;
+
 /* Bring-up CSQ (converted to dBm; 0 = unknown) — seeds the first net.status
  * emitted right after GOT_IP, before the supervision loop's first poll. */
 static int8_t s_bringup_rssi_dbm;
@@ -1654,7 +1667,25 @@ static bool modem_recovery_commit_backend(void *context)
 static teardown_action_t supervise_uplink(void)
 {
     modem_recovery_init(&s_uplink_recovery);
+    /* Per-SESSION watchdog timer: paces the reset ladder (a fresh PPP gets
+     * UPLINK_DEAD_SECS to prove itself before the next trip). */
     uint32_t last_healthy_s  = now_s();  /* watchdog timer starts at GOT_IP */
+    /* Cross-session backend-outage clock (issue #20): a session that starts
+     * mid-escalation — trips pending, or the zero-trip hold alert active —
+     * inherits it, because the modem reset / PPP re-dial that ended the
+     * previous session was itself caused by the dead uplink and says
+     * nothing about the backend. Only a session with no escalation pending
+     * (first PPP of the boot, or PPP recovered after a genuine network
+     * outage) starts a fresh clock, mirroring the GOT_IP bookkeeping. */
+    if (s_uplink_last_healthy_s == 0 ||
+        (s_uplink_trips == 0 && s_fail_stage != MODEM_FAIL_UPLINK)) {
+        s_uplink_last_healthy_s = now_s();
+    } else {
+        ESP_LOGW(MODEM_TAG,
+                 "supervision resumed mid-outage: backend uplink unhealthy for %us "
+                 "(trips=%d) — outage clock carried over",
+                 (unsigned)(now_s() - s_uplink_last_healthy_s), s_uplink_trips);
+    }
     uint32_t last_clear_s    = now_s();  /* GOT_IP path just sent a clear    */
     uint32_t last_radio_snapshot_s = now_s();
     uint32_t last_radio_poll_s = now_s();
@@ -1691,9 +1722,11 @@ static teardown_action_t supervise_uplink(void)
          * busy (MQTT may go quiet under the TLS transfer) and a watchdog
          * teardown would kill it. Freeze the watchdog timer, count no trips,
          * escalate nothing; genuine PPP loss (the EVT bits above) still ends
-         * the session and fails the download on its own. */
+         * the session and fails the download on its own. The outage clock
+         * is frozen too: a transfer-starved uplink is not a backend outage. */
         if (fw_ota_in_progress()) {
             last_healthy_s = now_s();
+            s_uplink_last_healthy_s = last_healthy_s;
             continue;
         }
 
@@ -1708,6 +1741,7 @@ static teardown_action_t supervise_uplink(void)
         if (wd_healthy) {
             modem_recovery_backend_healthy(&s_uplink_recovery);
             last_healthy_s = now;
+            s_uplink_last_healthy_s = now;
             /* OTA-1 rollback — first demonstrably healthy uplink marks a
              * pending-verify OTA image valid (one-shot, no-op otherwise).
              * Gated on ota_proof, NOT wd_ok: an auth-refused unit must not
@@ -1733,10 +1767,11 @@ static teardown_action_t supervise_uplink(void)
                 }
             }
         } else if (s_alert_active && s_fail_stage == MODEM_FAIL_UPLINK) {
-            /* Hold alert survived a PPP re-dial (last_healthy_s re-armed, so
-             * the hold branch won't re-assert for another UPLINK_DEAD_SECS):
-             * keep refreshing it here, or the RP2040's 5-min non-refresh
-             * auto-clear would drop the banner mid-outage. */
+            /* Hold alert survived a PPP re-dial (the per-session timer is
+             * re-armed, so the hold branch won't re-assert for another
+             * UPLINK_DEAD_SECS): keep refreshing it here, or the RP2040's
+             * 5-min non-refresh auto-clear would drop the banner
+             * mid-outage. */
             modem_ui_alert(modem_fail_msg(MODEM_FAIL_UPLINK));
         }
 
@@ -1834,14 +1869,18 @@ static teardown_action_t supervise_uplink(void)
              * Otherwise preserve the previous missing-client escalation. */
             bool client_missing = (backend_mode_get() == WUPS_BACKEND_MODE_MQTT &&
                                    !mqtt_sdk_is_started());
+            /* Total backend outage, across the modem resets this watchdog
+             * triggered (issue #20) — the hold-alert deadline runs on it. */
+            uint32_t outage_s = now - s_uplink_last_healthy_s;
             bool inet_ok = (now - last_probe_ok_s < INET_PROBE_CACHE_S);
             if (!mqtt_owned_fault && !inet_ok && !client_missing && inet_probe()) {
                 last_probe_ok_s = now;
                 inet_ok = true;
                 ESP_LOGW(MODEM_TAG,
-                         "uplink dead %us but internet probes answer — "
-                         "holding modem recovery (cause not yet established)",
-                         (unsigned)(now - last_healthy_s));
+                         "uplink dead %us this session (backend outage %us) but "
+                         "internet probes answer — holding modem recovery "
+                         "(cause not yet established)",
+                         (unsigned)(now - last_healthy_s), (unsigned)outage_s);
             }
             if (mqtt_owned_fault || (inet_ok && !client_missing)) {
                 /* Long hold (wedged client / marathon backend outage):
@@ -1849,12 +1888,12 @@ static teardown_action_t supervise_uplink(void)
                  * unit is never silent forever. Re-asserted every tick —
                  * the RP2040 auto-clears a non-refreshed alert after 5 min
                  * and does not re-beep on a repeated identical text. */
-                if (now - last_healthy_s >= UPLINK_HOLD_ALERT_S) {
+                if (outage_s >= UPLINK_HOLD_ALERT_S) {
                     if (!s_alert_active) {
                         ESP_LOGE(MODEM_TAG,
-                                 "uplink dead %us (%s) — raising 'NO UPLINK' "
+                                 "backend outage %us (%s) — raising 'NO UPLINK' "
                                  "alert without modem reset",
-                                 (unsigned)(now - last_healthy_s),
+                                 (unsigned)outage_s,
                                  mqtt_owned_fault ? "MQTT owner/proof degraded"
                                                   : "internet probes answer");
                     }
@@ -1868,6 +1907,7 @@ static teardown_action_t supervise_uplink(void)
                 return TEARDOWN_NORMAL;
             if (fw_ota_in_progress()) {
                 last_healthy_s = now_s();
+                s_uplink_last_healthy_s = last_healthy_s;
                 continue;
             }
             /* A public DNS timeout cannot overrule new backend evidence. */
@@ -1880,6 +1920,7 @@ static teardown_action_t supervise_uplink(void)
                 return TEARDOWN_NORMAL;
             if (fw_ota_in_progress()) {
                 last_healthy_s = now_s();
+                s_uplink_last_healthy_s = last_healthy_s;
                 continue;
             }
             now = now_s();
@@ -1892,12 +1933,20 @@ static teardown_action_t supervise_uplink(void)
             if (!fw_ota_try_modem_recovery(modem_recovery_commit_backend, &recovery))
                 continue;
             s_uplink_trips++;
-            s_fail_stage = MODEM_FAIL_NET;
+            /* A trip never downgrades an established backend-outage
+             * classification (issue #20): once the hold branch has raised
+             * NO UPLINK, a later probe timeout in the same outage still
+             * runs the reset ladder but must not flip the banner to
+             * NO NETWORK — PPP comes up every time, so the network is the
+             * one thing this outage has demonstrated to work. Only the
+             * healthy branch clears the classification. */
+            if (s_fail_stage != MODEM_FAIL_UPLINK) s_fail_stage = MODEM_FAIL_NET;
             s_fails_since_ok++;
             ESP_LOGE(MODEM_TAG,
-                     "uplink DEAD for %us with PPP up (zombie PDP?) — trip #%d, "
-                     "%s",
-                     (unsigned)(now - last_healthy_s), s_uplink_trips,
+                     "uplink DEAD for %us this session with PPP up (zombie PDP?; "
+                     "backend outage %us) — trip #%d, %s",
+                     (unsigned)(now - last_healthy_s),
+                     (unsigned)(now - s_uplink_last_healthy_s), s_uplink_trips,
                      s_uplink_trips >= 2 ? "escalating to PWRKEY power-cycle"
                                          : "resetting module (AT+CFUN=1,1)");
             return s_uplink_trips >= 2 ? TEARDOWN_PWRCYCLE
@@ -1980,7 +2029,9 @@ static void ppp_supervisor_task(void *arg)
                      * bookkeeping (fail counters, alert clear) moves to the
                      * supervision loop's uplink-healthy branch — otherwise a
                      * persistent zombie would reset the alert machinery every
-                     * cycle and never surface. */
+                     * cycle and never surface. The backend-outage clock
+                     * (s_uplink_last_healthy_s) is likewise inherited by the
+                     * next supervise_uplink() session (issue #20). */
                     ESP_LOGW(MODEM_TAG,
                              "PPP up after uplink trip #%d — waiting for the "
                              "uplink itself before declaring recovery",

@@ -5,7 +5,10 @@ Provides cellular telemetry, authenticated commands and firmware updates over
 MQTT, HTTP or Arkiv, independently of the Raspberry Pi's local network.
 
 The current firmware uses **LTE Cat-M1 only**, on **B3 (1800 MHz) and B20
-(800 MHz)**. NB-IoT selection is disabled. Version 0.8.17 adds
+(800 MHz)**. NB-IoT selection is disabled. Version 0.8.18 keeps the
+[backend-outage clock across watchdog modem resets](docs/RELEASE-0.8.18.md),
+so a continuous backend outage reaches the `NO UPLINK` alert (issue #20).
+Version 0.8.17 adds
 [300-second MQTT deadlines and 5-second retransmission](docs/RELEASE-0.8.17.md).
 Version 0.8.16 added
 [bounded MQTT/TLS service and guarded modem recovery](docs/MQTT-RECOVERY-15-17.md).
@@ -154,13 +157,13 @@ From this directory with ESP-IDF activated:
 
 ```sh
 # Default fleet classification (legacy ICCID list -> 1nce, other SIMs -> sensor)
-idf.py -B build-auto -DPROJECT_VER=0.8.17 -DWUPS_FIXED_APN= build
+idf.py -B build-auto -DPROJECT_VER=0.8.18 -DWUPS_FIXED_APN= build
 
 # Always use iot.1nce.net, independent of ICCID
-idf.py -B build-1nce -DPROJECT_VER=0.8.17-1nce -DWUPS_FIXED_APN=iot.1nce.net build
+idf.py -B build-1nce -DPROJECT_VER=0.8.18-1nce -DWUPS_FIXED_APN=iot.1nce.net build
 
 # Always use sensor.net, independent of ICCID
-idf.py -B build-sensor -DPROJECT_VER=0.8.17-sensor -DWUPS_FIXED_APN=sensor.net build
+idf.py -B build-sensor -DPROJECT_VER=0.8.18-sensor -DWUPS_FIXED_APN=sensor.net build
 ```
 
 Each directory contains `firmware-ESP32-LTE-M.bin`, the application image for

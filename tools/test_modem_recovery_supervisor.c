@@ -60,6 +60,7 @@ static int s_modem_evt;
 static void *s_dce;
 static bool s_cmux_active, s_iccid_known, s_alert_active;
 static int s_uplink_trips, s_fails_since_ok, s_fail_stage, s_alert_clear_pending;
+static uint32_t s_uplink_last_healthy_s;  /* #20 backend-outage clock (unused by the sealed baseline) */
 static int8_t s_ns_last_rssi;
 static uint8_t s_ns_last_state;
 static uint32_t s_ns_last_emit_s;
@@ -67,6 +68,9 @@ static uint32_t s_ns_last_emit_s;
 static enum scenario current_scenario;
 static uint32_t simulated_seconds, registration_seen_s;
 static unsigned probes, health_reads;
+static bool probes_answer;                /* #20: Internet probes answer in this session */
+static unsigned alerts;                   /* modem_ui_alert() calls (raise or refresh) */
+static uint32_t alert_first_s;            /* simulated second of the first alert call */
 static bool ota_active, ppp_loss_pending, registration_present, mqtt_restored;
 static mqtt_health_t health;
 static bool auth_refused;
@@ -110,8 +114,16 @@ static bool mqtt_sdk_is_started(void) { return true; }
 static bool fw_ota_in_progress(void) { return ota_active; }
 static void fw_ota_mark_uplink_healthy(void) {}
 static void modem_ui_alert_clear(void) {}
-static void modem_ui_alert(const char *text) { (void)text; }
-static const char *modem_fail_msg(int stage) { (void)stage; return "synthetic"; }
+static void modem_ui_alert(const char *text)
+{
+    (void)text;
+    if (++alerts == 1) alert_first_s = now_s();
+}
+static const char *modem_fail_msg(int stage)
+{
+    return stage == MODEM_FAIL_UPLINK ? "NO UPLINK" :
+           stage == MODEM_FAIL_NET ? "NO NETWORK" : "synthetic";
+}
 static void modem_diag_clock_log(const char *event) { (void)event; }
 static bool mqtt_auth_refused(void) { return auth_refused; }
 static bool http_backend_is_configured(void)
@@ -201,7 +213,7 @@ static bool inet_probe(void)
         s_ppp_state.sequence++;
     if (current_scenario == OTA_STARTS_IN_PROBE) ota_active = true;
     if (current_scenario == PPP_LOST_IN_PROBE) ppp_loss_pending = true;
-    if (current_scenario == INTERNET_ANSWERS) return true;
+    if (current_scenario == INTERNET_ANSWERS || probes_answer) return true;
     simulated_seconds += INET_PROBE_TIMEOUT_MS / 1000;
     return false;
 }
@@ -309,6 +321,10 @@ static void run_case(enum scenario scenario, const char *name,
     s_uplink_trips = scenario == SECOND_DEAD_TRIP ? 1 : 0;
     s_fails_since_ok = s_alert_clear_pending = 0;
     s_fail_stage = MODEM_FAIL_NONE;
+    s_uplink_last_healthy_s = 0;
+    probes_answer = false;
+    alerts = 0;
+    alert_first_s = 0;
     s_ns_last_rssi = 0;
     s_ns_last_state = NET_STATE_PPP_UP;
     s_ns_last_emit_s = 1000;
@@ -335,6 +351,15 @@ static void run_case(enum scenario scenario, const char *name,
         assert(s_modem_recovery_busy && s_ppp_state.phase == PPP_STOPPING);
         assert(!fw_ota_try_modem_recovery(modem_recovery_commit_backend, NULL));
     } else assert(!s_modem_recovery_busy);
+    /* #20 outage clock: armed at session entry and frozen forward by an OTA
+     * transfer in the same iteration. (A backend that returns during the
+     * probe/final snapshot refreshes it on the NEXT tick, which these
+     * horizons cut off — run_issue20 covers the healthy refresh.) */
+    assert(s_uplink_last_healthy_s >= 1000);
+    if (scenario == OTA_STARTS_IN_PROBE || scenario == OTA_IN_FINAL_SNAPSHOT)
+        assert(s_uplink_last_healthy_s > 1000);
+    if (scenario == DEAD_LINK || scenario == HTTP_DEAD || scenario == ARKIV_DEAD)
+        assert(s_uplink_last_healthy_s == 1000);
 #endif
     printf("PASS %-38s t=%us action=%s trips=%d connected=%d proof=%d probes=%u",
            name, now_s(), observed_action == -1 ? "NONE" :
@@ -343,6 +368,136 @@ static void run_case(enum scenario scenario, const char *name,
            s_uplink_trips, final_health.connected, final_health.proof_fresh, probes);
     if (registration_seen_s) printf(" registration_age=%us", now_s() - registration_seen_s);
     printf("\n");
+}
+
+/* --- issue #20: backend-outage clock across watchdog-triggered PPP sessions.
+ * One supervise_uplink() call per PPP session; between sessions the host
+ * plays the supervisor task's teardown + GOT_IP bookkeeping for the
+ * mid-escalation case (counters preserved, nothing cleared). */
+static int session(uint32_t start_s, bool answer, unsigned horizon_s)
+{
+    simulated_seconds = start_s;
+    horizon = horizon_s;
+    probes_answer = answer;
+    probes = 0;
+    ota_active = ppp_loss_pending = false;
+    s_ppp_state = (ppp_event_state_t){.phase = PPP_UP, .attempt = 1, .sequence = 1, .generation = 1};
+#ifdef FIXED
+    s_modem_recovery_busy = false;   /* fw_ota_finish_modem_recovery() */
+    lock_depth = lock_count = 0;
+#endif
+    observed_action = -1;
+    if (setjmp(simulation_end) == 0) observed_action = supervise_uplink();
+    return observed_action;
+}
+
+static void run_issue20(void)
+{
+    const uint32_t t0 = 1000, bringup_s = 60;
+    current_scenario = HTTP_DEAD;
+    active_backend = WUPS_BACKEND_MODE_HTTP;
+    registration_present = true;
+    registration_seen_s = 0;
+    health_reads = 0;
+    mqtt_restored = auth_refused = backend_restored = false;
+    s_cmux_active = s_iccid_known = true;
+    s_alert_active = false;
+    s_uplink_trips = s_fails_since_ok = s_alert_clear_pending = 0;
+    s_fail_stage = MODEM_FAIL_NONE;
+    s_uplink_last_healthy_s = 0;
+    alerts = 0;
+    alert_first_s = 0;
+    s_ns_last_rssi = 0;
+    s_ns_last_state = NET_STATE_PPP_UP;
+    s_ns_last_emit_s = t0;
+    assert(mqtt_health_init(&health, (uint64_t)t0 * 1000, NULL));
+#ifdef FIXED
+    s_ota_active = s_validation_busy = s_modem_recovery_busy = false;
+#endif
+
+    /* Session 1: backend dead, probes time out → first trip (module reset). */
+    assert(session(t0, false, 5000) == TEARDOWN_MODULE_RESET);
+    assert(s_uplink_trips == 1 && s_fails_since_ok == 1 && s_fail_stage == MODEM_FAIL_NET);
+    assert(!s_alert_active);
+    uint32_t trip1_s = now_s();
+    /* Session 2: PPP back after the reset, backend still dead → PWRKEY trip. */
+    assert(session(trip1_s + bringup_s, false, 5000) == TEARDOWN_PWRCYCLE);
+    assert(s_uplink_trips == 2 && s_fails_since_ok == 2);
+    assert(!s_alert_active);
+    uint32_t trip2_s = now_s();
+    /* Session 3: PPP back again, backend dead, Internet probes answer → hold.
+     * The bounded deadline (UPLINK_HOLD_ALERT_S after the LAST healthy
+     * uplink, i.e. t0) must raise NO UPLINK in this session. */
+    const unsigned deadline_s = t0 + UPLINK_HOLD_ALERT_S;
+    const unsigned horizon3 = deadline_s + 2 * UPLINK_DEAD_SECS;
+    assert(session(trip2_s + bringup_s, true, horizon3) == -1);
+    assert(s_uplink_trips == 2);
+#ifdef FIXED
+    assert(s_uplink_last_healthy_s == t0);
+    assert(s_alert_active && s_fail_stage == MODEM_FAIL_UPLINK);
+    assert(alerts > 0 && alert_first_s >= deadline_s);
+    assert(alert_first_s <= deadline_s + PPP_SUPERVISE_TICK_MS / 1000 + INET_PROBE_TIMEOUT_MS / 1000);
+    printf("PASS %-38s t=%us NO UPLINK raised %us after last healthy uplink (trips=%d)\n",
+           "#20 outage clock survives resets", now_s(), alert_first_s - t0, s_uplink_trips);
+#else
+    /* Baseline: the local timer restarted at session start, so no alert
+     * before the horizon although the outage is already past the deadline. */
+    assert(!s_alert_active && alerts == 0 && s_fail_stage == MODEM_FAIL_NET);
+    printf("PASS %-38s t=%us no alert %us after last healthy uplink (trips=%d)\n",
+           "#20 baseline: timer restarts", now_s(), now_s() - t0, s_uplink_trips);
+#endif
+    uint32_t hold_end_s = now_s();
+    /* Session 4: probes time out again → the reset ladder keeps running, but
+     * an established NO UPLINK classification is not downgraded. */
+    assert(session(hold_end_s + bringup_s, false, hold_end_s + 5000) == TEARDOWN_PWRCYCLE);
+    assert(s_uplink_trips == 3 && s_fails_since_ok == 3);
+#ifdef FIXED
+    assert(s_alert_active && s_fail_stage == MODEM_FAIL_UPLINK);
+    assert(s_uplink_last_healthy_s == t0);
+    printf("PASS %-38s t=%us trips=%d stage=%s\n", "#20 trip keeps NO UPLINK classification",
+           now_s(), s_uplink_trips, modem_fail_msg(s_fail_stage));
+#else
+    assert(!s_alert_active && s_fail_stage == MODEM_FAIL_NET);
+    printf("PASS %-38s t=%us trips=%d stage=%s\n", "#20 baseline: trip classifies NO NETWORK",
+           now_s(), s_uplink_trips, modem_fail_msg(s_fail_stage));
+#endif
+    /* Session 5: backend returns → healthy branch clears the whole
+     * escalation and refreshes the outage clock. */
+    uint32_t trip3_s = now_s();
+    backend_restored = true;
+    assert(session(trip3_s + bringup_s, true, trip3_s + bringup_s + 120) == -1);
+    assert(s_uplink_trips == 0 && s_fails_since_ok == 0 && s_fail_stage == MODEM_FAIL_NONE);
+    assert(!s_alert_active);
+#ifdef FIXED
+    assert(s_uplink_last_healthy_s >= trip3_s + bringup_s);
+#endif
+    printf("PASS %-38s t=%us trips=%d alert=%d\n", "#20 healthy uplink clears escalation",
+           now_s(), s_uplink_trips, s_alert_active);
+
+#ifdef FIXED
+    /* Control: a session with no escalation pending starts a fresh clock —
+     * a long genuine network outage (no trips) must not count as a backend
+     * outage once PPP returns. */
+    backend_restored = false;
+    s_uplink_last_healthy_s = 100;       /* stale: PPP was down for ages */
+    assert(session(5000, true, 5000 + UPLINK_DEAD_SECS + 200) == -1);
+    assert(s_uplink_last_healthy_s == 5000);
+    assert(!s_alert_active && s_fail_stage == MODEM_FAIL_NONE);
+    printf("PASS %-38s t=%us clock re-armed at session start, no alert\n",
+           "#20 fresh session re-arms clock", now_s());
+
+    /* Control: a zero-trip hold alert that survived a genuine PPP re-dial
+     * inherits the clock and keeps the banner refreshed. */
+    s_alert_active = true;
+    s_fail_stage = MODEM_FAIL_UPLINK;
+    s_uplink_last_healthy_s = 6000;
+    alerts = 0;
+    assert(session(6000 + UPLINK_HOLD_ALERT_S, true, 6000 + UPLINK_HOLD_ALERT_S + UPLINK_DEAD_SECS + 100) == -1);
+    assert(s_uplink_last_healthy_s == 6000);
+    assert(s_alert_active && s_fail_stage == MODEM_FAIL_UPLINK && alerts > 0);
+    printf("PASS %-38s t=%us clock inherited, alert refreshed %u times\n",
+           "#20 hold alert survives PPP re-dial", now_s(), alerts);
+#endif
 }
 
 int main(void)
@@ -377,6 +532,7 @@ int main(void)
     run_case(INTERNET_ANSWERS, "reachable Internet control", -1, 0, false, false);
     run_case(MQTT_CONNECTED_WITHOUT_PROOF, "MQTT owner responsibility control", -1, 0, true, false);
     run_case(SECOND_DEAD_TRIP, "persistent second trip control", TEARDOWN_PWRCYCLE, 2, false, false);
+    run_issue20();
 #ifdef BASELINE
     puts("10 baseline scenarios reproduced. PASS means unwanted resets were reproduced.");
 #else
