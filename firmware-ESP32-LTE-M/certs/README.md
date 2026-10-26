@@ -16,8 +16,11 @@ certificate passed to the verification callback, before delegating to the
 ESP-IDF bundle callback. Reissuing/cross-signing a certificate with the same
 blocked key cannot evade this comparison. The eight inputs in rustls omit
 the outer ASN.1 SEQUENCE; the manifest/header restore and validate that
-encoding to match Mbed TLS `pk_raw`. Normal signature, hostname, expiry
-and chain checks remain with the SDK. Roots in the compressed bundle are
+encoding to match Mbed TLS `pk_raw`. Signature, hostname, expiry
+and chain checks are performed by the SDK. `MBEDTLS_HAVE_TIME_DATE` is
+explicitly enabled and required by both CMake and the generated-image
+audit; the SDK default does not check certificate validity dates. The
+modem synchronizes the clock before starting its TLS clients. Roots in the compressed bundle are
 also checked against the denylist by the build-input audit.
 
 The SDK callback is exported but not a stable public API. Its source hash
@@ -52,6 +55,9 @@ hardware/APN/release settings.
 Host wrapper tests use an SDK callback stub; they verify denylist placement,
 all eight keys at multiple depths/flag combinations, error propagation and
 fail-closed attachment. They do not establish an ESP32 TLS handshake or
-LTE/OTA recovery. The public checkout also uses the existing placeholder
+LTE/OTA recovery. `tools/tls_target_fixture` additionally runs real mbedTLS
+handshakes and cross-issuer blocked-key verification on the physical ESP32.
+Its disposable trust anchors are isolated from production builds.
+The public checkout also uses the existing placeholder
 Arkiv WS token. Production rollout requires the separately provisioned token
 and device verification; do not publish private headers in source artifacts.

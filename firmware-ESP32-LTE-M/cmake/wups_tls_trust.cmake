@@ -1,5 +1,8 @@
 # The wrapper delegates to an exported but non-public ESP-IDF callback.
 # Any SDK change requires review; never silently bypass distrust checks.
+if(NOT CONFIG_MBEDTLS_HAVE_TIME OR NOT CONFIG_MBEDTLS_HAVE_TIME_DATE)
+    message(FATAL_ERROR "TLS trust: certificate validity dates must be checked; enable MBEDTLS_HAVE_TIME and MBEDTLS_HAVE_TIME_DATE")
+endif()
 if(NOT CONFIG_MBEDTLS_CERTIFICATE_BUNDLE OR
    NOT CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_NONE OR
    NOT CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE OR

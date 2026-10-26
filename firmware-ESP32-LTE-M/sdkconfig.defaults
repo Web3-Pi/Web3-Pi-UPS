@@ -44,6 +44,9 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_NONE=y
 CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE_PATH="certs/roots.pem"
 # CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEPRECATED_LIST is not set
+# Enforce notBefore/notAfter using the clock synchronized before TLS startup.
+CONFIG_MBEDTLS_HAVE_TIME=y
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
 
 # Allocate mbedTLS handshake buffers on the heap instead of the stack.
 # Without this the per-task stack must be huge to fit a TLS 1.2/1.3

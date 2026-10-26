@@ -85,7 +85,18 @@ jobs:
           esp_idf_version: v6.0.2
           target: esp32s3
           path: firmware-ESP32-LTE-M
-          command: idf.py build && python3 ../tools/check_tls_trust.py --build-dir build && python3 ../tools/test_arkiv_balance.py && python3 ../tools/test_arkiv_cmd_poll.py && MQTT_TEST_SANITIZERS=address,undefined python3 ../tools/test_modem_core1.py
+          command: |
+            set -e
+            idf.py build
+            python3 ../tools/check_tls_trust.py --build-dir build
+            python3 ../tools/test_arkiv_balance.py
+            python3 ../tools/test_arkiv_cmd_poll.py
+            MQTT_TEST_SANITIZERS=address,undefined python3 ../tools/test_modem_core1.py
+            python3 ../tools/tls_target_fixture/generate.py
+            mkdir -p ../tools/tls_target_fixture/build
+            cp sdkconfig ../tools/tls_target_fixture/build/sdkconfig
+            cd ../tools/tls_target_fixture
+            idf.py -B build -D SDKCONFIG=build/sdkconfig -D IDF_TARGET=esp32s3 build
       - uses: actions/upload-artifact@v7
         with:
           name: esp32-firmware

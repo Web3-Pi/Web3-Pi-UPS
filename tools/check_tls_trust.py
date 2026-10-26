@@ -81,6 +81,8 @@ static inline bool wups_tls_spki_distrusted(const unsigned char *spki, size_t le
         require(config.get("IDF_TARGET") == "esp32s3", "wrong hardware target")
         require(config.get("ESPTOOLPY_FLASHSIZE") == "4MB", "wrong flash size")
         require(config.get("BOOTLOADER_APP_ROLLBACK_ENABLE") is True, "OTA rollback disabled")
+        require(config.get("MBEDTLS_HAVE_TIME") is True, "TLS clock disabled")
+        require(config.get("MBEDTLS_HAVE_TIME_DATE") is True, "certificate validity dates unchecked")
         require(config.get("MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_NONE") is True, "SDK roots enabled")
         require(config.get("MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE") is True, "custom roots disabled")
         require(config.get("MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE_PATH") == "certs/roots.pem", "unexpected roots path")

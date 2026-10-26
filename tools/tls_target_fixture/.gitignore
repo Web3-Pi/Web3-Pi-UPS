@@ -1,0 +1,5 @@
+/build*/
+/main/fixtures.h
+/certs/
+/partitions.csv
+/sdkconfig*
