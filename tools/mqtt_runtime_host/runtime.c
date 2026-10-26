@@ -97,7 +97,7 @@ void host_log(const char *format, ...) { (void)format; }
 void esp_log_level_set(const char *tag, int level) { (void)tag; (void)level; }
 const char *esp_err_to_name(esp_err_t error) { (void)error; return "host-fixture"; }
 int64_t esp_timer_get_time(void) { return (int64_t)atomic_load(&host_clock_ms) * 1000; }
-int esp_crt_bundle_attach(void *config) { (void)config; return ESP_OK; }
+int wups_crt_bundle_attach(void *config) { (void)config; return ESP_OK; }
 uint32_t esp_get_free_heap_size(void) { return 100000; }
 uint32_t esp_get_minimum_free_heap_size(void) { return 90000; }
 unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { (void)task; return 1000; }

@@ -105,7 +105,7 @@ static void release_in_progress(void) { assert(claimed && !client.live); claimed
 static void vTaskDelay(int ms) { assert(claimed); assert(delay_count<12); delays[delay_count++]=ms; now+=(int64_t)ms*1000; }
 static void esp_restart(void) { assert(claimed && !client.live && finishes==1 && verifies==1); rebooted++; longjmp(task_exit,1); }
 static void vTaskDelete(void *p) { assert(!p && !claimed && !client.live); deleted++; longjmp(task_exit,1); }
-static void esp_crt_bundle_attach(void) {}
+static void wups_crt_bundle_attach(void) {}
 static void event(int id,char *key,char *value) {
  esp_http_client_event_t e={.event_id=id,.client=&client,.user_data=client.cfg.user_data,.header_key=key,.header_value=value};
  assert(client.live && claimed); assert(client.cfg.event_handler(&e)==ESP_OK);

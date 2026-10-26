@@ -7,7 +7,7 @@
 #include <stdlib.h>
 #include "esp_log.h"
 #include "esp_websocket_client.h"
-#include "esp_crt_bundle.h"
+#include "tls_trust.h"
 #include "cJSON.h"
 
 #include "freertos/FreeRTOS.h"
@@ -409,7 +409,7 @@ esp_err_t arkiv_ws_start(const uint8_t owner_addr[20])
 
     esp_websocket_client_config_t cfg = {0};
     cfg.uri                    = ARKIV_WS_URI;
-    cfg.crt_bundle_attach      = esp_crt_bundle_attach;
+    cfg.crt_bundle_attach      = wups_crt_bundle_attach;
     cfg.disable_auto_reconnect = false;
     cfg.reconnect_timeout_ms   = ARKIV_WS_RECONNECT_MS;
     cfg.network_timeout_ms     = 10000;
