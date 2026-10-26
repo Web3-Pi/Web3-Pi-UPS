@@ -113,3 +113,6 @@ Desktop.ini
 # Deployment-specific WS token for the self-hosted Arkiv node (see
 # main/arkiv_ws_token.h.example) — never commit the real one.
 main/arkiv_ws_token.h
+
+# Reviewed public CA trust anchors; private PEM files remain ignored.
+!certs/roots.pem
