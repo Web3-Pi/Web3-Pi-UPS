@@ -10,7 +10,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_http_client.h"
-#include "esp_crt_bundle.h"
+#include "tls_trust.h"
 #include "cJSON.h"
 
 #include "identity.h"
@@ -80,7 +80,7 @@ static esp_err_t rpc_post(const char *body, char *resp, size_t resp_cap)
          * handshake fails as ESP_ERR_HTTP_CONNECT even though PPP +
          * plain HTTP + MQTTS are all up (plan §4.7: integrity-protected
          * single gateway, availability deliberately not). */
-        .crt_bundle_attach = esp_crt_bundle_attach,
+        .crt_bundle_attach = wups_crt_bundle_attach,
     };
     esp_http_client_handle_t cl = esp_http_client_init(&cfg);
     if (!cl) return ESP_FAIL;

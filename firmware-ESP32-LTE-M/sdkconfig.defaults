@@ -38,11 +38,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 #     recovers on its own. ---
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
-# --- TLS: use the mbedTLS-bundled root CA store so esp-mqtt can verify
-#         broker.w3p.ovh's Let's Encrypt cert without us having to embed
-#         certs ourselves. ---
+# --- TLS: reviewed project CA bundle, replacing (not extending) SDK roots. ---
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_NONE=y
+CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CUSTOM_CERTIFICATE_BUNDLE_PATH="certs/roots.pem"
+# CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEPRECATED_LIST is not set
 
 # Allocate mbedTLS handshake buffers on the heap instead of the stack.
 # Without this the per-task stack must be huge to fit a TLS 1.2/1.3

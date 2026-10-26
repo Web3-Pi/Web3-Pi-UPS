@@ -42,6 +42,7 @@ jobs:
             if [ "$test" = tools/test_modem_core1.py ]; then continue; fi
             python3 "$test"
           done
+          python3 tools/test_tls_trust.py
           python3 tools/test_wups_deframer.py
           python3 tools/test_http_cmd_loop.py
           cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I firmware-ESP32-LTE-M/main tools/test_power_status_decode.c -o /tmp/power-status-test
@@ -84,7 +85,7 @@ jobs:
           esp_idf_version: v6.0.2
           target: esp32s3
           path: firmware-ESP32-LTE-M
-          command: idf.py build && python3 ../tools/test_arkiv_balance.py && python3 ../tools/test_arkiv_cmd_poll.py && MQTT_TEST_SANITIZERS=address,undefined python3 ../tools/test_modem_core1.py
+          command: idf.py build && python3 ../tools/check_tls_trust.py --build-dir build && python3 ../tools/test_arkiv_balance.py && python3 ../tools/test_arkiv_cmd_poll.py && MQTT_TEST_SANITIZERS=address,undefined python3 ../tools/test_modem_core1.py
       - uses: actions/upload-artifact@v7
         with:
           name: esp32-firmware

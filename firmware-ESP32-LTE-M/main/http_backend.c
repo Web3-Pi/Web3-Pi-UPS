@@ -16,7 +16,7 @@
 #include <time.h>
 
 #include "cJSON.h"
-#include "esp_crt_bundle.h"
+#include "tls_trust.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -839,7 +839,7 @@ static int post_once(void)
         .method        = HTTP_METHOD_POST,
         .timeout_ms    = HTTP_TIMEOUT_MS,
         .event_handler = resp_evt,
-        .crt_bundle_attach = is_https ? esp_crt_bundle_attach : NULL,
+        .crt_bundle_attach = is_https ? wups_crt_bundle_attach : NULL,
         /* A 3xx is logged, not followed: the signed POST must land on the
          * configured URL (a redirect would re-POST elsewhere or degrade to a
          * GET). Point the device at the final URL instead. */

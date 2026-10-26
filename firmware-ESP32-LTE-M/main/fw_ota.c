@@ -37,7 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "esp_crt_bundle.h"
+#include "tls_trust.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_log.h"
@@ -405,7 +405,7 @@ static void ota_task(void *arg)
         esp_http_client_config_t http_cfg = {
             .url = s_url,
             .timeout_ms = FW_OTA_HTTP_TIMEOUT_MS,
-            .crt_bundle_attach = esp_crt_bundle_attach,
+            .crt_bundle_attach = wups_crt_bundle_attach,
             .buffer_size = 2048,
             .keep_alive_enable = true,
             .keep_alive_idle = 60,
@@ -677,7 +677,7 @@ static void relay_task(void *arg)
         esp_http_client_config_t http_cfg = {
             .url               = s_url,
             .timeout_ms        = FW_OTA_HTTP_TIMEOUT_MS,
-            .crt_bundle_attach = esp_crt_bundle_attach,
+            .crt_bundle_attach = wups_crt_bundle_attach,
             .buffer_size       = 2048,
             .keep_alive_enable = true,
         };

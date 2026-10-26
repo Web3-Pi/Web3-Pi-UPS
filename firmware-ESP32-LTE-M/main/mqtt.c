@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdatomic.h>
 #include <inttypes.h>
-#include "esp_crt_bundle.h"
+#include "tls_trust.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -372,7 +372,7 @@ static esp_err_t sdk_start(void)
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = MQTT_BROKER_URI,
         /* TLS via the bundled root CA list — covers Let's Encrypt. */
-        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+        .broker.verification.crt_bundle_attach = wups_crt_bundle_attach,
 
         /* Per-device credentials (Track 0 / WS-10; ADR-0005 superseded):
          * username = ICCID, password = the per-device secret read from the
