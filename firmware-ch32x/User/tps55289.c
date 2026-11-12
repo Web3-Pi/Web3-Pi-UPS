@@ -93,9 +93,11 @@ void tps55289_enable_output(UINT8 enable)
         /* Reset value of MODE is 0x20 (HICCUP=1). The earlier code wrote
          * 0x80 which silently cleared HICCUP and FPWM stayed at 0. Without
          * HICCUP, an SCP trip latches the device off until power-cycle.
-         * Preserve HICCUP=1 (default), keep FPWM=0 (PFM at light load,
-         * default), DISCHG=0 (default), FSWDBL=0 (default). */
-        tps55289_write_byte(REG_MODE, MODE_OE_BIT | MODE_HICCUP_BIT);
+         * Preserve HICCUP=1 (default), DISCHG=0 (default), FSWDBL=0
+         * (default). FPWM follows TPS55289_FORCE_PWM (see tps55289.h) —
+         * this is the only write of MODE while the output is on, and the
+         * 2 s watchdog in main.c re-issues it, so the setting sticks. */
+        tps55289_write_byte(REG_MODE, MODE_OE_BIT | MODE_HICCUP_BIT | MODE_LIGHT_LOAD_BITS);
 	}
     else
     {
@@ -207,5 +209,13 @@ float tps55289_read_current_limit(void)
 UINT8 tps55289_read_status(void)
 {
     return I2C_read_reg(TPS55289_I2C_ADDR, REG_STATUS);
+}
+// -----------------------------------------------------------------------------
+//  Read MODE register (0x06). Expected while the output is on: 0xA2 with
+//  TPS55289_FORCE_PWM, 0xA0 without.
+// -----------------------------------------------------------------------------
+UINT8 tps55289_read_mode(void)
+{
+    return I2C_read_reg(TPS55289_I2C_ADDR, REG_MODE);
 }
 // -----------------------------------------------------------------------------

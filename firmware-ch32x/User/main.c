@@ -452,7 +452,7 @@ static UINT16 Powercycle_Timer_Ms = 0;
 /* Firmware version, reported in system.ping RESP / system.hello. The
  * string rides the optional pong tail (protocol.h); the u16 stays as
  * the coarse legacy field. Bump on release. */
-#define FW_VERSION_STR "ch32x:1.1.1"
+#define FW_VERSION_STR "ch32x:1.1.2"
 #define FW_VERSION_U16 ((uint16_t)((1u << 8) | 1u)) /* coarse 1.1 */
 
 /*********************************************************************
@@ -1418,6 +1418,11 @@ int main(void)
             uint8_t r08 = mp2762a_read_reg(MP2762A_REG_CONFIG0);
             uint8_t r13 = mp2762a_read_reg(MP2762A_REG_STATUS);
             uint8_t r14 = mp2762a_read_reg(MP2762A_REG_FAULT);
+            /* Light-load noise settings readback: r12 bit1 = DIG_SKIP_EN
+             * (0x75 = skip off, 0x77 = OTP default), TPSm = TPS55289 MODE
+             * (0xA2 = forced PWM, 0xA0 = PFM). */
+            uint8_t r12 = mp2762a_read_reg(MP2762A_REG_IIN_OCP);
+            uint8_t tps_mode = tps55289_read_mode();
             uint8_t ichg_l = mp2762a_read_reg(MP2762A_REG_ADC_ICHG_L);
             uint8_t ichg_h = mp2762a_read_reg(MP2762A_REG_ADC_ICHG_H);
             uint8_t iin_l  = mp2762a_read_reg(MP2762A_REG_ADC_IIN_L);
@@ -1475,6 +1480,8 @@ int main(void)
                 buf[p++] = (char)('0' + frac);
                 buf[p++] = 'C';
             }
+            EMIT_STR(" r12=");        EMIT_HEX(r12);
+            EMIT_STR(" TPSm=");       EMIT_HEX(tps_mode);
             #undef EMIT_STR
             #undef EMIT_HEX
             buf[p] = 0;

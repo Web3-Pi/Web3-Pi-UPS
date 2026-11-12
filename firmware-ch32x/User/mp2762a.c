@@ -27,6 +27,24 @@ static uint8_t g_stuck_counter = 0;
 // (UVLO ~6.0-6.6 V) and far above the grounded-divider no-battery reading.
 #define BAT_PRESENT_EXT_MIN_MV 5500
 
+// Apply the light-load skip setting (MP2762A_DISABLE_SKIP, see mp2762a.h).
+//
+// REG12H shares its byte with the PROCHOT input-OCP threshold and reserved
+// bits, so this is a read-modify-write that touches only DIG_SKIP_EN. The
+// read is sanity-checked first: an unpowered chip reads 0x00 and a floating
+// bus reads 0xFF over the ACK-less bit-bang I2C, and neither may be written
+// back. Writes only when the bit actually needs changing, so the steady
+// state costs one single-byte read per call.
+static void mp2762a_apply_skip_mode(void) {
+#if MP2762A_DISABLE_SKIP
+  uint8_t r12 = mp2762a_read_reg(MP2762A_REG_IIN_OCP);
+  if (r12 == 0x00 || r12 == 0xFF) return;
+  if (r12 & MP2762A_DIG_SKIP_EN) {
+    mp2762a_write_reg(MP2762A_REG_IIN_OCP, (uint8_t)(r12 & ~MP2762A_DIG_SKIP_EN));
+  }
+#endif
+}
+
 // Initialize MP2762A for 2S Li-ion battery
 void mp2762a_init(void) {
   // Read fault register to clear latched faults
@@ -82,6 +100,9 @@ void mp2762a_init(void) {
   // can pull from this PCB so the assertion never fires in practice.
   uint8_t cfg3 = mp2762a_read_reg(MP2762A_REG_ADC_CFG);
   mp2762a_write_reg(MP2762A_REG_ADC_CFG, cfg3 | 0x03);
+
+  // REG12H: light-load pulse skipping (audible-noise fix).
+  mp2762a_apply_skip_mode();
 }
 
 // Reset all MP2762A registers to IC power-on defaults via REG_RST bit.
@@ -319,6 +340,9 @@ void mp2762a_kick_watchdog(void) {
   // we keep on 5 A so DC IN can fully feed VBUS_OUT plus charging.
   mp2762a_write_reg(MP2762A_REG_INPUT_ILIM,  0x64);
   mp2762a_write_reg(MP2762A_REG_INPUT_ILIM2, 0x64);
+  // DIG_SKIP_EN is reset by REG_RST / watchdog like the registers above,
+  // so it is re-applied here on every tick.
+  mp2762a_apply_skip_mode();
 }
 
 // Restart charging by clearing faults and toggling CHG_EN
