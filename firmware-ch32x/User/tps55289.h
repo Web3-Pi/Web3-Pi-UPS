@@ -34,6 +34,21 @@ extern "C" {
 #define MODE_DISCHG_BIT  (1 << 4)
 #define MODE_FPWM_BIT    (1 << 1)
 
+/* Light-load operating mode.
+ *   1 = forced PWM: the converter keeps switching at the full 400 kHz down
+ *       to no load, so nothing lands in the audible band (datasheet §7.4.1).
+ *       Costs roughly 0.1 W of extra loss below ~0.5 A of output current.
+ *   0 = PFM (chip default): pulse bursts at light load — best efficiency,
+ *       but the burst rate falls into the audible band and the output MLCCs
+ *       and inductor whine (reported 2026-11-12 at <4 W output). */
+#define TPS55289_FORCE_PWM  1
+
+#if TPS55289_FORCE_PWM
+#define MODE_LIGHT_LOAD_BITS  MODE_FPWM_BIT
+#else
+#define MODE_LIGHT_LOAD_BITS  0
+#endif
+
 /* STATUS register (0x07) — read-only, latched on trip until read */
 #define STATUS_SCP_BIT   (1 << 7)   /* short-circuit protection tripped */
 #define STATUS_OCP_BIT   (1 << 6)   /* overcurrent protection tripped */
@@ -86,6 +101,9 @@ float tps55289_read_current_limit(void);
 
 // Read STATUS register (0x07). Reading clears latched SCP/OCP/OVP bits.
 UINT8 tps55289_read_status(void);
+
+// Read MODE register (0x06) — diagnostic readback of OE/HICCUP/FPWM.
+UINT8 tps55289_read_mode(void);
 
 extern void I2C_write_reg(UINT8 addr, UINT8 reg, UINT8 dat);
 

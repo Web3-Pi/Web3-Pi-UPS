@@ -235,7 +235,7 @@ identify which firmware is installed on a particular device.
 
 | Target | Source version | Build tool | Details |
 |---|---|---|---|
-| CH32X035 power controller | `ch32x:1.1.1` | WCH GCC / MounRiver Studio 2 | [README](firmware-ch32x/README.md) |
+| CH32X035 power controller | `ch32x:1.1.2` | WCH GCC / MounRiver Studio 2 | [README](firmware-ch32x/README.md) |
 | RP2040 UI and router | `rp2040:1.2.4` | PlatformIO, arduino-pico 5.6.1 | [README](firmware-rp2040/README.md) |
 | ESP32-S3 LTE-M card | `esp32:0.8.18` | ESP-IDF v6.0.2 | [README](firmware-ESP32-LTE-M/README.md) |
 

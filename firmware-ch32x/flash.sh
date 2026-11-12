@@ -14,7 +14,9 @@
 
 set -euo pipefail
 
-HEX="obj/USB-PD.hex"
+# Override the image with e.g. `HEX=build/USB-PD.hex ./flash.sh` (headless
+# `make` output). Default is the MRS2 build.
+HEX="${HEX:-obj/USB-PD.hex}"
 MODE="${1:-dev}"
 
 case "$MODE" in

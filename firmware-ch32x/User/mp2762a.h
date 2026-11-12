@@ -22,6 +22,7 @@ extern "C" {
 #define MP2762A_REG_INPUT_ILIM2 0x0F  // Input current limit 2 (burst, higher; default 1.5A!)
 #define MP2762A_REG_ILIM2_DUR   0x10  // Input current limit 2 duration (t_MAX)
 #define MP2762A_REG_TWO_LEVEL_PERIOD 0x11  // Two-level current limit period
+#define MP2762A_REG_IIN_OCP 0x12      // Input OCP threshold for PROCHOT + DIG_SKIP_EN (bit 1)
 #define MP2762A_REG_STATUS  0x13      // Status register
 #define MP2762A_REG_FAULT   0x14      // Fault register
 #define MP2762A_REG_ADC_VBAT_L 0x16  // Battery voltage ADC LSB
@@ -45,6 +46,18 @@ extern "C" {
 #define MP2762A_SUSP_EN     0x08  // Bit 3: Suspend enable
 #define MP2762A_NTC_GCOMP   0x04  // Bit 2: NTC/OTG pin select
 #define MP2762A_BATTFET_EN  0x02  // Bit 1: Battery FET enable
+
+// REG12H bits
+#define MP2762A_DIG_SKIP_EN 0x02  // Bit 1: digital skip mode (OTP default 1 = skip PWM at light load)
+
+/* Light-load pulse skipping.
+ *   1 = clear DIG_SKIP_EN: the buck stage stops skipping PWM pulses at light
+ *       load, removing the low-frequency bursts that can be heard as a whine
+ *       (reported 2026-11-12 at <4 W output). Lower light-load efficiency.
+ *   0 = leave the OTP default (skip enabled).
+ * EXPERIMENTAL: the datasheet does not describe how VSYS behaves near zero
+ * load with skip disabled — watch VSYS in telemetry when validating. */
+#define MP2762A_DISABLE_SKIP  1
 
 // REG13H Status register bits
 #define MP2762A_BATT_UVLO   0x80  // Bit 7: Battery UVLO

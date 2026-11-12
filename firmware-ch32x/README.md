@@ -1,7 +1,7 @@
 # Web3 Pi UPS — CH32X035 Power Controller
 
 USB-PD output and power-management firmware for **Web3 Pi UPS hardware
-rev.3**. The current source reports **`ch32x:1.1.1`**.
+rev.3**. The current source reports **`ch32x:1.1.2`**.
 
 ## Architecture
 
